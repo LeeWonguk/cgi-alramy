@@ -1,0 +1,949 @@
+#!/usr/bin/env python3
+"""CGV 예매 가능 날짜 추가 알림기 — CGV 접근과 비교 로직.
+
+DB(store)에 등록된 영화×극장 조합의 예매 가능 날짜를 확인해, 이전 확인
+때보다 날짜가 늘어났으면 Slack으로 알린다.
+
+CGV는 Cloudflare가 TLS 지문 단위로 봇을 막기 때문에 requests/curl로는
+헤더를 완벽히 맞춰도 403이 떨어진다. 그래서 Chromium을 실제로 띄우고
+페이지 컨텍스트 안에서 same-origin fetch로 내부 API를 호출한다.
+
+이 모듈은 CLI로도 쓰지만(`--once`), 상시 동작은 web/poller.py가 브라우저
+세션을 상주시키며 check_all()을 반복 호출하는 쪽이다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import logging
+import logging.handlers
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import store
+from envfile import load_env
+
+# ── CGV 내부 API ────────────────────────────────────────────────────────────
+# 비공개 API라 사이트 개편 시 바뀔 수 있다. 변경 지점을 여기 한 곳에 모아둔다.
+CO_CD = "A420"  # CGV 고정값
+BASE_URL = "https://cgv.co.kr"
+BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
+
+EP_MOVIES = f"/api/v1/booking/searchAtktTopPostrList?coCd={CO_CD}&movNm=&div=&attrCd="
+EP_SITES = f"/api/v1/content/site/searchAllRegionAndSite?coCd={CO_CD}"
+EP_DATES = (
+    "/api/v1/booking/searchSiteScnscYmdListByMov"
+    f"?coCd={CO_CD}&siteNo={{site_no}}&movNo={{mov_no}}"
+)
+EP_SCHEDULE = (
+    "/api/v1/booking/searchSchByMov"
+    f"?coCd={CO_CD}&siteNo={{site_no}}&scnYmd={{ymd}}&movNo={{mov_no}}&rtctlScopCd=08"
+)
+
+CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+# ── 경로 ────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parent
+LOCK_PATH = ROOT / ".watch.lock"
+LOG_PATH = ROOT / "logs" / "watch.log"
+
+FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 Slack 경고
+WEEKDAYS = "월화수목금토일"
+
+log = logging.getLogger("cgv-watch")
+
+
+# ── 설정 / 상태 ─────────────────────────────────────────────────────────────
+def setup_logging(verbose: bool) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setFormatter(fmt)
+
+    stream = logging.StreamHandler(sys.stderr)
+    stream.setFormatter(fmt)
+
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+    log.handlers.clear()  # 진입점이 여러 개라 두 번 불릴 수 있다
+    log.addHandler(file_handler)
+    log.addHandler(stream)
+    # 루트로 올려보내지 않는다. 의존 패키지 중 하나가 logging.basicConfig()를
+    # 부르면 루트에 핸들러가 붙어 같은 줄이 두 번 찍힌다.
+    log.propagate = False
+
+
+@contextmanager
+def single_instance():
+    """확인이 겹치지 않게 막는다.
+
+    상시 동작하는 서버와 수동으로 띄운 `--once`가 같은 순간에 돌면, 늦게 끝난
+    쪽이 앞의 결과를 덮어써 그 사이에 열린 날짜를 영영 놓친다. 서버는 락을
+    사이클 단위로만 잡으므로 CLI도 그대로 쓸 수 있다.
+    """
+    fh = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
+# ── 포맷 헬퍼 ───────────────────────────────────────────────────────────────
+def fmt_date(ymd: str) -> str:
+    """'20260812' -> '8/12(수)'"""
+    try:
+        d = datetime.strptime(ymd, "%Y%m%d")
+    except ValueError:
+        return ymd
+    return f"{d.month}/{d.day}({WEEKDAYS[d.weekday()]})"
+
+
+def fmt_time(hhmm: str) -> str:
+    """'1400' -> '14:00'. CGV는 심야를 '2525'(=다음날 01:25)로 주는데 그대로 표기한다."""
+    return f"{hhmm[:2]}:{hhmm[2:]}" if hhmm and len(hhmm) == 4 else (hhmm or "")
+
+
+def normalize(name: str) -> str:
+    """이름 비교용 정규화 — 공백/대소문자/CGV 접두 무시."""
+    stripped = "".join(name.split())  # 일반/비분리 공백 모두 제거
+    return stripped.lower().removeprefix("cgv")
+
+
+# ── CGV 세션 ────────────────────────────────────────────────────────────────
+class CgvSession:
+    """Chromium을 띄워 CGV 내부 API를 호출하는 세션.
+
+    Cloudflare 쿠키를 얻기 위해 먼저 홈페이지를 방문하고, 이후 요청은
+    페이지 컨텍스트 안에서 same-origin fetch로 보낸다.
+    """
+
+    def __init__(self, headless: bool = True):
+        self._headless = headless
+        self._pw = None
+        self._browser = None
+        self._page = None
+        self.requests = 0  # 사이클당 CGV 요청 수 — 대시보드에서 부하를 본다
+        self.opened_at: datetime | None = None
+
+    def __enter__(self) -> "CgvSession":
+        from playwright.sync_api import sync_playwright
+
+        self._pw = sync_playwright().start()
+
+        # Playwright의 headless=True는 chrome-headless-shell 바이너리를 찾는데
+        # 그게 없는 환경이 많다. 정식 Chromium을 신형 headless 모드로 띄운다.
+        args = ["--disable-gpu"]
+        if self._headless:
+            args.insert(0, "--headless=new")
+
+        self._browser = self._pw.chromium.launch(headless=False, args=args)
+        context = self._browser.new_context(locale="ko-KR", user_agent=CHROME_UA)
+        self._page = context.new_page()
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = self._page.goto(
+                    BASE_URL, wait_until="domcontentloaded", timeout=45_000
+                )
+                if resp and resp.status == 200:
+                    log.debug("CGV 홈 접속 성공 (%d번째 시도)", attempt + 1)
+                    self.opened_at = datetime.now().astimezone()
+                    return self
+                last_exc = RuntimeError(
+                    f"CGV 홈 응답 코드 {resp.status if resp else 'None'}"
+                )
+            except Exception as exc:  # noqa: BLE001 - playwright 예외 종류가 다양
+                last_exc = exc
+            log.warning("CGV 홈 접속 실패 (%d/3): %s", attempt + 1, last_exc)
+            time.sleep(2 * (attempt + 1))
+
+        self.__exit__(None, None, None)
+        raise RuntimeError(f"CGV 접속 실패: {last_exc}")
+
+    def __exit__(self, *_exc) -> None:
+        for closer in (self._browser, self._pw):
+            if closer is None:
+                continue
+            try:
+                closer.close() if closer is self._browser else closer.stop()
+            except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
+                pass
+        self._browser = self._pw = self._page = None
+
+    def is_alive(self) -> bool:
+        """페이지가 아직 살아 있는지. 브라우저 상주 중 크래시를 감지하는 데 쓴다."""
+        if self._page is None:
+            return False
+        try:
+            return self._page.evaluate("() => 1") == 1
+        except Exception:  # noqa: BLE001 - 죽었는지 보는 게 목적이다
+            return False
+
+    def get_json(self, path: str, retries: int = 2) -> dict:
+        """API를 호출해 JSON을 반환. 실패하면 지수 백오프로 재시도."""
+        script = """async (path) => {
+            const res = await fetch(path, {headers: {'accept': 'application/json'}});
+            const text = await res.text();
+            return {status: res.status, text: text};
+        }"""
+
+        last_error = ""
+        for attempt in range(retries + 1):
+            if attempt:
+                time.sleep(2**attempt)
+            self.requests += 1
+            try:
+                out = self._page.evaluate(script, path)
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+
+            if out["status"] != 200:
+                last_error = f"HTTP {out['status']}"
+                continue
+            try:
+                payload = json.loads(out["text"])
+            except json.JSONDecodeError:
+                last_error = f"JSON 파싱 실패: {out['text'][:120]}"
+                continue
+            if payload.get("statusCode") not in (0, "0", None):
+                last_error = f"API 오류: {payload.get('statusMessage')}"
+                continue
+            return payload
+
+        raise RuntimeError(f"{path.split('?')[0]} 조회 실패 — {last_error}")
+
+    # ── 개별 조회 ──
+    def bookable_movies(self) -> list[dict]:
+        """현재 예매가 열린 영화 목록. 아직 오픈 전이면 여기에 없다."""
+        return self.get_json(EP_MOVIES).get("data") or []
+
+    def sites(self) -> tuple[list[dict], dict[str, str]]:
+        """(극장 목록, 지역코드 -> 지역명)"""
+        data = self.get_json(EP_SITES).get("data") or {}
+        regions = {
+            r["comCdval"]: r["comCdvalNm"] for r in (data.get("regionInfo") or [])
+        }
+        return (data.get("siteInfo") or []), regions
+
+    def bookable_dates(self, site_no: str, mov_no: str) -> list[str]:
+        payload = self.get_json(EP_DATES.format(site_no=site_no, mov_no=mov_no))
+        return sorted(
+            row["scnYmd"] for row in (payload.get("data") or []) if row.get("scnYmd")
+        )
+
+    def showtimes(self, site_no: str, mov_no: str, ymd: str) -> list[dict]:
+        payload = self.get_json(
+            EP_SCHEDULE.format(site_no=site_no, mov_no=mov_no, ymd=ymd), retries=1
+        )
+        return payload.get("data") or []
+
+
+# ── 이름 -> 코드 해석 ───────────────────────────────────────────────────────
+def resolve(query: str, items: list[dict], name_key: str) -> tuple[dict | None, str]:
+    """이름으로 항목을 찾는다. 완전일치 우선, 그다음 부분일치.
+
+    Returns: (찾은 항목 또는 None, 문제 설명)
+    """
+    q = normalize(query)
+    exact = [it for it in items if normalize(it.get(name_key, "")) == q]
+    if len(exact) == 1:
+        return exact[0], ""
+
+    partial = [it for it in items if q and q in normalize(it.get(name_key, ""))]
+    if len(partial) == 1:
+        return partial[0], ""
+    if not partial:
+        return None, "일치하는 항목이 없습니다"
+
+    names = ", ".join(it.get(name_key, "?") for it in partial[:6])
+    return None, f"여러 항목에 걸립니다 ({names}) — 더 구체적으로 적어주세요"
+
+
+# ── Slack ───────────────────────────────────────────────────────────────────
+def send_slack(text: str, dry_run: bool = False,
+               webhook_url: str | None = None) -> bool:
+    """Slack으로 보낸다. webhook_url을 주면 그쪽으로, 없으면 .env의 전역 웹훅으로."""
+    if dry_run:
+        print("\n--- [dry-run] Slack 전송 안 함 ---")
+        print(text)
+        print("-" * 34)
+        return True
+
+    url = (webhook_url or "").strip() or os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    if not url:
+        log.error("보낼 Slack 웹훅이 없습니다 "
+                  "(사용자 설정 또는 .env의 SLACK_WEBHOOK_URL을 확인하세요)")
+        return False
+
+    body = json.dumps({"text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}
+    )
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2**attempt)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status == 200:
+                    return True
+                log.warning("Slack 응답 코드 %d", resp.status)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            log.warning("Slack 전송 실패 (%d/3): %s", attempt + 1, exc)
+    log.error("Slack 전송을 포기했습니다")
+    return False
+
+
+def deliver_alert(kind: str, body: str, *, dry_run: bool = False,
+                  target_id: int | None = None, owner_id: int | None = None,
+                  webhook_url: str | None = None, mov_nm: str | None = None,
+                  site_nm: str | None = None, dates: list[str] | None = None) -> bool:
+    """알림을 이력에 남기고 그 소유자의 Slack으로 보낸다. 전송 성공 여부를 반환.
+
+    먼저 delivered=false로 적어 두므로, 전송이 실패해도 "무엇을 못 보냈는지"가
+    화면에 남는다. dry-run은 이력도 남기지 않는다 — 아무것도 바꾸지 않는 게 뜻이다.
+    """
+    if dry_run:
+        return send_slack(body, dry_run=True)
+
+    alert_id = store.record_alert(
+        kind, body, target_id=target_id, owner_id=owner_id, mov_nm=mov_nm,
+        site_nm=site_nm, dates=dates or [],
+    )
+    if send_slack(body, webhook_url=webhook_url):
+        store.mark_alert_delivered(alert_id)
+        return True
+    return False
+
+
+def screen_label(row: dict) -> str:
+    """상영 한 건의 상영관 표기 — 'IMAX LASER 2D IMAX관' 같은 형태."""
+    kind = row.get("movkndDsplNm") or ""
+    screen = row.get("expoScnsNm") or row.get("scnsNm") or ""
+    return " ".join(part for part in (kind, screen) if part)
+
+
+def matches_screen_types(row: dict, wanted: list[str]) -> bool:
+    """상영 한 건이 원하는 상영관 종류인지.
+
+    CGV는 IMAX를 movkndDsplNm='IMAX LASER 2D', expoScnsNm='IMAX관'처럼 주고
+    4DX는 '4DX 2D'/'4DX관', SCREENX는 'SCREENX 2D'/'4관[SCREENX]'로 준다.
+    두 필드를 합쳐 부분 문자열로 보면 'IMAX' 한 단어로 충분히 걸린다.
+    """
+    if not wanted:
+        return True
+    haystack = normalize(screen_label(row))
+    return any(normalize(w) in haystack for w in wanted)
+
+
+def group_showtimes(rows: list[dict]) -> list[dict]:
+    """상영 목록을 상영관별로 묶는다 — [{label, times}, ...].
+
+    Slack 알림과 웹 화면이 같은 묶음을 쓰도록 포맷과 분리해 둔다.
+    """
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        key = (row.get("movkndDsplNm") or "",
+               row.get("expoScnsNm") or row.get("scnsNm") or "")
+        grouped.setdefault(key, []).append(row.get("scnsrtTm") or "")
+
+    groups = []
+    for (kind, screen), times in grouped.items():
+        groups.append({
+            "label": " ".join(part for part in (kind, screen) if part),
+            "times": [fmt_time(t) for t in sorted(times)],
+        })
+    return groups
+
+
+def summarize_showtimes(rows: list[dict]) -> list[str]:
+    """상영 목록을 '2D 1관 (Laser): 14:00, 17:00' 형태의 줄들로 요약."""
+    return [f"     • {g['label']}: {', '.join(g['times'])}"
+            for g in group_showtimes(rows)]
+
+
+def build_new_dates_message(
+    movie_name: str,
+    site_name: str,
+    new_dates: list[str],
+    showtimes: dict[str, list[dict]],
+    screen_types: list[str] | None = None,
+) -> str:
+    what = f"{'/'.join(screen_types)} " if screen_types else ""
+    lines = [
+        f"🎟 *새 {what}예매 날짜 오픈*",
+        f"*{movie_name}* · CGV {site_name}",
+        f"➕ {', '.join(fmt_date(d) for d in new_dates)}",
+    ]
+    for ymd in new_dates:
+        rows = showtimes.get(ymd)
+        if not rows:
+            continue
+        lines.append(f"  {fmt_date(ymd)}")
+        lines.extend(summarize_showtimes(rows))
+    lines.append(f"<{BOOKING_URL}|▶ 예매하러 가기>")
+    return "\n".join(lines)
+
+
+def build_open_message(
+    movie_name: str,
+    site_name: str,
+    dates: list[str],
+    screen_types: list[str] | None = None,
+) -> str:
+    span = (
+        f"{fmt_date(dates[0])} ~ {fmt_date(dates[-1])}"
+        if len(dates) > 1
+        else (fmt_date(dates[0]) if dates else "날짜 정보 없음")
+    )
+    what = f"{'/'.join(screen_types)} " if screen_types else ""
+    return "\n".join(
+        [
+            f"🎬 *{what}예매 오픈!*",
+            f"*{movie_name}* · CGV {site_name}",
+            f"예매 가능 날짜: {span} (총 {len(dates)}일)",
+            f"<{BOOKING_URL}|▶ 예매하러 가기>",
+        ]
+    )
+
+
+# ── 메인 확인 로직 ──────────────────────────────────────────────────────────
+def within_lookahead(ymd: str, lookahead_days: int) -> bool:
+    if lookahead_days <= 0:
+        return True
+    try:
+        target = datetime.strptime(ymd, "%Y%m%d").date()
+    except ValueError:
+        return True
+    return target <= date.today() + timedelta(days=lookahead_days)
+
+
+class Catalog:
+    """예매 영화·극장 목록을 처음 필요할 때 한 번만 받아오는 지연 로더.
+
+    DB에 movNo·siteNo가 남아 있는 감시 대상은 이름을 다시 해석할 필요가 없다.
+    모든 대상이 캐시에 걸리면 이 두 API는 아예 호출되지 않아 사이클당 요청이
+    절반으로 줄고, 그만큼 폴링 간격을 좁힐 여유가 생긴다.
+
+    목록을 실제로 받아오면 DB 캐시(catalog_movies·catalog_sites)도 갱신한다 —
+    웹의 감시 대상 편집 화면이 그 캐시로 영화·극장 선택지를 만든다.
+    """
+
+    def __init__(self, cgv: CgvSession, persist: bool = True):
+        self._cgv = cgv
+        self._persist = persist
+        self._movies: list[dict] | None = None
+        self._sites: list[dict] | None = None
+
+    @property
+    def movies(self) -> list[dict]:
+        self._load()
+        return self._movies  # type: ignore[return-value]
+
+    @property
+    def sites(self) -> list[dict]:
+        self._load()
+        return self._sites  # type: ignore[return-value]
+
+    def _load(self) -> None:
+        if self._movies is not None:
+            return
+        self._movies = self._cgv.bookable_movies()
+        self._sites, regions = self._cgv.sites()
+        log.info("예매 가능 영화 %d편 / 극장 %d곳 조회됨",
+                 len(self._movies), len(self._sites))
+        if self._persist:
+            try:
+                store.replace_catalog_movies(self._movies)
+                store.replace_catalog_sites(self._sites, regions)
+            except Exception as exc:  # noqa: BLE001 - 캐시 갱신 실패로 확인을 멈추지 않는다
+                log.warning("영화·극장 목록 캐시 갱신 실패: %s", exc)
+
+
+def cached_ids(prev: dict) -> tuple[str, str, str, str] | None:
+    """이전 관측에 남은 (movNo, siteNo, movNm, siteNm)을 재사용할 수 있으면 반환.
+
+    아직 예매가 열리지 않은 항목은 영화 목록에 등장하는 순간이 곧 오픈이므로
+    캐시를 쓰면 안 된다 — 목록을 봐야만 오픈을 감지할 수 있다.
+    """
+    if not prev or prev.get("status") == "not_open":
+        return None
+    ids = (prev.get("movNo"), prev.get("siteNo"), prev.get("movNm"),
+           prev.get("siteNm"))
+    if not all(ids):
+        return None
+    return ids  # type: ignore[return-value]
+
+
+def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
+    """감시 대상을 한 바퀴 확인한다. cgv를 넘기면 그 세션을 재사용한다.
+
+    돌려주는 요약(targets_checked·requests·new_dates·alerts_sent)은 호출한 쪽이
+    poll_cycles에 기록한다 — 사이클을 누가 돌렸는지(스케줄·수동·CLI)는 여기서
+    알 필요가 없다.
+    """
+    if cgv is None:
+        headless = bool(store.get_setting("headless", True))
+        with CgvSession(headless=headless) as session:
+            return check_all(session, dry_run=dry_run)
+
+    # 소유자가 아직 없는 대상(로그인을 붙이기 전에 만든 것)에 쓸 기본값.
+    seed = store.settings_all()
+
+    rows = store.targets(enabled_only=True)
+    requests_before = cgv.requests
+    summary = {"targets_checked": 0, "requests": 0, "new_dates": 0, "alerts_sent": 0}
+
+    if not rows:
+        log.warning("감시 대상이 없습니다 — 웹에서 추가하거나 --migrate를 실행하세요")
+        return summary
+
+    messages: list[dict] = []  # 운영 알림 — 상태 진행과 무관
+    deferred: list[dict] = []  # 전송에 성공해야 상태를 미는 날짜 알림
+    config_errors: list[tuple[int | None, str]] = []  # (소유자, 문제)
+    owner_webhooks: dict[int | None, str | None] = {}  # 설정 오류를 보낼 곳
+
+    def add_config_error(owner_id: int | None, problem: str) -> None:
+        # 같은 오타가 대상 수만큼 중복되지 않게 한 번만 담는다.
+        if (owner_id, problem) not in config_errors:
+            config_errors.append((owner_id, problem))
+
+    catalog = Catalog(cgv)
+
+    for row in rows:
+        target_id = row["id"]
+        movie_query, site_query = row["movie_query"], row["site_query"]
+        prev = store.prev_state(row)
+        wanted = store.normalize_screen_types(row["screen_types"])
+
+        # 확인 조건과 알림 수신처는 그 대상의 **소유자** 것을 쓴다.
+        owner_id = row["owner_id"]
+        webhook = row["owner_slack_webhook_url"] if owner_id else None
+        owner_webhooks[owner_id] = webhook
+        lookahead = int((row["owner_lookahead_days"] if owner_id
+                         else seed["lookahead_days"]) or 0)
+        want_showtimes = bool(row["owner_include_showtimes"] if owner_id
+                              else seed["include_showtimes"])
+
+        # ── 코드 확보: 이전 관측 캐시를 먼저 쓰고, 안 되면 목록을 받는다 ──
+        ids = cached_ids(prev)
+        dates: list[str] | None = None
+        mov_no = site_no = mov_nm = site_nm = ""
+
+        if ids is not None:
+            mov_no, site_no, mov_nm, site_nm = ids
+            try:
+                dates = cgv.bookable_dates(site_no, mov_no)
+            except RuntimeError as exc:
+                log.debug("캐시된 코드로 조회 실패 — 목록을 다시 받습니다: %s", exc)
+                dates = None
+            if not dates:
+                # 종영·재편성으로 코드가 낡았을 수 있다. 목록으로 확인한다.
+                ids = None
+
+        if ids is None:
+            movie, movie_problem = resolve(movie_query, catalog.movies, "movNm")
+
+            # 이름이 여러 영화에 걸리는 건 설정 오류다 — 확인을 진행할 수 없다.
+            if movie is None and movie_problem != "일치하는 항목이 없습니다":
+                add_config_error(owner_id, f"영화 '{movie_query}': {movie_problem}")
+                continue
+
+            site, site_problem = resolve(site_query, catalog.sites, "siteNm")
+            if site is None:
+                add_config_error(owner_id, f"극장 '{site_query}': {site_problem}")
+                continue
+            site_nm = site["siteNm"]
+
+            # 아직 예매가 열리지 않은 영화 — 목록에 등장하는 순간이 곧 티켓 오픈.
+            if movie is None:
+                log.info("%s · %s — 아직 예매 오픈 전", movie_query, site_nm)
+                if not dry_run:
+                    store.mark_not_open(target_id, wanted)
+                summary["targets_checked"] += 1
+                continue
+
+            mov_no, site_no = movie["movNo"], site["siteNo"]
+            mov_nm = movie["movNm"]
+            try:
+                dates = cgv.bookable_dates(site_no, mov_no)
+            except RuntimeError as exc:
+                # 날짜는 갱신하지 않는다 — 다음 성공 때 그 사이 열린 날짜를 잡는다.
+                fails = (int(prev.get("fail_count", 0)) + 1 if dry_run
+                         else store.record_fail(target_id, str(exc)))
+                log.error("%s · %s 조회 실패 (%d회 연속): %s",
+                          mov_nm, site_nm, fails, exc)
+                if fails == FAIL_ALERT_THRESHOLD:
+                    messages.append({
+                        "kind": "fetch_error",
+                        "owner_id": owner_id,
+                        "webhook": webhook,
+                        "body": "⚠️ *CGV 알림기 조회 실패*\n"
+                                f"*{mov_nm}* · CGV {site_nm} — "
+                                f"{fails}회 연속 실패\n`{exc}`",
+                    })
+                continue
+
+        was_not_open = prev.get("status") == "not_open"
+
+        # 필터를 바꾸면 이전에 쌓은 날짜 집합은 의미가 달라진다.
+        # 기준선을 다시 잡아 엉뚱한 알림이 쏟아지지 않게 한다.
+        # (순서만 다른 건 같은 필터로 본다 — 체크박스 순서로 기준선이 날아가면 안 된다.)
+        if prev and sorted(prev.get("screen_types", [])) != sorted(wanted):
+            log.info("%s · %s — 상영관 필터가 바뀌어 기준선을 다시 잡습니다",
+                     mov_nm, site_nm)
+            prev = {}
+
+        showtimes: dict[str, list[dict]] = {}
+
+        if wanted:
+            # IMAX 등 특정 상영관만 감시. 상영관 정보는 날짜 목록 API에 없고
+            # 시간표 API에만 있으므로 날짜별로 확인해야 한다.
+            # 이미 해당 상영관이 확인된 날짜는 다시 볼 필요가 없다.
+            known = set(prev.get("matched_dates", []))
+            matched: list[str] = []
+            for ymd in dates:
+                if ymd in known:
+                    matched.append(ymd)
+                    continue
+                try:
+                    schedule = cgv.showtimes(site_no, mov_no, ymd)
+                except RuntimeError as exc:
+                    # 확인 못 한 날짜는 미확정으로 남긴다 — 다음 확인에서 재시도.
+                    log.warning("%s %s 시간표 조회 실패: %s", site_nm, ymd, exc)
+                    continue
+                hits = [r for r in schedule if matches_screen_types(r, wanted)]
+                if hits:
+                    matched.append(ymd)
+                    showtimes[ymd] = hits
+
+            tracked = matched
+            new_dates = [d for d in matched
+                         if d not in known and within_lookahead(d, lookahead)]
+        else:
+            known = set(prev.get("dates", []))
+            tracked = dates
+            new_dates = [d for d in dates
+                         if d not in known and within_lookahead(d, lookahead)]
+
+        alert: str | None = None
+        kind = ""
+        label = "/".join(wanted) if wanted else "전체 상영관"
+
+        if was_not_open and tracked:
+            # 예매가 새로 열렸다.
+            log.info("%s · %s — 예매 오픈 감지 (%s, %d일)",
+                     mov_nm, site_nm, label, len(tracked))
+            alert, kind = build_open_message(mov_nm, site_nm, tracked, wanted), "open"
+        elif was_not_open:
+            log.info("%s · %s — 예매는 열렸지만 %s 상영이 아직 없습니다",
+                     mov_nm, site_nm, label)
+        elif not prev:
+            # 첫 관측: 기준선만 저장하고 알리지 않는다.
+            log.info("%s · %s — 기준선 저장 (%s, %d일: %s)",
+                     mov_nm, site_nm, label, len(tracked),
+                     ", ".join(fmt_date(d) for d in tracked) or "해당 없음")
+        elif new_dates:
+            log.info("%s · %s — 새 %s 날짜 %s", mov_nm, site_nm, label,
+                     ", ".join(fmt_date(d) for d in new_dates))
+            if want_showtimes and not wanted:
+                # 필터가 없으면 시간표를 아직 안 받았다 — 알림용으로 받아온다.
+                for ymd in new_dates:
+                    try:
+                        showtimes[ymd] = cgv.showtimes(site_no, mov_no, ymd)
+                    except RuntimeError as exc:
+                        # 시간표는 부가 정보다 — 실패해도 알림은 보낸다.
+                        log.warning("%s 시간표 조회 실패: %s", ymd, exc)
+            alert = build_new_dates_message(
+                mov_nm, site_nm, new_dates,
+                showtimes if want_showtimes else {}, wanted
+            )
+            kind = "new_dates"
+        else:
+            log.info("%s · %s — 변화 없음 (%s, %d일)",
+                     mov_nm, site_nm, label, len(tracked))
+
+        fresh = {
+            "mov_no": mov_no,
+            "site_no": site_no,
+            "mov_nm": mov_nm,
+            "site_nm": site_nm,
+            "dates": dates,
+            "matched_dates": tracked if wanted else [],
+            "screen_types": wanted,
+        }
+
+        if not dry_run:
+            # 받아온 시간표는 캐시에 남겨 화면이 CGV를 다시 부르지 않게 한다.
+            for ymd, hits in showtimes.items():
+                store.save_showtimes(target_id, ymd, hits)
+            store.prune_showtimes(target_id, dates)
+
+        summary["targets_checked"] += 1
+        if prev:
+            # 첫 관측은 비교 대상이 없다 — 열린 날짜 전부를 "새 날짜"로 세면
+            # 사이클 이력에 알림 없는 16일 같은 값이 남아 읽는 사람을 속인다.
+            summary["new_dates"] += len(new_dates)
+
+        if alert:
+            # 알림 전송이 성공한 뒤에만 상태를 갱신한다. 지금 반영해 버리면
+            # Slack 전송이 실패했을 때 그 날짜를 두 번 다시 알릴 수 없다.
+            deferred.append({"target_id": target_id, "owner_id": owner_id,
+                             "webhook": webhook, "kind": kind, "body": alert,
+                             "fresh": fresh, "dates": new_dates or tracked})
+        elif not dry_run:
+            store.save_state(target_id, **fresh)
+
+    # 설정 오류는 한 번만 알린다 — 같은 오타로 30초마다 알림이 오면 안 된다.
+    if config_errors:
+        for _, problem in config_errors:
+            log.error("설정 오류: %s", problem)
+        signature = "\n".join(sorted(f"{o}:{p}" for o, p in config_errors))
+        if store.config_error_signature() != signature:
+            # 소유자별로 묶어 자기 오류만 받게 한다.
+            by_owner: dict[int | None, list[str]] = {}
+            for problem_owner, problem in config_errors:
+                by_owner.setdefault(problem_owner, []).append(problem)
+            for problem_owner, problems in by_owner.items():
+                messages.append({
+                    "kind": "config_error",
+                    "owner_id": problem_owner,
+                    "webhook": owner_webhooks.get(problem_owner),
+                    "body": "⚠️ *CGV 알림기 설정 오류*\n"
+                            + "\n".join(f"• {p}" for p in problems)
+                            + "\n웹의 감시 대상 화면에서 정확한 영화·극장을 "
+                              "골라 주세요.",
+                })
+            if not dry_run:
+                store.set_config_error_signature(signature)
+    elif not dry_run and store.config_error_signature() is not None:
+        store.set_config_error_signature(None)
+
+    # 여기까지 왔으면 사이트 접속은 성공했다 — 전역 실패 카운터를 되돌린다.
+    if not dry_run:
+        store.clear_global_fail()
+
+    # 날짜 알림: 전송에 성공한 대상만 상태를 앞으로 밀어준다.
+    # 실패하면 상태를 그대로 남겨 다음 확인에서 같은 날짜를 다시 알린다.
+    for item in deferred:
+        fresh = item["fresh"]
+        sent = deliver_alert(
+            item["kind"], item["body"], dry_run=dry_run,
+            target_id=item["target_id"], owner_id=item["owner_id"],
+            webhook_url=item["webhook"], mov_nm=fresh["mov_nm"],
+            site_nm=fresh["site_nm"], dates=item["dates"],
+        )
+        if sent:
+            summary["alerts_sent"] += 1
+            if not dry_run:
+                store.save_state(item["target_id"], **fresh)
+        else:
+            log.error("%s · %s 알림 전송 실패 — 다음 확인에서 다시 시도합니다",
+                      fresh["mov_nm"], fresh["site_nm"])
+
+    # 운영 알림은 상태 진행과 무관하므로 결과를 따지지 않는다.
+    for message in messages:
+        deliver_alert(message["kind"], message["body"], dry_run=dry_run,
+                      owner_id=message["owner_id"],
+                      webhook_url=message["webhook"])
+
+    summary["requests"] = cgv.requests - requests_before
+    if dry_run:
+        log.info("dry-run: DB를 변경하지 않았습니다")
+    return summary
+
+
+def refresh_catalog(cgv: CgvSession) -> dict:
+    """영화·극장 목록을 받아 DB 캐시를 갱신한다.
+
+    감시 대상이 모두 코드 캐시에 걸리면 확인 사이클은 이 두 API를 아예 부르지
+    않는다. 그래서 웹의 편집 화면이 필요할 때 이 함수로 따로 갱신한다.
+    """
+    catalog = Catalog(cgv)
+    return {"movies": len(catalog.movies), "sites": len(catalog.sites)}
+
+
+# ── CLI 서브 동작 ───────────────────────────────────────────────────────────
+def _headless() -> bool:
+    return bool(store.get_setting("headless", True))
+
+
+def cmd_list_movies() -> None:
+    with CgvSession(headless=_headless()) as cgv:
+        movies = cgv.bookable_movies()
+    print(f"예매 가능 영화 {len(movies)}편:\n")
+    for m in movies:
+        print(f"  {m['movNo']}  {m['movNm']}  (예매율 {m.get('atktRate', '-')}%)")
+
+
+def cmd_list_sites(region_query: str | None) -> None:
+    with CgvSession(headless=_headless()) as cgv:
+        sites, regions = cgv.sites()
+
+    if region_query:
+        q = normalize(region_query)
+        matched = [code for code, name in regions.items() if q in normalize(name)]
+        if not matched:
+            print(f"'{region_query}'에 맞는 지역이 없습니다. 가능한 지역: "
+                  + ", ".join(regions.values()))
+            return
+        sites = [s for s in sites if s.get("regnGrpCd") in matched]
+
+    print(f"극장 {len(sites)}곳:\n")
+    for s in sites:
+        region = regions.get(s.get("regnGrpCd", ""), "?")
+        print(f"  {s['siteNo']}  [{region}] {s['siteNm']}")
+
+
+def cmd_reset() -> None:
+    """모든 감시 대상의 기준선을 지운다. 대상 자체는 지우지 않는다."""
+    rows = store.targets()
+    for row in rows:
+        store.reset_state(row["id"])
+    print(f"기준선을 지웠습니다 ({len(rows)}개 대상).")
+    print("다음 확인은 현재 상태만 저장하고 알림을 보내지 않습니다.")
+
+
+def cmd_migrate() -> None:
+    result = store.migrate_legacy()
+    print(f"감시 대상 {result['targets_added']}개 추가, "
+          f"관측 상태 {result['states_imported']}개 이관")
+    for problem in result["skipped"]:
+        print(f"  건너뜀: {problem}")
+    if store.LEGACY_STATE_PATH.exists():
+        backup = store.LEGACY_STATE_PATH.with_suffix(".json.bak")
+        store.LEGACY_STATE_PATH.replace(backup)
+        print(f"state.json을 {backup.name}으로 옮겼습니다 (이제 DB가 기준입니다).")
+
+
+def run_once(dry_run: bool) -> int:
+    """CLI 1회 확인. 결과를 poll_cycles에도 남긴다."""
+    with single_instance() as acquired:
+        if not acquired:
+            log.info("다른 확인이 진행 중이라 이번 차례는 건너뜁니다")
+            return 0
+
+        cycle_id = None if dry_run else store.start_cycle("cli")
+        try:
+            summary = check_all(dry_run=dry_run)
+        except RuntimeError as exc:
+            if cycle_id is not None:
+                store.finish_cycle(cycle_id, ok=False, error=str(exc))
+            raise
+        if cycle_id is not None:
+            store.finish_cycle(cycle_id, ok=True, **summary_fields(summary))
+        log.info("확인 완료 — 대상 %d개 / 요청 %d건 / 새 날짜 %d개",
+                 summary["targets_checked"], summary["requests"],
+                 summary["new_dates"])
+    return 0
+
+
+def summary_fields(summary: dict) -> dict:
+    """check_all의 요약을 store.finish_cycle 인자로 옮긴다."""
+    return {
+        "targets_checked": summary["targets_checked"],
+        "requests": summary["requests"],
+        "new_dates": summary["new_dates"],
+    }
+
+
+def report_connect_failure(exc: Exception, dry_run: bool) -> None:
+    """브라우저 기동·접속 실패. 연속 3회일 때만 Slack으로 알린다."""
+    log.error("%s", exc)
+    if dry_run:
+        return
+    fails = store.bump_global_fail()
+    if fails == FAIL_ALERT_THRESHOLD:
+        deliver_alert(
+            "connect_error",
+            f"⚠️ *CGV 알림기가 사이트에 접속하지 못했습니다* ({fails}회 연속)\n"
+            f"`{exc}`",
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="CGV 예매 가능 날짜가 추가되면 Slack으로 알립니다. "
+                    "상시 동작은 `python3 -m web.app`(웹 서버)이 담당합니다."
+    )
+    parser.add_argument("--once", action="store_true",
+                        help="1회 확인 (기본 동작)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Slack 전송·DB 갱신 없이 감지 결과만 출력")
+    parser.add_argument("--list-movies", action="store_true",
+                        help="예매 가능 영화 목록 출력 (정확한 이름·코드 확인)")
+    parser.add_argument("--list-sites", nargs="?", const="", metavar="지역",
+                        help="극장 목록 출력. 지역명을 주면 그 지역만")
+    parser.add_argument("--reset", action="store_true",
+                        help="기준선을 지웁니다 (감시 대상은 유지)")
+    parser.add_argument("--migrate", action="store_true",
+                        help="config.toml·state.json을 DB로 이관 (1회용)")
+    parser.add_argument("--test-notify", action="store_true",
+                        help="Slack 연동만 테스트")
+    parser.add_argument("-v", "--verbose", action="store_true", help="상세 로그")
+    args = parser.parse_args()
+
+    setup_logging(args.verbose)
+    load_env()
+
+    if args.test_notify:
+        ok = send_slack(
+            "✅ *CGV 알림기 연결 테스트*\n"
+            "이 메시지가 보이면 Slack 알림이 정상 동작합니다.",
+            dry_run=args.dry_run,
+        )
+        return 0 if ok else 1
+
+    try:
+        store.init_db()
+    except Exception as exc:  # noqa: BLE001 - 접속 실패 종류가 여러 가지다
+        log.error("DB에 접속할 수 없습니다: %s", exc)
+        log.error("DATABASE_URL을 확인하세요 (현재: %s)", store.safe_dsn())
+        return 1
+
+    if args.migrate:
+        cmd_migrate()
+        return 0
+
+    if args.reset:
+        cmd_reset()
+        return 0
+
+    try:
+        if args.list_movies:
+            cmd_list_movies()
+            return 0
+        if args.list_sites is not None:
+            cmd_list_sites(args.list_sites or None)
+            return 0
+        return run_once(dry_run=args.dry_run)
+    except RuntimeError as exc:
+        report_connect_failure(exc, args.dry_run)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+.env
+state.json
+state.json.tmp
+state.json.bak
+.watch.lock
+logs/
+__pycache__/
+*.pyc
+com.lwg.cgv-watch.plist.generated
+com.lwg.cgv-web.plist.generated
+
+# vite 빌드 산출물 — frontend/에서 만들어집니다
+web/static/
+frontend/node_modules/
+frontend/dist/

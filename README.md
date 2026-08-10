@@ -1,0 +1,343 @@
+# CGV 예매 알림기
+
+CGV에서 지정한 **영화 × 극장** 조합의 예매 가능 날짜를 30초마다 확인해,
+**새 날짜가 열리면 Slack으로 알립니다.** IMAX·4DX 같은 **특정 상영관만 골라
+감시**할 수 있고, 아직 예매가 열리지 않은 영화를 적어두면 예매가 시작되는
+순간에도 알림이 옵니다.
+
+감시 대상 관리·현재 상태 확인·상영표 조회·알림 이력을 **웹 화면**에서 합니다.
+**네이버·카카오 로그인**으로 들어가며, 감시 대상과 알림은 계정별로 나뉩니다.
+
+```
+🎟 새 IMAX 예매 날짜 오픈
+오디세이 · CGV 용산아이파크몰
+➕ 8/17(월), 8/18(화)
+  8/17(월)
+     • IMAX LASER 2D IMAX관: 06:30, 10:00, 13:30, 17:00, 20:30, 24:00
+▶ 예매하러 가기
+```
+
+## 구성
+
+```
+브라우저 (Svelte SPA)  ─ 네이버/카카오 로그인 → 세션 쿠키
+   │  5초마다 /api/dashboard
+   ▼
+[선택] Cloudflare Tunnel · nginx — 도메인 + HTTPS
+   ▼
+Flask 서버 (waitress, 127.0.0.1:8787)          ← launchd가 상주시킴
+   ├── 인증 게이트(before_request) ─ 로그인 + 승인 확인
+   ├── 폴링 스케줄러 ─┐
+   │                  ├─→ 작업 큐 ─→ 브라우저 워커 스레드 ─→ CGV 내부 API
+   ├── REST API ──────┘                (Chromium 세션 1개 상주)
+   ▼
+Postgres  (사용자 · 감시 대상 · 관측 상태 · 알림 이력 · 사이클 이력 · 영화/극장 목록)
+```
+
+CGV는 **Cloudflare가 TLS 지문 단위로 봇을 차단**하기 때문에 `requests`나 `curl`로는
+헤더를 완벽히 맞춰도 403이 떨어집니다. 그래서 Playwright로 Chromium을 실제로 띄워
+CGV 홈을 방문한 뒤, 페이지 컨텍스트 안에서 same-origin `fetch()`로 API를 호출합니다.
+
+Playwright의 sync API는 **세션을 만든 스레드에서만** 쓸 수 있습니다. 그래서 브라우저를
+소유하는 워커 스레드 하나를 두고 CGV로 나가는 모든 요청을 큐로 직렬화합니다
+(`browser_worker.py`). 세션을 상주시키므로 확인 사이클마다 Chromium을 새로 띄우던
+1~2초가 사라집니다 — 실측으로 **첫 사이클 1.4초 → 이후 0.2~0.3초**입니다.
+
+## 빠른 시작
+
+```bash
+# 1. 의존성
+pip install playwright flask 'psycopg[binary,pool]' waitress
+playwright install chromium
+
+# 2. 설정
+cp .env.example .env && chmod 600 .env
+$EDITOR .env    # SLACK_WEBHOOK_URL, DATABASE_URL, PUBLIC_BASE_URL, 로그인 키
+
+# 3. 프론트엔드 빌드 (web/static/으로 나갑니다)
+cd frontend && npm install && npm run build && cd ..
+
+# 4. 예전 config.toml·state.json이 있다면 DB로 이관 (1회)
+python3 watch.py --migrate
+
+# 5. 백그라운드 등록
+./install.sh                      # → http://127.0.0.1:8787
+```
+
+DB(`cgv`)는 없으면 서버가 시작할 때 만듭니다. 첫 확인은 **현재 열린 날짜를
+기준선으로 저장하고 알림을 보내지 않습니다.** 그 이후 늘어난 날짜만 알립니다.
+
+### 소셜 로그인 준비
+
+로그인 키가 없으면 아무도 들어갈 수 없습니다. 두 콘솔에서 앱을 만들고
+`.env`를 채우세요. **콜백 주소는 로그인 화면에 그대로 표시**되니 그대로 복사해
+등록하면 됩니다.
+
+| | 콘솔 | 등록할 콜백 | `.env` |
+|---|---|---|---|
+| 네이버 | developers.naver.com → 애플리케이션 등록 → 네이버 로그인 | `{PUBLIC_BASE_URL}/api/auth/naver/callback` | `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET` |
+| 카카오 | developers.kakao.com → 앱 → 카카오 로그인 활성화 | `{PUBLIC_BASE_URL}/api/auth/kakao/callback` | `KAKAO_REST_API_KEY` (+선택 `KAKAO_CLIENT_SECRET`) |
+
+- `PUBLIC_BASE_URL`과 등록한 콜백은 **문자열이 정확히 같아야** 합니다 —
+  http/https, 포트, 끝 슬래시까지 다르면 provider가 거부합니다.
+- 로컬에서 먼저 시험하려면 둘 다 `http://localhost:8787`로 두면 됩니다.
+- 카카오 이메일은 선택 동의라 사용자가 거부하면 오지 않습니다. 신원은 이메일이
+  아니라 `(provider, 사용자 ID)`로 잡으므로 이메일이 없어도 로그인은 됩니다.
+
+**처음 로그인한 계정이 소유자**가 되고, 로그인 이전에 만들어져 주인이 없던 감시
+대상은 그 계정으로 넘어옵니다. 그 뒤 로그인하는 계정은 `승인 대기` 상태로 들어와
+소유자가 **사용자** 탭에서 승인해야 쓸 수 있습니다.
+
+### 외부에 열기
+
+**로그인 키를 채우기 전에는 외부에 열지 마세요.** 그 사이엔 무방비입니다.
+
+서버는 `127.0.0.1:8787`에 두고 앞에 TLS 종료를 세우는 방식을 권합니다 —
+Cloudflare Tunnel이면 포트 개방 없이 HTTPS가 붙습니다. nginx 리버스 프록시도
+같습니다. 그다음 `.env`의 `PUBLIC_BASE_URL`을 그 https 주소로 바꾸고, 콘솔의
+콜백도 같이 바꾼 뒤 서버를 다시 띄우세요. 쿠키는 `PUBLIC_BASE_URL`이 https일 때
+자동으로 `Secure`가 붙습니다.
+
+## 웹 화면
+
+| 탭 | 하는 일 |
+|---|---|
+| **대시보드** | 내 조합의 상태·열린 날짜·시간표. 뒤늦게 추가된 날짜에 `새로` 표시. 5초마다 갱신 |
+| **감시 대상** | 영화·극장·상영관 필터를 골라 추가/중지/삭제, 기준선 초기화 |
+| **상영표 조회** | 감시 등록 없이 임의 조합의 날짜·시간표를 CGV에서 바로 조회 |
+| **이력** | 내가 받은 알림(전송 성공 여부). 소유자는 확인 사이클 기록과 로그도 |
+| **사용자** | 소유자 전용 — 승인 대기 계정 승인·차단·삭제 |
+| **설정** | 내 설정(알림 옵션·Slack 웹훅). 소유자는 서버 설정(확인 간격 등)도 |
+
+영화·극장은 목록에서 골라 저장하므로 오타로 인한 설정 오류가 생기지 않습니다.
+아직 예매가 열리지 않은 영화는 목록에 없으니 **이름을 직접 입력**하면 됩니다 —
+그 이름이 예매 목록에 등장하는 순간이 곧 티켓 오픈입니다.
+
+### 상영관 필터
+
+`IMAX`처럼 지정하면 **그 상영관 상영이 있는 날짜만** 알림 대상이 됩니다.
+
+- 부분 일치라 `IMAX` 하나로 `IMAX LASER 2D`·`IMAX관`이 모두 걸립니다.
+- 여러 개를 고르면 그중 **하나라도** 있으면 알립니다.
+- 비우면 상영관을 가리지 않고 날짜 추가만 봅니다.
+- **이미 열린 날짜에 IMAX가 나중에 추가되는 경우도 잡습니다.** CGV는 일반관을
+  먼저 열고 IMAX를 나중에 배정하는 일이 있어서, 날짜 자체가 아니라
+  "그 상영관이 있는 날짜"(`matched_dates`)를 추적합니다.
+
+필터를 바꾸면 추적 대상이 달라지므로 **기준선을 자동으로 다시 잡습니다**
+(바꾼 직후 한 번은 알림이 오지 않습니다). 순서만 바꾼 건 같은 필터로 봅니다.
+
+> 필터를 쓰면 상영관 확인을 위해 날짜별 시간표를 조회해야 합니다. 해당 상영관이
+> 이미 확인된 날짜는 다시 조회하지 않으므로, 보통은 **아직 그 상영관이 없는
+> 날짜 수만큼**만 요청이 늘어납니다.
+
+## 데이터
+
+감시 대상과 설정의 출처는 **Postgres**입니다. `config.toml`은 최초 1회 시드로만
+쓰입니다 — 웹에서 편집하려면 쓰기가 필요한데 `tomllib`은 읽기 전용이고, TOML을
+다시 쓰면 파일의 주석 설명이 다 날아가기 때문입니다.
+
+| 테이블 | 내용 |
+|---|---|
+| `users` | 소셜 계정, 승인 상태, 사용자별 알림 설정·Slack 웹훅 |
+| `settings` | 서버 공용 설정(확인 간격 등) + 운영 상태값 + 세션 서명 키 |
+| `watch_targets` | 감시 조합 (소유자, 영화, 극장) 한 행씩 |
+| `watch_state` | 이전 관측 결과 — 알림 판정의 기준선 |
+| `showtimes` | 날짜별 시간표 캐시 (화면이 CGV를 다시 부르지 않게) |
+| `alerts` | 보낸 알림, 소유자, 전송 성공 여부와 시도 횟수 |
+| `poll_cycles` | 확인 사이클 기록 (시각·요청 수·소요) |
+| `catalog_movies` / `catalog_sites` | 영화·극장 목록 캐시 |
+
+### 무엇이 개인 것이고 무엇이 서버 것인가
+
+브라우저와 스케줄러가 하나씩뿐이라 일부 설정은 서버 전체에 하나만 있을 수 있습니다.
+
+| | 범위 |
+|---|---|
+| 감시 대상, 관측 기준선, 시간표, 받은 알림 | 사용자별 — 서로 보이지 않습니다 |
+| 알림 첨부·며칠 이내·기본 상영관 필터·Slack 웹훅 | 사용자별 |
+| 확인 간격·headless·세션 재기동 주기 | 서버 공용 (소유자만 수정) |
+| 확인 사이클 이력·`watch.log`·영화/극장 목록 | 서버 공용 (소유자만 조회) |
+
+폴링은 **모든 사용자의 대상을 한 사이클에** 확인합니다. 대상마다 그 소유자의
+설정과 웹훅을 씁니다. 승인 대기·차단된 계정의 대상은 확인하지 않습니다.
+
+사용자 Slack 웹훅이 비어 있으면 `.env`의 `SLACK_WEBHOOK_URL`로 갑니다.
+
+타임스탬프는 **앱 시계로 찍습니다**. DB가 컨테이너 안에 있으면 호스트와 시계가
+어긋나는데(실측 2초), 폴링 일정은 앱 시계로 계산하면서 기록만 DB 시계로 남기면
+화면의 "N초 전"과 "다음 확인" 카운트다운이 서로 다른 시계를 가리킵니다.
+
+## API
+
+| 메서드 | 경로 | 설명 |
+|---|---|---|
+| GET | `/api/auth/providers` | 로그인 수단과 콜백 주소 (로그인 전에도 열림) |
+| GET | `/api/auth/<provider>/login` | provider 인증 페이지로 302 |
+| GET | `/api/auth/<provider>/callback` | 코드 교환 → 세션 발급 → `/`로 302 |
+| POST | `/api/auth/logout` | 세션 파기 |
+| GET | `/api/me` | 내 계정·권한·내 설정 |
+| PATCH | `/api/me/settings` | 내 알림 설정과 Slack 웹훅 |
+| GET | `/api/dashboard` | 내 대상 + 상태 + 시간표 (소유자는 사이클 요약도) |
+| GET | `/api/health` | DB·워커·스케줄러 상태 |
+| GET/POST | `/api/targets` | 내 목록 / 추가(극장 여러 개 → 여러 행) |
+| PATCH/DELETE | `/api/targets/<id>` | `enabled`·`screen_types` 수정 / 삭제 |
+| POST | `/api/targets/<id>/reset` | 기준선 초기화 |
+| GET | `/api/catalog` | 영화·극장 목록 (DB 캐시) |
+| POST | `/api/catalog/refresh` | 목록을 CGV에서 다시 받기 |
+| POST | `/api/lookup` | `{mov_no, site_no}` → 예매 가능 날짜 |
+| POST | `/api/lookup/showtimes` | `{mov_no, site_no, date, screen_types?}` → 시간표 |
+| GET | `/api/showtimes?target_id=&date=` | 캐시된 시간표 (내 대상만) |
+| GET | `/api/alerts` | 내 알림 이력 (`?limit=`) |
+| GET | `/api/cycles`, `/api/logs` | **소유자 전용** — 사이클 이력, 로그 tail |
+| GET/PATCH | `/api/users`, `/api/users/<id>` | **소유자 전용** — 승인·차단·삭제 |
+| POST | `/api/check-now` | 즉시 1회 확인 |
+| GET | `/api/settings` | 서버 설정 (PATCH는 소유자 전용) |
+| POST | `/api/test-notify` | 내 웹훅으로 Slack 연동 테스트 |
+
+`/api/auth/*`를 뺀 모든 API는 **로그인 + 승인**을 요구합니다. 게이트는
+`before_request` 한 곳에 있어 새 엔드포인트를 추가할 때 인증을 빠뜨릴 수 없습니다.
+SPA 껍데기(`/`와 정적 파일)만 열려 있고, 데이터는 API로만 나갑니다.
+
+서버는 `127.0.0.1:8787`에만 바인딩합니다 — 외부 공개는 앞단 프록시로 하세요.
+(포트 8787은 macOS AirPlay Receiver가 쓰는 5000을 피한 값입니다.)
+
+## 명령어
+
+웹 서버가 상시 동작을 담당하고, CLI는 점검·이관용으로 남아 있습니다.
+
+| 명령 | 설명 |
+|---|---|
+| `python3 -m web.app` | 웹 서버를 직접 띄웁니다 (`--host`, `--port`, `--no-poll`) |
+| `python3 watch.py --once` | 1회 확인 (서버와 파일 락으로 겹치지 않게 조율됩니다) |
+| `python3 watch.py --once --dry-run` | Slack 전송·DB 갱신 없이 감지 결과만 출력 |
+| `python3 watch.py --migrate` | `config.toml`·`state.json`을 DB로 이관 (1회용) |
+| `python3 watch.py --reset` | 모든 대상의 기준선 초기화 |
+| `python3 watch.py --list-movies` | 예매 가능한 영화명 + 코드 |
+| `python3 watch.py --list-sites [지역]` | 극장명 + 코드 |
+| `python3 watch.py --test-notify` | Slack 연동만 테스트 |
+| `python3 store.py init` | DB·테이블 생성 및 점검 |
+
+## 개발
+
+```bash
+python3 -m web.app -v            # API 서버 (8787)
+cd frontend && npm run dev       # vite dev (5173) — /api를 8787로 프록시
+```
+
+vite dev(5173)로 개발할 때도 OAuth 콜백은 `PUBLIC_BASE_URL`(기본 8787)로
+돌아옵니다. 로그인은 8787에서 한 번 하고 5173으로 옮겨 가면 됩니다 — 쿠키는
+포트를 가리지 않습니다.
+
+프론트엔드를 고친 뒤에는 `npm run build`로 `web/static/`에 반영해야 launchd로
+띄운 서버에도 적용됩니다.
+
+## 운영
+
+```bash
+launchctl list | grep cgv         # 등록 상태 (com.lwg.cgv-web)
+tail -f logs/watch.log            # 동작 로그
+./uninstall.sh                    # 해제 (DB·로그는 남김)
+```
+
+확인 간격을 바꿀 때 **`./install.sh`를 다시 실행할 필요가 없습니다** — 간격은
+plist가 아니라 DB 설정값이고, 서버가 다음 사이클부터 새 값을 씁니다.
+
+조회 실패는 조합별로 2회 재시도하고, **연속 3회 실패했을 때만** Slack으로 한 번
+경고합니다. 실패한 조합은 상태를 갱신하지 않아 다음 성공 때 놓친 날짜를 그대로
+잡습니다. Slack 전송이 실패한 경우에도 상태를 밀지 않으므로 알림이 유실되지
+않습니다 — 이력에는 `전송 실패 · N회 시도`로 한 행만 남고, 웹훅이 살아나는 순간
+전송됩니다. (같은 알림을 다시 시도할 때 새 행을 만들면 30초마다 이력이 쌓여
+못 쓰게 됩니다.)
+
+Chromium을 상주시키므로 기본 30분마다 세션을 갈아 줍니다 — 메모리 누적과 좀비
+프로세스를 이 지점에서 끊습니다. 세션이 죽어 있으면 다음 작업 전에 다시 띄웁니다.
+
+`.watch.lock` 파일로 한 번에 하나만 확인하게 막습니다. 서버는 락을 **사이클
+단위로만** 잡으므로 `--once`를 수동으로 돌려도 서로 밀어내지 않습니다.
+
+## 알림이 얼마나 빨리 오나
+
+지연은 **확인 간격**과 **확인 시각의 위상**에서 나옵니다. 스케줄러는 유닉스
+에포크 기준으로 간격을 맞추므로, 간격이 60의 약수면 확인 시각이 매분 같은 자리
+(`:00`·`:30`)에 고정됩니다. 예매 오픈은 정각·30분에 몰리는데 확인 시각이 계속
+밀리면 하필 오픈 직전에 확인하고 다음 차례까지 꽉 기다리는 일이 생깁니다.
+
+한 가지 남는 한계는 **CGV 쪽 반영 지연**입니다. 실제로 관측해 보면 한 영화의
+날짜들이 `11:31 → 11:33 → 11:34 → 11:35 → 11:38`처럼 몇 분에 걸쳐 순차적으로
+열립니다. 확인 간격을 아무리 좁혀도 이 부분은 줄일 수 없습니다.
+
+## 요구 사항
+
+- macOS (launchd 사용)
+- Python 3.11+ (`tomllib` 표준 라이브러리)
+- Postgres (기본 `postgresql://postgres:postgres@127.0.0.1:5432/cgv`)
+- Node 18+ / npm (프론트엔드 빌드)
+- `playwright` + Chromium, `flask`, `psycopg[binary,pool]`, `waitress`
+
+## 내부 API 엔드포인트
+
+CGV 비공개 API라 사이트 개편 시 바뀔 수 있습니다. `watch.py` 상단의 `EP_*`
+상수 한 곳에 모여 있습니다.
+
+| 용도 | 엔드포인트 |
+|---|---|
+| 예매 가능 날짜 | `searchSiteScnscYmdListByMov?coCd=A420&siteNo=&movNo=` |
+| 예매 가능 영화 | `searchAtktTopPostrList?coCd=A420` |
+| 극장 목록 | `content/site/searchAllRegionAndSite?coCd=A420` |
+| 상영 시간표 | `searchSchByMov?coCd=A420&siteNo=&scnYmd=&movNo=` |
+
+`robots.txt`는 일반 User-agent에 `Allow: /`이며 AI 학습 크롤러만 차단합니다.
+조합당 1요청이므로 30초 간격에 조합 몇 개면 분당 몇 건 수준입니다. 감시 조합을
+수십 개로 늘리면 분당 요청 수가 비례해 늘어나니 확인 간격도 함께 올려주세요.
+
+## 문제 해결
+
+**화면에 "프론트엔드가 아직 빌드되지 않았습니다"가 나온다**
+`cd frontend && npm install && npm run build`
+
+**대시보드가 "서버에 연결할 수 없습니다"라고 한다**
+`launchctl list | grep cgv`로 job이 살아 있는지, `logs/launchd.err.log`를 확인하세요.
+
+**DB 접속 실패**
+Postgres가 떠 있는지, `.env`의 `DATABASE_URL`이 맞는지 확인하세요.
+`python3 store.py init`으로 접속만 따로 시험할 수 있습니다.
+
+**`--list-movies`가 403 / 접속 실패로 죽는다**
+CGV가 봇 차단을 강화한 경우입니다. 웹의 '설정' 탭에서 headless를 끄고
+다시 시도해 보세요 (브라우저 창이 잠깐 떴다 사라지지만 통과율이 더 높습니다).
+
+**launchd에서만 실패한다**
+launchd는 셸 PATH를 물려받지 않습니다. `install.sh`가 필요한 패키지가 모두 있는
+python을 찾아 절대경로로 등록하므로, 가상환경을 쓴다면 그 환경을 활성화한
+상태에서 `./install.sh`를 실행하세요.
+
+**config.toml을 고쳤는데 반영되지 않는다**
+정상입니다. 이제 DB가 출처입니다 — 웹의 '설정'·'감시 대상' 탭에서 바꾸세요.
+
+**알림이 안 온다**
+웹의 '설정' 탭에서 `Slack 테스트`를 눌러 연동을 먼저 확인하고, '이력' 탭의
+확인 기록과 로그를 보세요. 기준선이 이미 최신이라 알릴 게 없는 상태일 수 있습니다.
+
+**로그인 화면에서 버튼이 안 보인다**
+`.env`에 키가 없는 상태입니다. 화면에 등록할 콜백 주소와 필요한 키 이름이
+그대로 표시되니 그대로 채우고 서버를 다시 띄우세요.
+
+**provider가 "redirect_uri 불일치"라고 한다**
+`.env`의 `PUBLIC_BASE_URL`로 만든 주소와 콘솔에 등록한 콜백이 다릅니다.
+`GET /api/auth/providers`나 로그인 화면에서 실제로 쓰는 주소를 확인해
+문자열 그대로 등록하세요 (http/https·포트·끝 슬래시까지).
+
+**로그인이 계속 처음으로 되돌아온다**
+프록시 뒤라면 `X-Forwarded-Proto`가 전달되는지, `PUBLIC_BASE_URL`이 https인지
+확인하세요. https인데 쿠키가 `Secure`로 나가면 http 접속에서는 세션이 유지되지
+않습니다.
+
+**두 번째 계정이 "승인 대기"에서 멈춘다**
+정상입니다. 소유자 계정으로 로그인해 '사용자' 탭에서 승인하세요.
+
+**소유자를 잘못 잡았다 (엉뚱한 계정이 소유자가 됐다)**
+DB에서 `delete from users;`를 실행하면 다음 로그인 계정이 다시 소유자가 됩니다.
+단 `watch_targets`가 `ON DELETE CASCADE`라 **그 계정들의 감시 대상도 함께
+사라집니다.** 소유자만 바꾸려면 `update users set is_owner = ... ;`를 쓰세요
+(소유자는 부분 유일 인덱스로 한 명만 가능하니 먼저 기존 소유자를 내려야 합니다).

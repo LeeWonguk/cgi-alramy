@@ -1,0 +1,156 @@
+-- CGV 알림기 스키마. store.init_db()가 매번 실행하므로 전부 멱등이어야 한다.
+
+-- 네이버·카카오 로그인 사용자.
+--   신원은 (provider, provider_user_id)로 잡는다. 카카오는 이메일이 선택 동의라
+--   사용자가 거부하면 아예 오지 않고, 이메일을 키로 쓰면 같은 이메일의 다른
+--   provider 계정과 뭉개진다. 이메일·닉네임은 표시용으로만 둔다.
+--   status: pending(승인 대기) | approved | blocked
+CREATE TABLE IF NOT EXISTS users (
+    id                   serial PRIMARY KEY,
+    provider             text NOT NULL,
+    provider_user_id     text NOT NULL,
+    nickname             text,
+    email                text,
+    profile_image        text,
+    status               text    NOT NULL DEFAULT 'pending',
+    is_owner             boolean NOT NULL DEFAULT false,
+    -- 비어 있으면 .env의 전역 SLACK_WEBHOOK_URL로 보낸다.
+    slack_webhook_url    text,
+    -- 사용자별 취향. 확인 간격·headless 같은 서버 공용 설정은 settings에 남는다.
+    include_showtimes    boolean NOT NULL DEFAULT true,
+    lookahead_days       integer NOT NULL DEFAULT 0,
+    default_screen_types text[]  NOT NULL DEFAULT '{}',
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    last_login_at        timestamptz,
+    UNIQUE (provider, provider_user_id)
+);
+
+-- 소유자는 한 명뿐이다 — 첫 로그인 계정이 가져간다.
+CREATE UNIQUE INDEX IF NOT EXISTS users_single_owner_idx
+    ON users ((is_owner)) WHERE is_owner;
+
+-- 전역 설정. config.toml은 최초 1회 시드로만 쓰이고, 이후 진짜 출처는 이 표다.
+--   poll_interval_seconds · include_showtimes · lookahead_days · headless
+--   default_screen_types · session_recycle_minutes
+--   config_error_signature · global_fail_count  (운영 상태값)
+CREATE TABLE IF NOT EXISTS settings (
+    key        text PRIMARY KEY,
+    value      jsonb       NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 감시 대상. config.toml의 sites = [...] 배열은 (영화, 극장) 한 행씩으로 펼친다.
+-- 예전 state.json 키 "영화|극장"과 1:1로 대응해 비교 로직이 단순해진다.
+CREATE TABLE IF NOT EXISTS watch_targets (
+    id           serial PRIMARY KEY,
+    movie_query  text   NOT NULL,
+    site_query   text   NOT NULL,
+    screen_types text[] NOT NULL DEFAULT '{}',
+    enabled      boolean     NOT NULL DEFAULT true,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (movie_query, site_query)
+);
+
+-- 이전 관측 결과. 여기 없는 대상은 "첫 관측"으로 취급해 알림 없이 기준선만 잡는다.
+--   status: unknown(아직 확인 못 함) | not_open(예매 오픈 전) | tracking(추적 중)
+--   dates         — 극장에 열린 전체 날짜
+--   matched_dates — screen_types 필터에 걸린 날짜 (필터가 있을 때의 비교 기준)
+CREATE TABLE IF NOT EXISTS watch_state (
+    target_id     integer PRIMARY KEY REFERENCES watch_targets(id) ON DELETE CASCADE,
+    status        text    NOT NULL DEFAULT 'unknown',
+    mov_no        text,
+    site_no       text,
+    mov_nm        text,
+    site_nm       text,
+    dates         text[]  NOT NULL DEFAULT '{}',
+    matched_dates text[]  NOT NULL DEFAULT '{}',
+    screen_types  text[]  NOT NULL DEFAULT '{}',
+    fail_count    integer NOT NULL DEFAULT 0,
+    last_ok       timestamptz,
+    last_error    text,
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- 날짜별 상영 시간표 캐시. payload는 CGV 응답 원본 배열을 그대로 담는다.
+-- (컬럼명 rows는 SQL 키워드와 헷갈리기 쉬워 payload로 둔다.)
+CREATE TABLE IF NOT EXISTS showtimes (
+    target_id  integer     NOT NULL REFERENCES watch_targets(id) ON DELETE CASCADE,
+    scn_ymd    text        NOT NULL,
+    payload    jsonb       NOT NULL,
+    fetched_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (target_id, scn_ymd)
+);
+
+-- 알림 이력. delivered=false로 먼저 남기고 Slack 전송이 성공하면 true로 올린다.
+-- 대상이 삭제돼도 이력은 남겨야 하므로 target_id는 SET NULL.
+CREATE TABLE IF NOT EXISTS alerts (
+    id           serial PRIMARY KEY,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    kind         text        NOT NULL,
+    target_id    integer REFERENCES watch_targets(id) ON DELETE SET NULL,
+    mov_nm       text,
+    site_nm      text,
+    dates        text[]  NOT NULL DEFAULT '{}',
+    body         text    NOT NULL,
+    delivered    boolean NOT NULL DEFAULT false,
+    delivered_at timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS alerts_created_at_idx ON alerts (created_at DESC);
+
+-- 폴링 사이클 이력. 대시보드의 "마지막 확인"과 소요 시간 추이가 여기서 나온다.
+CREATE TABLE IF NOT EXISTS poll_cycles (
+    id              bigserial PRIMARY KEY,
+    started_at      timestamptz NOT NULL DEFAULT now(),
+    finished_at     timestamptz,
+    ok              boolean,
+    trigger         text    NOT NULL DEFAULT 'schedule',  -- schedule | manual | cli
+    targets_checked integer NOT NULL DEFAULT 0,
+    requests        integer NOT NULL DEFAULT 0,
+    new_dates       integer NOT NULL DEFAULT 0,
+    error           text
+);
+
+CREATE INDEX IF NOT EXISTS poll_cycles_started_at_idx ON poll_cycles (started_at DESC);
+
+-- 영화·극장 목록 캐시. 감시 대상 편집 화면이 이름 대신 코드를 확정해 저장하도록 쓴다.
+CREATE TABLE IF NOT EXISTS catalog_movies (
+    mov_no       text PRIMARY KEY,
+    mov_nm       text NOT NULL,
+    atkt_rate    numeric,
+    refreshed_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS catalog_sites (
+    site_no      text PRIMARY KEY,
+    site_nm      text NOT NULL,
+    region       text,
+    refreshed_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 소유권 ──────────────────────────────────────────────────────────────────
+-- CREATE TABLE IF NOT EXISTS는 이미 있는 표를 건드리지 않으므로, 나중에 붙인
+-- 컬럼·제약은 ALTER로 따로 적용해야 한다. 아래도 전부 멱등이다.
+
+ALTER TABLE watch_targets ADD COLUMN IF NOT EXISTS
+    owner_id integer REFERENCES users(id) ON DELETE CASCADE;
+
+-- alerts.target_id는 ON DELETE SET NULL이라 대상을 지우면 소유자를 잃는다.
+-- 이력은 남아야 하므로 소유자를 직접 들고 있는다.
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS
+    owner_id integer REFERENCES users(id) ON DELETE SET NULL;
+
+-- 전송이 실패하면 상태를 밀지 않아 다음 확인에서 같은 알림을 다시 시도한다.
+-- 웹훅이 계속 죽어 있으면 30초마다 똑같은 행이 쌓이므로, 새 행을 만드는 대신
+-- 아직 못 보낸 같은 알림의 시도 횟수를 올린다.
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS
+    attempts integer NOT NULL DEFAULT 1;
+
+-- 같은 영화×극장을 사용자마다 따로 감시할 수 있어야 한다.
+ALTER TABLE watch_targets
+    DROP CONSTRAINT IF EXISTS watch_targets_movie_query_site_query_key;
+CREATE UNIQUE INDEX IF NOT EXISTS watch_targets_owner_movie_site_idx
+    ON watch_targets (owner_id, movie_query, site_query);
+
+CREATE INDEX IF NOT EXISTS watch_targets_owner_idx ON watch_targets (owner_id);
+CREATE INDEX IF NOT EXISTS alerts_owner_idx ON alerts (owner_id, created_at DESC);
