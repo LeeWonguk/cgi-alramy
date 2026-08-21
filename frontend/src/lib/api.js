@@ -38,3 +38,13 @@ export const del = (path) => send('DELETE', path)
 
 /** 알려진 상영관 종류. 부분 일치라 이 단어 하나로 파생 상영관까지 걸린다. */
 export const SCREEN_TYPES = ['IMAX', '4DX', 'SCREENX', 'DOLBY', 'CINE de CHEF']
+
+/** 웹훅 종류 표시 이름 — 서버의 store.WEBHOOK_KINDS와 짝이다. */
+export const WEBHOOK_LABELS = { slack: 'Slack', discord: 'Discord' }
+
+/** 로그인 수단 표시 이름 — 서버의 auth.PROVIDERS와 auth.LOCAL_PROVIDER의 짝이다. */
+export const PROVIDER_LABELS = {
+  naver: '네이버',
+  kakao: '카카오',
+  local: '로컬 계정',
+}

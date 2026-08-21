@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte'
-  import { get, patch, del } from '../lib/api.js'
+  import { get, patch, del, WEBHOOK_LABELS, PROVIDER_LABELS } from '../lib/api.js'
   import { fmtAgo, fmtDateTime } from '../lib/format.js'
 
   let { me } = $props()
@@ -84,7 +84,7 @@
         <th>계정</th>
         <th>로그인</th>
         <th>상태</th>
-        <th>Slack</th>
+        <th>알림</th>
         <th>마지막 로그인</th>
         <th></th>
       </tr>
@@ -110,10 +110,12 @@
               </div>
             </div>
           </td>
-          <td class="small muted">{user.provider}</td>
+          <td class="small muted">
+            {PROVIDER_LABELS[user.provider] ?? user.provider}
+          </td>
           <td><span class="badge {status.cls}">{status.text}</span></td>
           <td class="small muted">
-            {user.has_slack_webhook ? '개인 웹훅' : '기본 웹훅'}
+            {user.has_webhook ? `${WEBHOOK_LABELS[user.webhook_kind] ?? user.webhook_kind} 개인 웹훅` : '기본 웹훅'}
           </td>
           <td class="small muted" title={fmtDateTime(user.last_login_at)}>
             {fmtAgo(user.last_login_at)}

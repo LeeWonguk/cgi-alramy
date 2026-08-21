@@ -6,7 +6,8 @@
 CGV로 나가는 모든 요청은 browser_worker의 단일 스레드를 거친다. 요청 스레드가
 Playwright 세션을 직접 만지면 깨지기 때문이다.
 
-로그인은 네이버·카카오 소셜 로그인(auth.py)이고, 데이터는 사용자별로 나뉜다.
+로그인은 네이버·카카오 소셜 로그인(auth.py)이고, 키가 없을 때는 개발용 로컬
+계정으로도 들어올 수 있다. 데이터는 어느 쪽이든 사용자별로 나뉜다.
 API 핸들러는 반드시 `me()["id"]`로 범위를 좁혀야 남의 감시가 새어 나가지 않는다.
 """
 
@@ -92,6 +93,13 @@ def create_app(start_background: bool = True) -> Flask:
         log.warning("config.toml에 [[watch]] 항목이 남아 있습니다 — 이제 무시됩니다. "
                     "감시 대상은 웹 화면이나 `watch.py --migrate`로 관리하세요.")
 
+    # 비밀번호 없이 들어올 수 있는 상태다. 조용히 열려 있으면 위험하니 알린다.
+    local_login = auth.local_login_state()
+    if local_login["enabled"]:
+        log.warning("개발모드: 로컬 계정 로그인이 열려 있습니다 (%s). "
+                    "비밀번호가 없으므로 외부에 공개된 주소에서는 .env에 "
+                    "DEV_LOGIN=0을 두세요.", local_login["reason"])
+
     worker = BrowserWorker()
     poller = Poller(worker)
     app.extensions["cgv"] = {"worker": worker, "poller": poller,
@@ -151,8 +159,9 @@ def user_view(row: dict, *, full: bool = False) -> dict:
             "lookahead_days": row["lookahead_days"],
             "default_screen_types": row["default_screen_types"],
         }
-        # 웹훅 전체를 돌려주지 않는다 — 설정 여부만 알면 화면은 충분하다.
-        view["has_slack_webhook"] = bool(row["slack_webhook_url"])
+        # 웹훅 전체를 돌려주지 않는다 — 설정 여부와 종류만 알면 화면은 충분하다.
+        view["has_webhook"] = bool(row["webhook_url"])
+        view["webhook_kind"] = row["webhook_kind"] or "slack"
     return view
 
 
@@ -223,7 +232,38 @@ def register_auth(app: Flask) -> None:
     @app.get("/api/auth/providers")
     def auth_providers():
         return jsonify({"providers": auth.available(),
-                        "base_url": auth.public_base_url()})
+                        "base_url": auth.public_base_url(),
+                        "local": auth.local_login_state()})
+
+    @app.post("/api/auth/local/login")
+    def auth_local_login():
+        """개발용 로컬 계정 로그인 — 이름만 받는다 (비밀번호 없음).
+
+        열려 있는지는 요청마다 다시 확인한다. .env를 고쳐 껐다면 그 뒤로는
+        바로 막혀야 한다.
+        """
+        state = auth.local_login_state()
+        if not state["enabled"]:
+            return fail(f"로컬 계정 로그인이 꺼져 있습니다 — {state['reason']}", 403)
+        if parts(app)["db_error"]:
+            return fail(f"DB 접속 실패: {parts(app)['db_error']}", 503)
+
+        try:
+            profile = auth.local_profile(str(body().get("name", "")))
+        except auth.AuthError as exc:
+            return fail(str(exc))
+
+        account = store.login_user(
+            profile.provider, profile.provider_user_id,
+            nickname=profile.nickname,
+        )
+        session.clear()
+        session["user_id"] = account["id"]
+        session.permanent = True
+        # 비밀번호 없는 로그인이라 누가 언제 들어왔는지는 로그에 남겨 둔다.
+        log.warning("로컬 계정 로그인: %s (#%d, 요청 %s)", account["nickname"],
+                    account["id"], request.remote_addr)
+        return jsonify({"user": user_view(account, full=True)})
 
     @app.get("/api/auth/<provider_name>/login")
     def auth_login(provider_name: str):
@@ -565,11 +605,11 @@ def register_api(app: Flask) -> None:
 
     @app.patch("/api/me/settings")
     def patch_my_settings():
-        """내 취향 설정과 Slack 웹훅. 웹훅은 빈 문자열이면 전역 웹훅으로 되돌린다."""
+        """내 취향 설정과 알림 웹훅. 웹훅은 빈 문자열이면 전역 웹훅으로 되돌린다."""
         data = body()
         fields = {k: data[k] for k in
                   ("include_showtimes", "lookahead_days", "default_screen_types",
-                   "slack_webhook_url") if k in data}
+                   "webhook_url", "webhook_kind") if k in data}
         try:
             updated = store.update_user(me()["id"], **fields)
         except (TypeError, ValueError) as exc:
@@ -578,12 +618,21 @@ def register_api(app: Flask) -> None:
 
     @app.post("/api/test-notify")
     def test_notify():
-        ok = watch.send_slack(
+        """내 웹훅으로 테스트 메시지. 어디로 보냈는지도 함께 낸다."""
+        url, kind = watch.resolve_webhook(me().get("webhook_url"),
+                                          me().get("webhook_kind"))
+        ok = watch.send_webhook(
             "✅ *CGV 알림기 연결 테스트*\n"
-            "이 메시지가 보이면 Slack 알림이 정상 동작합니다.",
-            webhook_url=me().get("slack_webhook_url"),
+            "이 메시지가 보이면 알림이 정상 동작합니다.",
+            webhook_url=url, kind=kind,
         )
-        return jsonify({"sent": ok}), (200 if ok else 502)
+        return jsonify({
+            "sent": ok,
+            "kind": kind,
+            "label": watch.WEBHOOK_LABELS.get(kind, kind),
+            # 개인 웹훅이 없으면 .env의 전역 웹훅으로 나갔다는 뜻이다.
+            "personal": bool((me().get("webhook_url") or "").strip()),
+        }), (200 if ok else 502)
 
 
 # ── 정적 파일 ───────────────────────────────────────────────────────────────

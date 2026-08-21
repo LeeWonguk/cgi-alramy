@@ -2,11 +2,15 @@
 """네이버·카카오 소셜 로그인 (OAuth 2.0 authorization code).
 
 provider가 둘뿐이고 흐름도 표준 authorization code라, Authlib 같은 라이브러리를
-새로 들이지 않고 기존 `send_slack`(watch.py)처럼 urllib 표준 라이브러리로 처리한다.
+새로 들이지 않고 기존 `send_webhook`(watch.py)처럼 urllib 표준 라이브러리로 처리한다.
 
 신원은 **(provider, provider_user_id)** 로 잡는다. 카카오는 이메일이 선택 동의라
 사용자가 거부하면 아예 오지 않고, 이메일을 키로 쓰면 같은 이메일을 쓰는 다른
 provider 계정과 뭉개진다. 이메일·닉네임은 표시용으로만 쓴다.
+
+개발모드(`local_login`)는 OAuth 키 없이 이름만으로 들어오는 뒷문이다. 키를 받기
+전에도 화면을 띄워 보려면 필요하지만 **비밀번호가 없으므로** 켜지는 조건을
+좁혀 둔다 — 자세한 규칙은 `local_login_state()`에 있다.
 """
 
 from __future__ import annotations
@@ -256,3 +260,82 @@ def available() -> list[dict]:
         }
         for p in PROVIDERS.values()
     ]
+
+
+# ── 개발용 로컬 계정 ────────────────────────────────────────────────────────
+# OAuth 키를 받기 전에도 화면을 돌려 보려면 로그인 수단이 하나는 있어야 한다.
+# 비밀번호가 없는 뒷문이므로 provider는 'local'로 따로 두고(소셜 계정과 섞이지
+# 않는다) 켜지는 조건도 좁혀 둔다.
+LOCAL_PROVIDER = "local"
+LOCAL_LABEL = "로컬 계정"
+LOCAL_NAME_MAX = 40
+# PUBLIC_BASE_URL이 이 호스트일 때만 '키 없음 → 자동 활성'을 허용한다.
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+
+def _env_flag(name: str) -> bool | None:
+    """설정되지 않은 것과 꺼 둔 것을 구분해야 하므로 None을 따로 낸다."""
+    load_env()
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return None
+    return raw in ("1", "true", "yes", "on")
+
+
+def base_url_is_local() -> bool:
+    host = urllib.parse.urlsplit(public_base_url()).hostname or ""
+    return host.lower() in LOCAL_HOSTS
+
+
+def oauth_configured() -> bool:
+    return any(p.configured() for p in PROVIDERS.values())
+
+
+def local_login_state() -> dict:
+    """로컬 계정 로그인을 열어 둘지 판단한다.
+
+    `DEV_LOGIN`이 있으면 그 값이 최종이다. 없으면 **네이버·카카오 키가 하나도
+    없고** 공개 주소가 로컬일 때만 자동으로 켠다 — 실수로 외부에 열린 서버에서
+    이름만 적고 들어오는 일이 없게 하는 안전장치다.
+    """
+    forced = _env_flag("DEV_LOGIN")
+    if forced is False:
+        return {"enabled": False, "forced": True,
+                "reason": "DEV_LOGIN=0 이므로 로컬 계정 로그인을 쓰지 않습니다"}
+    if forced is True:
+        return {"enabled": True, "forced": True,
+                "reason": "DEV_LOGIN=1 이므로 로컬 계정 로그인이 열려 있습니다"}
+    if oauth_configured():
+        return {"enabled": False, "forced": False,
+                "reason": "네이버·카카오 로그인이 설정되어 있습니다 "
+                          "(그래도 쓰려면 .env에 DEV_LOGIN=1)"}
+    if not base_url_is_local():
+        return {"enabled": False, "forced": False,
+                "reason": f"공개 주소({public_base_url()})에서는 자동으로 켜지 "
+                          f"않습니다 (필요하면 .env에 DEV_LOGIN=1)"}
+    return {"enabled": True, "forced": False,
+            "reason": "네이버·카카오 키가 없어 개발모드로 동작합니다"}
+
+
+def local_login_enabled() -> bool:
+    return local_login_state()["enabled"]
+
+
+def local_profile(name: str) -> Profile:
+    """입력한 이름으로 로컬 계정 신원을 만든다.
+
+    provider_user_id는 소문자로 눌러 둔다 — 'Dev'와 'dev'가 각각 계정을 만들면
+    소유자 승인이 두 번 필요해지고 감시 대상도 갈린다.
+    """
+    display = " ".join((name or "").split())  # 연속 공백·앞뒤 공백 정리
+    if not display:
+        raise AuthError("계정 이름을 입력하세요")
+    if len(display) > LOCAL_NAME_MAX:
+        raise AuthError(f"계정 이름은 {LOCAL_NAME_MAX}자까지입니다")
+    if any(ch < " " for ch in display):
+        raise AuthError("계정 이름에 쓸 수 없는 문자가 있습니다")
+    return Profile(
+        provider=LOCAL_PROVIDER,
+        provider_user_id=display.casefold(),
+        nickname=display,
+    )

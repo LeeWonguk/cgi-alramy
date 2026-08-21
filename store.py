@@ -17,6 +17,7 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import psycopg
 from psycopg import sql
@@ -330,9 +331,35 @@ def clear_global_fail() -> None:
 # ── 사용자 ──────────────────────────────────────────────────────────────────
 USER_COLUMNS = """
     id, provider, provider_user_id, nickname, email, profile_image, status,
-    is_owner, slack_webhook_url, include_showtimes, lookahead_days,
+    is_owner, webhook_url, webhook_kind, include_showtimes, lookahead_days,
     default_screen_types, created_at, last_login_at
 """
+
+# 지원하는 웹훅 종류. 문구는 하나로 만들고 전송 직전에 서비스 문법으로 바꾼다
+# (watch.send_webhook).
+WEBHOOK_KINDS = ("slack", "discord")
+
+
+def normalize_webhook_kind(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    if kind not in WEBHOOK_KINDS:
+        raise ValueError(f"알 수 없는 웹훅 종류: {value!r} "
+                         f"({' | '.join(WEBHOOK_KINDS)})")
+    return kind
+
+
+def detect_webhook_kind(url: str | None) -> str | None:
+    """웹훅 주소에서 종류를 알아낸다. 확실하지 않으면 None.
+
+    사용자가 주소는 Discord 것으로 바꾸고 종류를 그대로 두는 실수가 흔하다.
+    주소에 서비스가 적혀 있으므로 저장할 때 이 값으로 바로잡는다.
+    """
+    host = urlparse((url or "").strip()).hostname or ""
+    if host.endswith("discord.com") or host.endswith("discordapp.com"):
+        return "discord"
+    if host.endswith("slack.com"):
+        return "slack"
+    return None
 
 
 def users() -> list[dict]:
@@ -442,9 +469,20 @@ def set_user_status(user_id: int, status: str) -> dict | None:
 
 
 def update_user(user_id: int, **fields: Any) -> dict | None:
-    """사용자 취향 설정과 Slack 웹훅을 갱신한다. 지정한 항목만 바뀐다."""
+    """사용자 취향 설정과 알림 웹훅을 갱신한다. 지정한 항목만 바뀐다.
+
+    webhook_url을 새로 주면 주소에서 알아낸 종류로 webhook_kind를 덮어쓴다 —
+    Slack 주소를 Discord로 표시해 두면 문법이 어긋난 문구가 나가기 때문이다.
+    """
+    fields = dict(fields)
+    if fields.get("webhook_url"):
+        detected = detect_webhook_kind(fields["webhook_url"])
+        if detected:
+            fields["webhook_kind"] = detected
+
     allowed = {
-        "slack_webhook_url": lambda v: (str(v).strip() or None) if v is not None else None,
+        "webhook_url": lambda v: (str(v).strip() or None) if v is not None else None,
+        "webhook_kind": normalize_webhook_kind,
         "include_showtimes": lambda v: coerce_setting("include_showtimes", v),
         "lookahead_days": lambda v: coerce_setting("lookahead_days", v),
         "default_screen_types": normalize_screen_types,
@@ -482,7 +520,8 @@ TARGET_COLUMNS = """
     u.nickname as owner_nickname, u.status as owner_status,
     u.include_showtimes as owner_include_showtimes,
     u.lookahead_days as owner_lookahead_days,
-    u.slack_webhook_url as owner_slack_webhook_url
+    u.webhook_url as owner_webhook_url,
+    u.webhook_kind as owner_webhook_kind
 """
 
 TARGET_FROM = (" from watch_targets t"

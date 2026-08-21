@@ -1,12 +1,27 @@
 <script>
-  import { patch, post, SCREEN_TYPES } from '../lib/api.js'
+  import { patch, post, SCREEN_TYPES, WEBHOOK_LABELS } from '../lib/api.js'
 
-  let { server, user, isOwner, onchange } = $props()
+  let { server, user, isOwner, onchange, onguide } = $props()
+
+  // 지원하는 웹훅. 종류를 바꾸면 문구가 그 서비스 문법으로 변환돼 나간다.
+  const KINDS = [
+    {
+      id: 'slack',
+      label: WEBHOOK_LABELS.slack,
+      hint: 'https://hooks.slack.com/services/T…/B…/…',
+    },
+    {
+      id: 'discord',
+      label: WEBHOOK_LABELS.discord,
+      hint: 'https://discord.com/api/webhooks/123…/토큰',
+    },
+  ]
 
   // ── 내 설정 ──
   let mine = $state(null)
   let webhook = $state('')
   let webhookTouched = $state(false)
+  let webhookKind = $state(null)
   let savingMine = $state(false)
 
   // ── 서버 설정 (소유자만) ──
@@ -21,12 +36,22 @@
     if (user?.settings && mine === null) mine = { ...user.settings }
   })
   $effect(() => {
+    if (user && webhookKind === null) webhookKind = user.webhook_kind ?? 'slack'
+  })
+  $effect(() => {
     if (server && draft === null) draft = { ...server }
   })
 
+  const kindInfo = $derived(KINDS.find((k) => k.id === webhookKind) ?? KINDS[0])
+  const kindDirty = $derived(!!webhookKind && webhookKind !== user?.webhook_kind)
+
   const mineDirty = $derived.by(() => {
     if (!mine || !user?.settings) return false
-    return JSON.stringify(mine) !== JSON.stringify(user.settings) || webhookTouched
+    return (
+      JSON.stringify(mine) !== JSON.stringify(user.settings) ||
+      webhookTouched ||
+      kindDirty
+    )
   })
   const serverDirty = $derived.by(() => {
     if (!draft || !server) return false
@@ -39,16 +64,26 @@
     mine.default_screen_types = [...current]
   }
 
+  /** 붙여넣은 주소에서 서비스를 알아내 종류를 맞춰준다 (서버도 한 번 더 본다). */
+  function onWebhookInput() {
+    webhookTouched = true
+    const url = webhook.trim()
+    if (/^https?:\/\/(\w+\.)*discord(app)?\.com\//.test(url)) webhookKind = 'discord'
+    else if (/^https?:\/\/hooks\.slack\.com\//.test(url)) webhookKind = 'slack'
+  }
+
   async function saveMine() {
     savingMine = true
     message = null
     error = null
     try {
       const payload = { ...mine }
-      if (webhookTouched) payload.slack_webhook_url = webhook
-      await patch('/api/me/settings', payload)
+      if (webhookTouched) payload.webhook_url = webhook
+      if (webhookTouched || kindDirty) payload.webhook_kind = webhookKind
+      const saved = await patch('/api/me/settings', payload)
       webhookTouched = false
       webhook = ''
+      webhookKind = saved.webhook_kind ?? webhookKind
       message = '내 설정을 저장했습니다'
       onchange?.()
     } catch (exc) {
@@ -79,10 +114,14 @@
     error = null
     try {
       const result = await post('/api/test-notify')
-      if (result.sent) message = 'Slack으로 테스트 메시지를 보냈습니다'
-      else error = 'Slack 전송에 실패했습니다 (웹훅 주소를 확인하세요)'
+      const where = result.personal ? '' : ' (서버 기본 웹훅)'
+      message = `${result.label}으로 테스트 메시지를 보냈습니다${where}`
     } catch (exc) {
-      error = exc.message
+      // 502면 서버가 전송에 실패한 것이다 — 주소나 채널 권한 문제가 대부분이다.
+      error =
+        exc.status === 502
+          ? '전송에 실패했습니다 — 웹훅 주소와 종류를 확인하세요'
+          : exc.message
     }
   }
 </script>
@@ -117,19 +156,45 @@
       <small class="muted">감시 대상을 추가할 때 폼에 미리 채워지는 값입니다.</small>
     </div>
 
+    <div class="field">
+      <span class="label">알림 받을 곳</span>
+      <div class="row">
+        {#each KINDS as kind (kind.id)}
+          <button
+            class="chip"
+            class:on={webhookKind === kind.id}
+            onclick={() => (webhookKind = kind.id)}>{kind.label}</button>
+        {/each}
+        {#if user.has_webhook}
+          <span class="badge">
+            {KINDS.find((k) => k.id === user.webhook_kind)?.label ?? user.webhook_kind}
+            웹훅 저장됨
+          </span>
+        {:else}
+          <span class="badge">서버 기본 웹훅 사용 중</span>
+        {/if}
+      </div>
+      <small class="muted">
+        같은 문구를 고른 서비스의 문법(굵게·링크)으로 바꿔 보냅니다.
+      </small>
+    </div>
+
     <label class="field">
-      <span>내 Slack 웹훅</span>
+      <span>내 {kindInfo.label} 웹훅 주소</span>
       <input
         type="url"
-        placeholder={user.has_slack_webhook
+        placeholder={user.has_webhook
           ? '설정되어 있습니다 — 바꾸려면 새 주소를 입력하세요'
-          : 'https://hooks.slack.com/services/...  (비우면 서버 기본 웹훅)'}
+          : `${kindInfo.hint}  (비우면 서버 기본 웹훅)`}
         bind:value={webhook}
-        oninput={() => (webhookTouched = true)} />
+        oninput={onWebhookInput} />
       <small class="muted">
         내 감시의 알림은 여기로 갑니다. 비워 두면 서버의 기본 웹훅(<code>.env</code>의
-        <code>SLACK_WEBHOOK_URL</code>)으로 갑니다. 저장된 주소는 보안을 위해 다시
-        보여주지 않습니다.
+        <code>SLACK_WEBHOOK_URL</code> · <code>DISCORD_WEBHOOK_URL</code>)으로 갑니다.
+        저장된 주소는 보안을 위해 다시 보여주지 않습니다.
+        {#if onguide}
+          <button class="linkish" onclick={onguide}>발급 방법 보기 →</button>
+        {/if}
       </small>
     </label>
 
@@ -137,7 +202,7 @@
       <button class="primary" onclick={saveMine} disabled={savingMine || !mineDirty}>
         {savingMine ? '저장 중…' : '내 설정 저장'}
       </button>
-      <button class="ghost" onclick={testNotify}>Slack 테스트</button>
+      <button class="ghost" onclick={testNotify}>테스트 메시지 보내기</button>
       {#if message}<span class="small ok-text">{message}</span>{/if}
       {#if error}<span class="small err-text">{error}</span>{/if}
     </div>
@@ -239,6 +304,20 @@
     border-color: transparent;
     color: #fff;
     font-weight: 600;
+  }
+  /* 안내 문구 안에 섞여 들어가는 링크형 버튼 — 탭 이동이라 <a>가 아니다. */
+  button.linkish {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--accent);
+    font: inherit;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  button.linkish:hover {
+    background: none;
+    text-decoration: underline;
   }
   .ok-text {
     color: var(--ok);

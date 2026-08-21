@@ -1,6 +1,7 @@
 -- CGV 알림기 스키마. store.init_db()가 매번 실행하므로 전부 멱등이어야 한다.
 
--- 네이버·카카오 로그인 사용자.
+-- 로그인 사용자. provider는 naver · kakao, 그리고 개발모드의 local이다
+-- (local은 비밀번호 없이 이름만으로 들어오는 계정 — auth.local_login_state 참고).
 --   신원은 (provider, provider_user_id)로 잡는다. 카카오는 이메일이 선택 동의라
 --   사용자가 거부하면 아예 오지 않고, 이메일을 키로 쓰면 같은 이메일의 다른
 --   provider 계정과 뭉개진다. 이메일·닉네임은 표시용으로만 둔다.
@@ -14,8 +15,10 @@ CREATE TABLE IF NOT EXISTS users (
     profile_image        text,
     status               text    NOT NULL DEFAULT 'pending',
     is_owner             boolean NOT NULL DEFAULT false,
-    -- 비어 있으면 .env의 전역 SLACK_WEBHOOK_URL로 보낸다.
-    slack_webhook_url    text,
+    -- 알림 웹훅. 비어 있으면 .env의 전역 웹훅으로 보낸다.
+    --   webhook_kind: slack | discord — 같은 문구를 서비스별 문법으로 바꿔 보낸다.
+    webhook_url          text,
+    webhook_kind         text NOT NULL DEFAULT 'slack',
     -- 사용자별 취향. 확인 간격·headless 같은 서버 공용 설정은 settings에 남는다.
     include_showtimes    boolean NOT NULL DEFAULT true,
     lookahead_days       integer NOT NULL DEFAULT 0,
@@ -81,7 +84,7 @@ CREATE TABLE IF NOT EXISTS showtimes (
     PRIMARY KEY (target_id, scn_ymd)
 );
 
--- 알림 이력. delivered=false로 먼저 남기고 Slack 전송이 성공하면 true로 올린다.
+-- 알림 이력. delivered=false로 먼저 남기고 웹훅 전송이 성공하면 true로 올린다.
 -- 대상이 삭제돼도 이력은 남겨야 하므로 target_id는 SET NULL.
 CREATE TABLE IF NOT EXISTS alerts (
     id           serial PRIMARY KEY,
@@ -154,3 +157,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS watch_targets_owner_movie_site_idx
 
 CREATE INDEX IF NOT EXISTS watch_targets_owner_idx ON watch_targets (owner_id);
 CREATE INDEX IF NOT EXISTS alerts_owner_idx ON alerts (owner_id, created_at DESC);
+
+-- ── 웹훅: Slack 전용 → Slack·Discord ────────────────────────────────────────
+-- 예전 이름 slack_webhook_url을 Discord도 담을 수 있게 webhook_url로 옮긴다.
+-- RENAME에는 IF NOT EXISTS가 없으므로 옮길 컬럼이 남아 있을 때만 실행한다.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'users' AND column_name = 'slack_webhook_url')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'users' AND column_name = 'webhook_url')
+    THEN
+        ALTER TABLE users RENAME COLUMN slack_webhook_url TO webhook_url;
+    END IF;
+END $$;
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS webhook_url  text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS webhook_kind text NOT NULL DEFAULT 'slack';

@@ -2,7 +2,7 @@
 """CGV 예매 가능 날짜 추가 알림기 — CGV 접근과 비교 로직.
 
 DB(store)에 등록된 영화×극장 조합의 예매 가능 날짜를 확인해, 이전 확인
-때보다 날짜가 늘어났으면 Slack으로 알린다.
+때보다 날짜가 늘어났으면 웹훅(Slack·Discord)으로 알린다.
 
 CGV는 Cloudflare가 TLS 지문 단위로 봇을 막기 때문에 requests/curl로는
 헤더를 완벽히 맞춰도 403이 떨어진다. 그래서 Chromium을 실제로 띄우고
@@ -20,6 +20,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -58,7 +59,7 @@ ROOT = Path(__file__).resolve().parent
 LOCK_PATH = ROOT / ".watch.lock"
 LOG_PATH = ROOT / "logs" / "watch.log"
 
-FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 Slack 경고
+FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 웹훅 경고
 WEEKDAYS = "월화수목금토일"
 
 log = logging.getLogger("cgv-watch")
@@ -281,23 +282,71 @@ def resolve(query: str, items: list[dict], name_key: str) -> tuple[dict | None, 
     return None, f"여러 항목에 걸립니다 ({names}) — 더 구체적으로 적어주세요"
 
 
-# ── Slack ───────────────────────────────────────────────────────────────────
-def send_slack(text: str, dry_run: bool = False,
-               webhook_url: str | None = None) -> bool:
-    """Slack으로 보낸다. webhook_url을 주면 그쪽으로, 없으면 .env의 전역 웹훅으로."""
+# ── 웹훅 (Slack · Discord) ──────────────────────────────────────────────────
+# 알림 문구는 Slack mrkdwn 한 가지로만 만들고, 전송 직전에 서비스 문법으로 옮긴다.
+# 두 벌의 포맷 함수를 들고 있으면 문구를 고칠 때마다 한쪽을 잊는다.
+WEBHOOK_LABELS = {"slack": "Slack", "discord": "Discord"}
+DISCORD_LIMIT = 2000    # content 최대 길이 — 넘기면 400이 떨어진다
+SLACK_LIMIT = 39000     # text 최대 길이 (문서상 40000)
+
+# <url|라벨> · <url> — Slack의 링크 표기
+LINK_LABELED_RE = re.compile(r"<(https?://[^|>\s]+)\|([^>]+)>")
+LINK_BARE_RE = re.compile(r"<(https?://[^>\s]+)>")
+# *굵게* — 앞뒤에 별이 더 붙지 않은 한 쌍만
+BOLD_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+
+
+def to_discord_markdown(text: str) -> str:
+    """Slack mrkdwn 문구를 Discord 마크다운으로 옮긴다.
+
+    링크는 <url|라벨> → [라벨](url), 굵게는 *한 개* → **두 개**다.
+    Discord에서 별 하나는 기울임이라 그대로 보내면 강조가 어긋난다.
+    """
+    text = LINK_LABELED_RE.sub(r"[\2](\1)", text)
+    text = LINK_BARE_RE.sub(r"\1", text)
+    return BOLD_RE.sub(r"**\1**", text)
+
+
+def webhook_payload(text: str, kind: str) -> dict:
+    """서비스별 요청 본문. 길이 제한을 넘으면 잘라 보낸다 (400보다 낫다)."""
+    if kind == "discord":
+        return {"content": to_discord_markdown(text)[:DISCORD_LIMIT]}
+    return {"text": text[:SLACK_LIMIT]}
+
+
+def resolve_webhook(webhook_url: str | None = None,
+                    kind: str | None = None) -> tuple[str, str]:
+    """보낼 곳과 종류를 정한다 — 사용자 설정이 없으면 .env의 전역 웹훅.
+
+    종류를 주지 않았거나 주소와 어긋나면 주소에서 알아낸 값을 쓴다.
+    """
+    url = (webhook_url or "").strip()
+    if not url:
+        url = (os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+               or os.environ.get("DISCORD_WEBHOOK_URL", "").strip())
+        kind = None  # 전역 웹훅에는 사용자가 고른 종류를 적용하지 않는다
+    detected = store.detect_webhook_kind(url)
+    return url, (detected or kind or "slack")
+
+
+def send_webhook(text: str, dry_run: bool = False,
+                 webhook_url: str | None = None,
+                 kind: str | None = None) -> bool:
+    """웹훅으로 보낸다. webhook_url을 주면 그쪽으로, 없으면 .env의 전역 웹훅으로."""
     if dry_run:
-        print("\n--- [dry-run] Slack 전송 안 함 ---")
+        print("\n--- [dry-run] 웹훅 전송 안 함 ---")
         print(text)
         print("-" * 34)
         return True
 
-    url = (webhook_url or "").strip() or os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    url, kind = resolve_webhook(webhook_url, kind)
     if not url:
-        log.error("보낼 Slack 웹훅이 없습니다 "
-                  "(사용자 설정 또는 .env의 SLACK_WEBHOOK_URL을 확인하세요)")
+        log.error("보낼 웹훅이 없습니다 (웹의 '설정' 탭 또는 .env의 "
+                  "SLACK_WEBHOOK_URL·DISCORD_WEBHOOK_URL을 확인하세요)")
         return False
 
-    body = json.dumps({"text": text}).encode("utf-8")
+    label = WEBHOOK_LABELS.get(kind, kind)
+    body = json.dumps(webhook_payload(text, kind)).encode("utf-8")
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}
     )
@@ -306,32 +355,40 @@ def send_slack(text: str, dry_run: bool = False,
             time.sleep(2**attempt)
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status == 200:
+                # Slack은 200 + "ok", Discord는 204 + 빈 본문으로 답한다.
+                if 200 <= resp.status < 300:
                     return True
-                log.warning("Slack 응답 코드 %d", resp.status)
+                log.warning("%s 응답 코드 %d", label, resp.status)
+        except urllib.error.HTTPError as exc:
+            # 400·404는 주소나 본문이 틀린 것이다 — 재시도해도 같은 답이 온다.
+            detail = exc.read(500).decode("utf-8", "replace").strip()
+            log.error("%s 전송 실패 (HTTP %d): %s", label, exc.code, detail)
+            if exc.code < 500:
+                return False
         except (urllib.error.URLError, TimeoutError) as exc:
-            log.warning("Slack 전송 실패 (%d/3): %s", attempt + 1, exc)
-    log.error("Slack 전송을 포기했습니다")
+            log.warning("%s 전송 실패 (%d/3): %s", label, attempt + 1, exc)
+    log.error("%s 전송을 포기했습니다", label)
     return False
 
 
 def deliver_alert(kind: str, body: str, *, dry_run: bool = False,
                   target_id: int | None = None, owner_id: int | None = None,
-                  webhook_url: str | None = None, mov_nm: str | None = None,
+                  webhook_url: str | None = None,
+                  webhook_kind: str | None = None, mov_nm: str | None = None,
                   site_nm: str | None = None, dates: list[str] | None = None) -> bool:
-    """알림을 이력에 남기고 그 소유자의 Slack으로 보낸다. 전송 성공 여부를 반환.
+    """알림을 이력에 남기고 그 소유자의 웹훅으로 보낸다. 전송 성공 여부를 반환.
 
     먼저 delivered=false로 적어 두므로, 전송이 실패해도 "무엇을 못 보냈는지"가
     화면에 남는다. dry-run은 이력도 남기지 않는다 — 아무것도 바꾸지 않는 게 뜻이다.
     """
     if dry_run:
-        return send_slack(body, dry_run=True)
+        return send_webhook(body, dry_run=True)
 
     alert_id = store.record_alert(
         kind, body, target_id=target_id, owner_id=owner_id, mov_nm=mov_nm,
         site_nm=site_nm, dates=dates or [],
     )
-    if send_slack(body, webhook_url=webhook_url):
+    if send_webhook(body, webhook_url=webhook_url, kind=webhook_kind):
         store.mark_alert_delivered(alert_id)
         return True
     return False
@@ -360,7 +417,7 @@ def matches_screen_types(row: dict, wanted: list[str]) -> bool:
 def group_showtimes(rows: list[dict]) -> list[dict]:
     """상영 목록을 상영관별로 묶는다 — [{label, times}, ...].
 
-    Slack 알림과 웹 화면이 같은 묶음을 쓰도록 포맷과 분리해 둔다.
+    웹훅 알림과 웹 화면이 같은 묶음을 쓰도록 포맷과 분리해 둔다.
     """
     grouped: dict[tuple[str, str], list[str]] = {}
     for row in rows:
@@ -522,7 +579,8 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
     messages: list[dict] = []  # 운영 알림 — 상태 진행과 무관
     deferred: list[dict] = []  # 전송에 성공해야 상태를 미는 날짜 알림
     config_errors: list[tuple[int | None, str]] = []  # (소유자, 문제)
-    owner_webhooks: dict[int | None, str | None] = {}  # 설정 오류를 보낼 곳
+    # 설정 오류를 보낼 곳 — 소유자별 (웹훅 주소, 종류)
+    owner_webhooks: dict[int | None, tuple[str | None, str | None]] = {}
 
     def add_config_error(owner_id: int | None, problem: str) -> None:
         # 같은 오타가 대상 수만큼 중복되지 않게 한 번만 담는다.
@@ -539,8 +597,9 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
 
         # 확인 조건과 알림 수신처는 그 대상의 **소유자** 것을 쓴다.
         owner_id = row["owner_id"]
-        webhook = row["owner_slack_webhook_url"] if owner_id else None
-        owner_webhooks[owner_id] = webhook
+        webhook = row["owner_webhook_url"] if owner_id else None
+        webhook_kind = row["owner_webhook_kind"] if owner_id else None
+        owner_webhooks[owner_id] = (webhook, webhook_kind)
         lookahead = int((row["owner_lookahead_days"] if owner_id
                          else seed["lookahead_days"]) or 0)
         want_showtimes = bool(row["owner_include_showtimes"] if owner_id
@@ -599,6 +658,7 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
                         "kind": "fetch_error",
                         "owner_id": owner_id,
                         "webhook": webhook,
+                        "webhook_kind": webhook_kind,
                         "body": "⚠️ *CGV 알림기 조회 실패*\n"
                                 f"*{mov_nm}* · CGV {site_nm} — "
                                 f"{fails}회 연속 실패\n`{exc}`",
@@ -708,9 +768,10 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
 
         if alert:
             # 알림 전송이 성공한 뒤에만 상태를 갱신한다. 지금 반영해 버리면
-            # Slack 전송이 실패했을 때 그 날짜를 두 번 다시 알릴 수 없다.
+            # 웹훅 전송이 실패했을 때 그 날짜를 두 번 다시 알릴 수 없다.
             deferred.append({"target_id": target_id, "owner_id": owner_id,
-                             "webhook": webhook, "kind": kind, "body": alert,
+                             "webhook": webhook, "webhook_kind": webhook_kind,
+                             "kind": kind, "body": alert,
                              "fresh": fresh, "dates": new_dates or tracked})
         elif not dry_run:
             store.save_state(target_id, **fresh)
@@ -726,10 +787,12 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
             for problem_owner, problem in config_errors:
                 by_owner.setdefault(problem_owner, []).append(problem)
             for problem_owner, problems in by_owner.items():
+                hook, hook_kind = owner_webhooks.get(problem_owner, (None, None))
                 messages.append({
                     "kind": "config_error",
                     "owner_id": problem_owner,
-                    "webhook": owner_webhooks.get(problem_owner),
+                    "webhook": hook,
+                    "webhook_kind": hook_kind,
                     "body": "⚠️ *CGV 알림기 설정 오류*\n"
                             + "\n".join(f"• {p}" for p in problems)
                             + "\n웹의 감시 대상 화면에서 정확한 영화·극장을 "
@@ -751,8 +814,8 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
         sent = deliver_alert(
             item["kind"], item["body"], dry_run=dry_run,
             target_id=item["target_id"], owner_id=item["owner_id"],
-            webhook_url=item["webhook"], mov_nm=fresh["mov_nm"],
-            site_nm=fresh["site_nm"], dates=item["dates"],
+            webhook_url=item["webhook"], webhook_kind=item["webhook_kind"],
+            mov_nm=fresh["mov_nm"], site_nm=fresh["site_nm"], dates=item["dates"],
         )
         if sent:
             summary["alerts_sent"] += 1
@@ -766,7 +829,8 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
     for message in messages:
         deliver_alert(message["kind"], message["body"], dry_run=dry_run,
                       owner_id=message["owner_id"],
-                      webhook_url=message["webhook"])
+                      webhook_url=message["webhook"],
+                      webhook_kind=message["webhook_kind"])
 
     summary["requests"] = cgv.requests - requests_before
     if dry_run:
@@ -869,7 +933,7 @@ def summary_fields(summary: dict) -> dict:
 
 
 def report_connect_failure(exc: Exception, dry_run: bool) -> None:
-    """브라우저 기동·접속 실패. 연속 3회일 때만 Slack으로 알린다."""
+    """브라우저 기동·접속 실패. 연속 3회일 때만 웹훅으로 알린다."""
     log.error("%s", exc)
     if dry_run:
         return
@@ -884,13 +948,13 @@ def report_connect_failure(exc: Exception, dry_run: bool) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="CGV 예매 가능 날짜가 추가되면 Slack으로 알립니다. "
+        description="CGV 예매 가능 날짜가 추가되면 Slack·Discord로 알립니다. "
                     "상시 동작은 `python3 -m web.app`(웹 서버)이 담당합니다."
     )
     parser.add_argument("--once", action="store_true",
                         help="1회 확인 (기본 동작)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Slack 전송·DB 갱신 없이 감지 결과만 출력")
+                        help="웹훅 전송·DB 갱신 없이 감지 결과만 출력")
     parser.add_argument("--list-movies", action="store_true",
                         help="예매 가능 영화 목록 출력 (정확한 이름·코드 확인)")
     parser.add_argument("--list-sites", nargs="?", const="", metavar="지역",
@@ -900,7 +964,7 @@ def main() -> int:
     parser.add_argument("--migrate", action="store_true",
                         help="config.toml·state.json을 DB로 이관 (1회용)")
     parser.add_argument("--test-notify", action="store_true",
-                        help="Slack 연동만 테스트")
+                        help="웹훅 연동만 테스트 (.env의 전역 웹훅)")
     parser.add_argument("-v", "--verbose", action="store_true", help="상세 로그")
     args = parser.parse_args()
 
@@ -908,9 +972,9 @@ def main() -> int:
     load_env()
 
     if args.test_notify:
-        ok = send_slack(
+        ok = send_webhook(
             "✅ *CGV 알림기 연결 테스트*\n"
-            "이 메시지가 보이면 Slack 알림이 정상 동작합니다.",
+            "이 메시지가 보이면 알림이 정상 동작합니다.",
             dry_run=args.dry_run,
         )
         return 0 if ok else 1

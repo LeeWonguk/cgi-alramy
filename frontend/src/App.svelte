@@ -9,6 +9,7 @@
   import History from './views/History.svelte'
   import Settings from './views/Settings.svelte'
   import Users from './views/Users.svelte'
+  import WebhookGuide from './views/WebhookGuide.svelte'
 
   // 서버가 30초마다 확인하므로 5초 폴링이면 거의 실시간이다.
   // DB 읽기라 비용이 없어 SSE의 장기 연결 관리를 감당할 이유가 없다.
@@ -32,6 +33,7 @@
     { id: 'history', label: '이력' },
     ...(isOwner ? [{ id: 'users', label: '사용자' }] : []),
     { id: 'settings', label: '설정' },
+    { id: 'webhooks', label: '웹훅 설정법' },
   ])
 
   async function loadSession() {
@@ -201,7 +203,10 @@
         server={data?.settings}
         {user}
         {isOwner}
-        onchange={() => loadSession().then(refresh)} />
+        onchange={() => loadSession().then(refresh)}
+        onguide={() => (tab = 'webhooks')} />
+    {:else if tab === 'webhooks'}
+      <WebhookGuide {user} onsettings={() => (tab = 'settings')} />
     {/if}
   </main>
 {/if}
