@@ -148,9 +148,11 @@
               {#if countdown !== null}다음 확인 {countdown}초{:else}대기 중{/if}
             </span>
           {/if}
-          <button class="primary" onclick={checkNow} disabled={checking}>
-            {checking ? '확인 중…' : '지금 확인'}
-          </button>
+          {#if isOwner}
+            <button class="primary" onclick={checkNow} disabled={checking}>
+              {checking ? '확인 중…' : '지금 확인'}
+            </button>
+          {/if}
           <div class="row who small" style="gap: 6px">
             {#if user.profile_image}
               <img class="avatar" src={user.profile_image} alt="" />

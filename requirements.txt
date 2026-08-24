@@ -1,0 +1,24 @@
+# CGV 예매 알림기 런타임 의존성.
+#
+#   pip install -r requirements.txt
+#   playwright install chromium        # 브라우저 바이너리는 따로 받는다
+#
+# 지금까지는 README와 install.sh의 pip 문구가 유일한 출처였고 버전이 고정돼
+# 있지 않았다. CGV 접근이 Playwright/Chromium 동작에 직접 매여 있어서, 어느
+# 버전에서 되던 것인지가 남아 있지 않으면 문제가 났을 때 되돌릴 지점이 없다.
+#
+# 아래 값은 실제로 동작을 확인한 조합이다 (Python 3.13.13, macOS).
+# 하한만 두는 대신 정확히 고정한다 — 상주 서비스라 조용히 바뀌는 게 더 나쁘다.
+
+playwright==1.61.0
+
+flask==3.1.3
+waitress==3.0.2
+
+# psycopg 3. binary는 libpq를 함께 담은 휠, pool은 상주 서버용 커넥션 풀이다.
+psycopg==3.3.4
+psycopg-binary==3.3.4
+psycopg-pool==3.3.1
+
+# 테스트는 표준 라이브러리 unittest만 쓴다 — 추가 의존성이 없다.
+#   python3 -m unittest discover -s tests -v

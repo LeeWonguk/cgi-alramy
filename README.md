@@ -47,7 +47,7 @@ Playwright의 sync API는 **세션을 만든 스레드에서만** 쓸 수 있습
 
 ```bash
 # 1. 의존성
-pip install playwright flask 'psycopg[binary,pool]' waitress
+pip install -r requirements.txt
 playwright install chromium
 
 # 2. 설정
@@ -149,6 +149,7 @@ Cloudflare Tunnel이면 포트 개방 없이 HTTPS가 붙습니다. nginx 리버
 | **이력** | 내가 받은 알림(전송 성공 여부). 소유자는 확인 사이클 기록과 로그도 |
 | **사용자** | 소유자 전용 — 승인 대기 계정 승인·차단·삭제 |
 | **설정** | 내 설정(알림 옵션·웹훅 주소·종류). 소유자는 서버 설정(확인 간격 등)도 |
+| **헤더** | 서버 상태·다음 확인 카운트다운. `지금 확인` 버튼은 **소유자만** — 사이클이 모든 사용자의 대상을 한 번에 돌기 때문입니다 |
 | **웹훅 설정법** | Slack·Discord 웹훅 발급 절차와 문제 해결 안내 |
 
 영화·극장은 목록에서 골라 저장하므로 오타로 인한 설정 오류가 생기지 않습니다.
@@ -173,6 +174,24 @@ Cloudflare Tunnel이면 포트 개방 없이 HTTPS가 붙습니다. nginx 리버
 > 이미 확인된 날짜는 다시 조회하지 않으므로, 보통은 **아직 그 상영관이 없는
 > 날짜 수만큼**만 요청이 늘어납니다.
 
+### 며칠 이내만 알림
+
+`며칠 이내`(`lookahead_days`)를 정하면 그 범위 안에 열린 날짜만 알립니다. 0이면
+제한이 없습니다(기본값).
+
+범위 밖 날짜는 **기준선에도 넣지 않습니다.** 넣어 버리면 시간이 흘러 그 날짜가
+범위 안으로 들어와도 "이미 아는 날짜"가 되어 알림이 영구히 사라집니다. 대신
+아직 알리지 않은 날짜로 남겨 두고, 범위에 들어온 뒤에 한 번 알립니다.
+
+상영관 필터를 함께 쓰면 범위 밖 날짜의 시간표는 조회하지 않으므로 요청도 줄어듭니다.
+
+## 영화·극장 목록
+
+감시 대상이 모두 코드 캐시에 걸리면 확인 사이클은 목록 API를 아예 부르지 않습니다.
+그래서 목록이 저절로 갱신될 계기가 없어, 서버가 **하루에 한 번** 따로 받아 둡니다
+(요청 2건). 신작이 바로 보이지 않으면 감시 대상 화면의 `목록 다시 받기`를 누르면
+됩니다.
+
 ## 데이터
 
 감시 대상과 설정의 출처는 **Postgres**입니다. `config.toml`은 최초 1회 시드로만
@@ -188,7 +207,7 @@ Cloudflare Tunnel이면 포트 개방 없이 HTTPS가 붙습니다. nginx 리버
 | `showtimes` | 날짜별 시간표 캐시 (화면이 CGV를 다시 부르지 않게) |
 | `alerts` | 보낸 알림, 소유자, 전송 성공 여부와 시도 횟수 |
 | `poll_cycles` | 확인 사이클 기록 (시각·요청 수·소요) |
-| `catalog_movies` / `catalog_sites` | 영화·극장 목록 캐시 |
+| `catalog_movies` / `catalog_sites` | 영화·극장 목록 캐시 (하루 한 번 자동 갱신) |
 
 ### 무엇이 개인 것이고 무엇이 서버 것인가
 
@@ -228,14 +247,14 @@ Cloudflare Tunnel이면 포트 개방 없이 HTTPS가 붙습니다. nginx 리버
 | PATCH/DELETE | `/api/targets/<id>` | `enabled`·`screen_types` 수정 / 삭제 |
 | POST | `/api/targets/<id>/reset` | 기준선 초기화 |
 | GET | `/api/catalog` | 영화·극장 목록 (DB 캐시) |
-| POST | `/api/catalog/refresh` | 목록을 CGV에서 다시 받기 |
+| POST | `/api/catalog/refresh` | 목록을 CGV에서 다시 받기 (서버도 하루 한 번 자동으로 받습니다) |
 | POST | `/api/lookup` | `{mov_no, site_no}` → 예매 가능 날짜 |
 | POST | `/api/lookup/showtimes` | `{mov_no, site_no, date, screen_types?}` → 시간표 |
 | GET | `/api/showtimes?target_id=&date=` | 캐시된 시간표 (내 대상만) |
 | GET | `/api/alerts` | 내 알림 이력 (`?limit=`) |
 | GET | `/api/cycles`, `/api/logs` | **소유자 전용** — 사이클 이력, 로그 tail |
 | GET/PATCH | `/api/users`, `/api/users/<id>` | **소유자 전용** — 승인·차단·삭제 |
-| POST | `/api/check-now` | 즉시 1회 확인 |
+| POST | `/api/check-now` | **소유자 전용** — 즉시 1회 확인 (사이클은 서버 전체를 돈다) |
 | GET | `/api/settings` | 서버 설정 (PATCH는 소유자 전용) |
 | POST | `/api/test-notify` | 내 웹훅으로 테스트 메시지 (어디로 보냈는지도 응답) |
 
@@ -261,6 +280,7 @@ SPA 껍데기(`/`와 정적 파일)만 열려 있고, 데이터는 API로만 나
 | `python3 watch.py --list-sites [지역]` | 극장명 + 코드 |
 | `python3 watch.py --test-notify` | 웹훅 연동만 테스트 (`.env`의 전역 웹훅) |
 | `python3 store.py init` | DB·테이블 생성 및 점검 |
+| `python3 -m unittest discover -s tests` | 감지 로직 테스트 (CGV·운영 DB를 건드리지 않습니다) |
 
 ## 개발
 

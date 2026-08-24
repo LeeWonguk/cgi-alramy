@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS watch_targets (
 
 -- 이전 관측 결과. 여기 없는 대상은 "첫 관측"으로 취급해 알림 없이 기준선만 잡는다.
 --   status: unknown(아직 확인 못 함) | not_open(예매 오픈 전) | tracking(추적 중)
---   dates         — 극장에 열린 전체 날짜
+--   dates         — 비교 기준이 되는 날짜 (필터가 없을 때). lookahead_days를
+--                   쓰면 그 범위 안의 날짜만 담는다 — 범위 밖 날짜를 여기 넣으면
+--                   나중에 범위 안으로 들어와도 "이미 아는 날짜"가 되어 그 날짜의
+--                   알림이 영구히 사라진다. 필터가 있으면 열린 전체 날짜가 들어온다.
 --   matched_dates — screen_types 필터에 걸린 날짜 (필터가 있을 때의 비교 기준)
 CREATE TABLE IF NOT EXISTS watch_state (
     target_id     integer PRIMARY KEY REFERENCES watch_targets(id) ON DELETE CASCADE,

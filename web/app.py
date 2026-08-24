@@ -584,7 +584,12 @@ def register_api(app: Flask) -> None:
     # ── 동작 ──
     @app.post("/api/check-now")
     def check_now():
-        return jsonify(parts(app)["poller"].run_cycle("manual"))
+        # 사이클은 **모든 사용자의 대상**을 한 바퀴 확인한다 — 한 사람의 버튼이
+        # 서버 전체를 움직이므로 소유자 전용이다. (/api/cycles·/api/logs·
+        # PATCH /api/settings 와 같은 기준.) 사용자별로 자기 대상만 확인하게
+        # 하려면 check_all에 소유자 스코프를 넣어야 한다 — 그때 다시 열면 된다.
+        denied = owner_only()
+        return denied or jsonify(parts(app)["poller"].run_cycle("manual"))
 
     @app.get("/api/settings")
     def get_settings():

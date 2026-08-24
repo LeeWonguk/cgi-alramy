@@ -747,15 +747,24 @@ def record_alert(kind: str, body: str, *, target_id: int | None = None,
     아직 못 보낸 **같은** 알림이 있으면 새 행을 만들지 않고 시도 횟수만 올린다.
     전송 실패 시 상태를 밀지 않는 설계라, 웹훅이 계속 죽어 있으면 30초마다
     똑같은 행이 쌓여 이력이 못 쓰게 된다.
+
+    "같은 알림"에는 **소유자도 포함된다.** config_error·connect_error는
+    target_id가 없고 dates도 비어 있어서, 소유자를 보지 않으면 사용자 A의
+    미전송 알림을 B의 알림이 덮어써 A의 본문이 바뀌고 B의 이력은 생기지 않는다.
+    한 행만 고르는 것도 같은 이유다 — UPDATE에 LIMIT을 못 걸어 서브쿼리로 잡는다.
     """
     dates = list(dates or [])
     with pool().connection() as conn:
         pending = conn.execute(
             "update alerts set attempts = attempts + 1, body = %s, created_at = %s"
-            " where not delivered and kind = %s and dates = %s"
-            "   and target_id is not distinct from %s"
+            " where id = ("
+            "     select id from alerts"
+            "      where not delivered and kind = %s and dates = %s"
+            "        and target_id is not distinct from %s"
+            "        and owner_id is not distinct from %s"
+            "      order by id limit 1)"
             " returning id",
-            (body, _now(), kind, dates, target_id),
+            (body, _now(), kind, dates, target_id, owner_id),
         ).fetchone()
         if pending:
             return int(pending["id"])

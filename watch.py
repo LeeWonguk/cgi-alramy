@@ -496,6 +496,19 @@ def within_lookahead(ymd: str, lookahead_days: int) -> bool:
     return target <= date.today() + timedelta(days=lookahead_days)
 
 
+def diff_dates(candidates: list[str], known: set[str],
+               lookahead_days: int) -> tuple[list[str], list[str]]:
+    """(기억할 날짜, 새로 알릴 날짜)를 가른다.
+
+    **둘이 같은 필터를 지나야 한다.** lookahead 범위 밖 날짜를 기준선에 넣어
+    버리면 나중에 범위 안으로 들어와도 "이미 아는 날짜"가 되어 그 날짜는 영구히
+    알림이 가지 않는다. 판정하는 집합과 기억하는 집합을 갈라 놓으면 이 구멍이
+    생기므로 한 함수에서 같이 만든다.
+    """
+    tracked = [d for d in candidates if within_lookahead(d, lookahead_days)]
+    return tracked, [d for d in tracked if d not in known]
+
+
 class Catalog:
     """예매 영화·극장 목록을 처음 필요할 때 한 번만 받아오는 지연 로더.
 
@@ -687,6 +700,10 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
                 if ymd in known:
                     matched.append(ymd)
                     continue
+                if not within_lookahead(ymd, lookahead):
+                    # 범위 밖 날짜는 알리지도, 기준선에 넣지도 않는다.
+                    # 그러면 시간표를 받아 볼 이유도 없다 — 요청을 아낀다.
+                    continue
                 try:
                     schedule = cgv.showtimes(site_no, mov_no, ymd)
                 except RuntimeError as exc:
@@ -698,14 +715,12 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
                     matched.append(ymd)
                     showtimes[ymd] = hits
 
-            tracked = matched
-            new_dates = [d for d in matched
-                         if d not in known and within_lookahead(d, lookahead)]
+            candidates = matched
         else:
             known = set(prev.get("dates", []))
-            tracked = dates
-            new_dates = [d for d in dates
-                         if d not in known and within_lookahead(d, lookahead)]
+            candidates = dates
+
+        tracked, new_dates = diff_dates(candidates, known, lookahead)
 
         alert: str | None = None
         kind = ""
@@ -749,7 +764,9 @@ def check_all(cgv: CgvSession | None = None, *, dry_run: bool = False) -> dict:
             "site_no": site_no,
             "mov_nm": mov_nm,
             "site_nm": site_nm,
-            "dates": dates,
+            # 비교 기준은 필터가 있으면 matched_dates, 없으면 dates다.
+            # 어느 쪽이든 판정한 집합(tracked)을 그대로 넣어야 어긋나지 않는다.
+            "dates": dates if wanted else tracked,
             "matched_dates": tracked if wanted else [],
             "screen_types": wanted,
         }

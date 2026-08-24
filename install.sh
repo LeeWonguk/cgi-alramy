@@ -28,7 +28,7 @@ done
 
 if [ -z "$PY" ]; then
   echo "오류: 필요한 패키지가 모두 설치된 python3을 찾지 못했습니다." >&2
-  echo "      pip install playwright flask 'psycopg[binary,pool]' waitress" >&2
+  echo "      pip install -r requirements.txt" >&2
   echo "      playwright install chromium" >&2
   exit 1
 fi

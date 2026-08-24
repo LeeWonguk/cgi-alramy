@@ -20,6 +20,9 @@ from browser_worker import BrowserWorker
 
 log = logging.getLogger("cgv-watch.poller")
 
+# 영화·극장 목록을 며칠까지 묵혀 둘지. 신작은 하루 단위로 들어온다.
+CATALOG_MAX_AGE_HOURS = 24
+
 
 class Poller:
     def __init__(self, worker: BrowserWorker) -> None:
@@ -103,6 +106,7 @@ class Poller:
     def _loop(self) -> None:
         # 서버를 띄운 직후 한 번 확인해 화면이 비어 있지 않게 한다.
         self._safe_cycle("startup")
+        self._refresh_catalog_if_stale()
 
         while not self._stop.is_set():
             interval = self.interval()
@@ -113,6 +117,7 @@ class Poller:
             if self._stop.wait(delay):
                 break
             self._safe_cycle("schedule")
+            self._refresh_catalog_if_stale()
 
         with self._lock:
             self._next_check_at = None
@@ -123,6 +128,29 @@ class Poller:
             self.run_cycle(trigger)
         except Exception:  # noqa: BLE001
             log.exception("확인 사이클에서 예상치 못한 오류가 났습니다")
+
+    def _refresh_catalog_if_stale(self) -> None:
+        """영화·극장 목록이 낡았으면 다시 받는다.
+
+        감시 대상이 모두 코드 캐시에 걸리면 확인 사이클은 목록 API를 **아예 부르지
+        않는다**(watch.cached_ids). 그래서 자동으로 갱신될 계기가 없어 실제로 2주
+        넘게 낡은 채로 있었다. 대상 추가 화면이 이 목록에서 영화를 고르므로,
+        낡으면 신작을 아예 고를 수 없다.
+
+        하루에 한 번이라 요청 2건이 늘 뿐이다. 실패는 삼킨다 — 목록이 낡는 것보다
+        스케줄러가 죽는 게 나쁘다.
+        """
+        try:
+            refreshed = store.catalog_refreshed_at()
+            if refreshed is not None:
+                age = datetime.now().astimezone() - refreshed
+                if age < timedelta(hours=CATALOG_MAX_AGE_HOURS):
+                    return
+            result = self._worker.run(watch.refresh_catalog, label="catalog:auto")
+            log.info("영화·극장 목록을 자동 갱신했습니다 (영화 %s · 극장 %s)",
+                     result.get("movies"), result.get("sites"))
+        except Exception:  # noqa: BLE001
+            log.exception("목록 자동 갱신에 실패했습니다 — 다음 사이클에 다시 시도합니다")
 
     @staticmethod
     def _delay_until_next_slot(interval: int) -> float:
