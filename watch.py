@@ -169,6 +169,14 @@ def normalize(name: str) -> str:
 
 
 # ── CGV 세션 ────────────────────────────────────────────────────────────────
+class AuthRequired(RuntimeError):
+    """CGV가 401을 냈다 — 로그인이 끊겼으니 세션을 되살려야 한다.
+
+    RuntimeError를 상속하므로 기존의 `except RuntimeError` 처리는 그대로
+    동작한다. 되살릴 수 있는 호출자만 이 타입을 따로 잡으면 된다.
+    """
+
+
 class CgvSession:
     """Chromium을 띄워 CGV 내부 API를 호출하는 세션.
 
@@ -230,6 +238,13 @@ class CgvSession:
                 pass
         self._browser = self._pw = self._page = None
 
+    @property
+    def page(self):
+        """살아 있는 Playwright 페이지. UI를 직접 몰아야 하는 쪽(booking)이 쓴다."""
+        if self._page is None:
+            raise RuntimeError("세션이 열려 있지 않습니다")
+        return self._page
+
     def is_alive(self) -> bool:
         """페이지가 아직 살아 있는지. 브라우저 상주 중 크래시를 감지하는 데 쓴다."""
         if self._page is None:
@@ -258,6 +273,11 @@ class CgvSession:
                 last_error = f"{type(exc).__name__}: {exc}"
                 continue
 
+            if out["status"] == 401:
+                # 로그인이 끊긴 것이다. 재시도해 봐야 같은 답이 오므로 바로 올려
+                # 호출자가 세션을 되살릴 기회를 준다 (cgv_login.recover_session).
+                raise AuthRequired(
+                    f"{path.split('?')[0]}: 로그인이 필요합니다 (HTTP 401)")
             if out["status"] != 200:
                 last_error = f"HTTP {out['status']}"
                 continue
@@ -332,13 +352,31 @@ class CgvSession:
         if cookies:
             self._page.context.add_cookies(cookies)
 
+    def clear_session_cookies(self) -> None:
+        """브라우저의 로그인 쿠키를 버린다.
+
+        만료된 accessToken이 남아 있으면 `logged_in()`이 계속 True를 내서 재로그인
+        경로로 못 간다. 되살리기 전에 반드시 비워야 한다.
+        """
+        try:
+            self._page.context.clear_cookies()
+        except Exception as exc:  # noqa: BLE001 - 못 지워도 재로그인은 시도한다
+            log.warning("세션 쿠키를 지우지 못했습니다: %s", exc)
+
     def refresh_session(self) -> bool:
         """refresh_token으로 accessToken을 갱신한다. 성공하면 True.
 
         refresh 토큰이 만료됐으면(401) False — 캡차를 다시 풀어 로그인해야 한다.
+
+        성공 판정은 **accessToken이 실제로 바뀌었는지**로 한다. 쿠키의 존재만
+        보면(logged_in) 만료된 토큰이 그대로 남아 있어도 True가 나와서, 되살렸다고
+        착각한 채 같은 401을 계속 맞는다.
         """
-        access = next((c["value"] for c in self._page.context.cookies()
-                       if c["name"] == "accessToken"), "")
+        def token() -> str:
+            return next((c["value"] for c in self._page.context.cookies()
+                         if c["name"] == "accessToken"), "")
+
+        access = token()
         try:
             out = self._page.evaluate(
                 """async ([url, body]) => {
@@ -351,7 +389,8 @@ class CgvSession:
         except Exception as exc:  # noqa: BLE001 - 실패하면 재로그인으로 폴백한다
             log.debug("refresh 호출 실패 (재로그인으로 폴백): %s", exc)
             return False
-        ok = out["status"] == 200 and self.logged_in()
+        fresh = token()
+        ok = out["status"] == 200 and bool(fresh) and fresh != access
         if ok:
             log.info("CGV accessToken을 refresh로 갱신했습니다")
         return ok

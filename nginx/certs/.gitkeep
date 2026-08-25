@@ -1,0 +1,5 @@
+# 인증서를 두는 자리 (fullchain.pem · privkey.pem).
+#
+# compose가 이 디렉터리를 nginx에 읽기전용으로 마운트한다. 비어 있어도 되지만
+# **존재는 해야** 한다 — 없으면 Docker가 root 소유의 빈 디렉터리를 대신 만든다.
+# 인증서 자체는 .gitignore로 걸러진다.

@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 import seats  # noqa: E402
 import seats as seats_mod  # 지역변수 seats에 가려지지 않게 별칭도 둔다  # noqa: E402
+import watch  # noqa: E402
 
 FIXTURE = json.loads(
     (ROOT / "tests" / "fixtures" / "seatdata.json").read_text(encoding="utf-8")
@@ -222,6 +223,204 @@ class TestAlertMessage(unittest.TestCase):
             "오디세이", "용산", "20260825", "1430", "IMAX", ["C7"],
             available_now=1, rows=None)
         self.assertNotIn("열)", msg)           # 열 범위 표기 없음
+
+
+def showtime(hhmm: str, seq: str = "1") -> dict:
+    return {"scnsrtTm": hhmm, "scnsNo": "S1", "scnSseq": seq}
+
+
+class TestSelectShowtimes(unittest.TestCase):
+    """감시가 볼 회차 고르기. 순서가 곧 자동 선점의 우선순위다."""
+
+    SCHEDULE = [showtime(t, str(i)) for i, t in enumerate(
+        ["1030", "1330", "1700", "2030", "2210", "2530"])]
+
+    def times(self, rows):
+        return [r["scnsrtTm"] for r in rows]
+
+    def test_no_filter_keeps_original_order(self):
+        got = seats.select_showtimes(self.SCHEDULE)
+        self.assertEqual(self.times(got),
+                         ["1030", "1330", "1700", "2030", "2210", "2530"])
+
+    def test_exact_time_picks_one(self):
+        got = seats.select_showtimes(self.SCHEDULE, scn_time="22:10")
+        self.assertEqual(self.times(got), ["2210"])
+
+    def test_range_is_latest_first(self):
+        # 이 기능의 핵심 — 시간대 안에서 늦은 회차부터 잡는다.
+        got = seats.select_showtimes(self.SCHEDULE, scn_time_from="17:00",
+                                     scn_time_to="22:10")
+        self.assertEqual(self.times(got), ["2210", "2030", "1700"])
+
+    def test_range_bounds_are_inclusive(self):
+        got = seats.select_showtimes(self.SCHEDULE, scn_time_from="10:30",
+                                     scn_time_to="13:30")
+        self.assertEqual(self.times(got), ["1330", "1030"])
+
+    def test_range_excludes_outside(self):
+        got = seats.select_showtimes(self.SCHEDULE, scn_time_from="12:00",
+                                     scn_time_to="18:00")
+        self.assertEqual(self.times(got), ["1700", "1330"])
+
+    def test_late_night_showtime_past_24h(self):
+        # CGV는 새벽 1:30을 '2530'으로 준다. 22:00~26:00이 그걸 잡아야 한다.
+        got = seats.select_showtimes(self.SCHEDULE, scn_time_from="22:00",
+                                     scn_time_to="26:00")
+        self.assertEqual(self.times(got), ["2530", "2210"])
+
+    def test_overnight_range_wraps(self):
+        # 끝이 시작보다 이르면 자정을 넘긴 것 — 22:00~02:00 = 22:00~26:00.
+        got = seats.select_showtimes(self.SCHEDULE, scn_time_from="22:00",
+                                     scn_time_to="02:00")
+        self.assertEqual(self.times(got), ["2530", "2210"])
+
+    def test_overnight_range_also_catches_plain_after_midnight_time(self):
+        # 극장에 따라 새벽 회차를 '0130'으로 주는 경우도 잡아야 한다.
+        # 그리고 01:30은 22:10보다 **늦은** 회차다 — 적힌 숫자로 줄을 세우면
+        # 뒤집혀서 '늦은 회차 우선'이 가장 이른 회차를 고르게 된다.
+        schedule = [showtime("2210"), showtime("0130", "2")]
+        got = seats.select_showtimes(schedule, scn_time_from="22:00",
+                                     scn_time_to="02:00")
+        self.assertEqual(self.times(got), ["0130", "2210"])
+
+    def test_exact_time_wins_over_range(self):
+        got = seats.select_showtimes(self.SCHEDULE, scn_time="20:30",
+                                     scn_time_from="10:00", scn_time_to="23:00")
+        self.assertEqual(self.times(got), ["2030"])
+
+    def test_half_open_range_is_ignored(self):
+        # 한쪽만 적힌 범위는 범위가 아니다 — 조용히 모든 회차로 돌아간다.
+        got = seats.select_showtimes(self.SCHEDULE, scn_time_from="18:00")
+        self.assertEqual(len(got), len(self.SCHEDULE))
+
+    def test_unreadable_showtime_is_dropped_from_range(self):
+        schedule = [showtime("2030"), showtime("", "9"), showtime(None, "8")]
+        got = seats.select_showtimes(schedule, scn_time_from="10:00",
+                                     scn_time_to="23:00")
+        self.assertEqual(self.times(got), ["2030"])
+
+    def test_empty_schedule(self):
+        self.assertEqual(
+            seats.select_showtimes([], scn_time_from="10:00", scn_time_to="23:00"),
+            [])
+
+
+class TestTimeRangeMinutes(unittest.TestCase):
+    def test_plain_range(self):
+        self.assertEqual(seats.time_range_minutes("18:00", "23:30"),
+                         (18 * 60, 23 * 60 + 30))
+
+    def test_overnight_adds_a_day(self):
+        self.assertEqual(seats.time_range_minutes("22:00", "02:00"),
+                         (22 * 60, 26 * 60))
+
+    def test_same_start_and_end_is_a_point(self):
+        self.assertEqual(seats.time_range_minutes("22:10", "22:10"),
+                         (22 * 60 + 10, 22 * 60 + 10))
+
+    def test_missing_side_is_not_a_range(self):
+        self.assertIsNone(seats.time_range_minutes("18:00", ""))
+        self.assertIsNone(seats.time_range_minutes("", ""))
+
+
+class TestCycleError(unittest.TestCase):
+    """확인 결과를 화면에 뭐라고 적을지. 실패가 정상으로 보이면 안 된다."""
+
+    def test_clean_run_has_no_error(self):
+        self.assertIsNone(seats._cycle_error(checked=3, failures=[]))
+
+    def test_nothing_to_check_is_reported(self):
+        self.assertEqual(seats._cycle_error(checked=0, failures=[]),
+                         "확인된 회차가 없습니다")
+
+    def test_total_failure_is_not_silent(self):
+        # 예전엔 실패 회차도 직전 상태를 복사해 넣어 error=None이 됐다.
+        msg = seats._cycle_error(checked=0, failures=["2210: HTTP 500"])
+        self.assertIsNotNone(msg)
+        self.assertIn("2210", msg)
+
+    def test_total_failure_counts_all(self):
+        msg = seats._cycle_error(
+            checked=0, failures=["2210: HTTP 500", "1930: HTTP 500"])
+        self.assertIn("2건", msg)
+        self.assertIn("외 1건", msg)
+
+    def test_partial_failure_shows_both_counts(self):
+        msg = seats._cycle_error(checked=4, failures=["2210: 시간초과"])
+        self.assertIn("4", msg)
+        self.assertIn("1", msg)
+        self.assertIn("시간초과", msg)
+
+
+class TestAuthRecovery(unittest.TestCase):
+    """좌석 조회가 401을 내면 세션을 되살리고 한 번 다시 시도해야 한다.
+
+    되살리기가 없으면, 저장된 accessToken이 만료되는 순간부터 그 사용자의 좌석
+    감시가 영구히 멎는다(성공했을 때만 쿠키를 갱신하므로 stale 토큰이 계속 남는다).
+    """
+
+    class FakeSession:
+        def __init__(self, fail_times: int):
+            self.fail_times = fail_times
+            self.calls = 0
+
+        def seat_map(self, **kwargs):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise watch.AuthRequired("로그인이 필요합니다 (HTTP 401)")
+            return {"ok": True}
+
+    class FakeGuard:
+        def __init__(self, succeeds: bool):
+            self.succeeds = succeeds
+            self.attempts = 0
+
+        def recover(self, session):
+            self.attempts += 1
+            return self.succeeds
+
+    def test_retries_once_after_successful_recovery(self):
+        session = self.FakeSession(fail_times=1)
+        guard = self.FakeGuard(succeeds=True)
+        self.assertEqual(seats._seat_map(session, guard, site_no="1"),
+                         {"ok": True})
+        self.assertEqual(session.calls, 2)
+        self.assertEqual(guard.attempts, 1)
+
+    def test_gives_up_when_recovery_fails(self):
+        session = self.FakeSession(fail_times=1)
+        guard = self.FakeGuard(succeeds=False)
+        with self.assertRaises(watch.AuthRequired):
+            seats._seat_map(session, guard, site_no="1")
+        self.assertEqual(session.calls, 1)      # 되살리기 실패 — 재시도 안 함
+
+    def test_second_401_after_recovery_is_not_retried_again(self):
+        # 되살렸는데도 또 401이면 그대로 올린다 — 무한 재로그인을 막는다.
+        session = self.FakeSession(fail_times=2)
+        guard = self.FakeGuard(succeeds=True)
+        with self.assertRaises(watch.AuthRequired):
+            seats._seat_map(session, guard, site_no="1")
+        self.assertEqual(session.calls, 2)
+
+    def test_guard_recovers_at_most_once(self):
+        recoveries = []
+
+        class Recorder(seats._AuthGuard):
+            def recover(self, session):        # cgv_login을 부르지 않고 가로챈다
+                if self.tried:
+                    return self.ok
+                self.tried = True
+                recoveries.append(session)
+                self.ok = False
+                return self.ok
+
+        guard = Recorder(owner_id=7)
+        session = self.FakeSession(fail_times=99)
+        for _ in range(5):
+            with self.assertRaises(watch.AuthRequired):
+                seats._seat_map(session, guard, site_no="1")
+        self.assertEqual(len(recoveries), 1)
 
 
 if __name__ == "__main__":

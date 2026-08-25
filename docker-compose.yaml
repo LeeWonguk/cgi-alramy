@@ -1,0 +1,76 @@
+# CGV 예매 알림기 — docker compose 구성.
+#
+# 사전 준비:
+#   cp .env.example .env && $EDITOR .env
+#     · SLACK_WEBHOOK_URL, NAVER_*, KAKAO_* 를 채우세요.
+#     · PUBLIC_BASE_URL은 브라우저가 접속하는 실제 주소로 두세요.
+#       - 로컬 시험:   http://localhost
+#       - 외부 도메인: https://cgv.example.com
+#     · DATABASE_URL은 compose가 아래에서 덮어씁니다 — .env 값은 무시됩니다.
+#
+# 실행:
+#   docker compose up -d --build
+#
+# 확인:
+#   docker compose logs -f app
+#   docker compose exec db psql -U postgres cgv
+#
+# 브라우저: http://localhost  (nginx 80 → app:8787)
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cgv
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      # 앱이 시작할 때 store.ensure_database()가 postgres DB에 붙어 확인을 하므로
+      # 서버가 실제로 커넥션을 받을 수 있을 때까지 기다린다.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cgv"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    # .env의 값들(SLACK, NAVER_*, KAKAO_*, PUBLIC_BASE_URL, FLASK_SECRET_KEY 등)을
+    # 그대로 환경변수로 넣는다. envfile.py가 os.environ.setdefault로 채우던 것과
+    # 동일한 효과지만, 컨테이너에는 .env 파일을 굳이 마운트하지 않는다.
+    env_file:
+      - .env
+    environment:
+      # compose 네트워크 안에서는 DB 호스트가 'db'다. .env의 값을 덮는다.
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/cgv
+    volumes:
+      # 로그는 호스트에서 tail 하고 싶으니 바인드 마운트.
+      - ./logs:/app/logs
+    # 8787은 밖으로 노출하지 않는다 — nginx만 프록시로 접근한다.
+    expose:
+      - "8787"
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      # HTTPS를 켜려면 nginx/conf.d/default.conf의 443 블록 주석을 풀고
+      # 인증서를 nginx/certs/ 아래에 fullchain.pem, privkey.pem으로 두세요.
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    restart: unless-stopped
+
+volumes:
+  db-data:

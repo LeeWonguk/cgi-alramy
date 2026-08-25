@@ -14,5 +14,9 @@ web/static/
 frontend/node_modules/
 frontend/dist/
 
+# TLS 인증서 — nginx/certs/ 자리는 .gitkeep으로만 남긴다
+nginx/certs/*
+!nginx/certs/.gitkeep
+
 # vim 스왑 파일
 *.swp

@@ -45,8 +45,9 @@ def ensure_logged_in(owner_id: int, session: CgvSession) -> bool:
     if tokens:
         session.restore_tokens(tokens)
         if session.logged_in():
-            # 되살린 accessToken이 실제로 유효한지는 refresh로 확정할 필요는 없다 —
-            # 좌석 조회가 401이면 그때 재로그인한다. 여기서는 쿠키 존재로 충분하다.
+            # 되살린 accessToken이 실제로 유효한지는 여기서 확정하지 않는다 —
+            # 확인하려면 요청을 한 번 더 써야 한다. 만료됐다면 좌석 조회가 401을
+            # 내고, 그때 recover_session()이 refresh→재로그인으로 되살린다.
             return True
 
     # 2) refresh로 accessToken 갱신 (refresh_token 쿠키가 살아 있으면 성공)
@@ -70,6 +71,31 @@ def ensure_logged_in(owner_id: int, session: CgvSession) -> bool:
 
     store.set_cgv_tokens(owner_id, fresh)
     return True
+
+
+def recover_session(owner_id: int, session: CgvSession) -> bool:
+    """401을 만난 뒤 세션을 되살린다. 성공하면 True.
+
+    `ensure_logged_in`은 accessToken **쿠키의 존재**만 보고 통과시킨다 — 실제로
+    유효한지는 요청을 보내 봐야 알 수 있기 때문이다. 그래서 만료된 토큰을 되살린
+    세션은 좌석 조회마다 401을 맞는데, 저장된 쿠키는 성공했을 때만 갱신되므로
+    가만히 두면 그 사용자의 좌석 감시가 영구히 멎는다. 이 함수가 그 고리를 끊는다.
+
+        1. refresh_token이 살아 있으면 accessToken만 갱신한다 — 캡차 없음.
+        2. 아니면 브라우저·DB의 죽은 쿠키를 버리고 처음부터 로그인한다 — 캡차.
+
+    브라우저 쿠키를 반드시 먼저 비운다. 만료된 accessToken이 남아 있으면
+    `logged_in()`이 계속 True를 내서 다음 사이클도 같은 자리에서 막힌다.
+    """
+    if session.refresh_session():
+        store.set_cgv_tokens(owner_id, session.session_tokens())
+        log.info("owner %s: refresh로 CGV 세션을 되살렸습니다", owner_id)
+        return True
+
+    log.info("owner %s: refresh가 만료돼 다시 로그인합니다", owner_id)
+    session.clear_session_cookies()
+    store.clear_cgv_tokens(owner_id)
+    return login_now(owner_id, session)
 
 
 def login_now(owner_id: int, session: CgvSession) -> bool:
