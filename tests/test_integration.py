@@ -193,5 +193,155 @@ class TestCheckNowIsOwnerOnly(DbCase):
         self.assertEqual(resp.status_code, 401)
 
 
+class TestCgvAccountStore(DbCase):
+    """CGV 자격증명 저장·상태 전이 (Phase 1).
+
+    비밀번호는 암호화해 넣고, 화면용 조회에는 절대 실려 나가지 않으며, 원문은
+    복호로만 되찾는다. 아이디·비밀번호가 바뀌면 상태가 unlinked로 되돌아간다.
+    """
+
+    def test_store_and_readback(self):
+        uid = self.make_user("owner")["id"]
+
+        account = store.set_cgv_account(uid, "hayato5246", "!Dnjsrnrl1")
+        self.assertEqual(account["cgv_user_id"], "hayato5246")
+        self.assertEqual(account["status"], "unlinked")
+        # 화면용 조회에는 비밀번호(암호문 포함)가 없어야 한다.
+        self.assertNotIn("password_enc", account)
+        self.assertNotIn("password", account)
+
+        # 원문은 복호로만 되찾는다.
+        self.assertEqual(store.cgv_password(uid), "!Dnjsrnrl1")
+
+    def test_password_stored_encrypted_not_plaintext(self):
+        uid = self.make_user("owner")["id"]
+        store.set_cgv_account(uid, "hayato5246", "!Dnjsrnrl1")
+
+        with store.pool().connection() as conn:
+            raw = conn.execute(
+                "select password_enc from cgv_accounts where owner_id = %s", (uid,)
+            ).fetchone()["password_enc"]
+        blob = bytes(raw)
+        self.assertNotIn(b"!Dnjsrnrl1", blob, "비밀번호가 평문으로 저장됐다")
+
+    def test_update_resets_status_to_unlinked(self):
+        uid = self.make_user("owner")["id"]
+        store.set_cgv_account(uid, "hayato5246", "!Dnjsrnrl1")
+        store.set_cgv_account_status(uid, "linked")
+        self.assertEqual(store.cgv_account(uid)["status"], "linked")
+
+        # 비밀번호를 바꾸면 이전 성공은 의미가 없어 unlinked로 돌아간다.
+        again = store.set_cgv_account(uid, "hayato5246", "새로운비번")
+        self.assertEqual(again["status"], "unlinked")
+        self.assertIsNone(again["last_error"])
+        self.assertEqual(store.cgv_password(uid), "새로운비번")
+
+    def test_status_error_records_message(self):
+        uid = self.make_user("owner")["id"]
+        store.set_cgv_account(uid, "hayato5246", "!Dnjsrnrl1")
+
+        store.set_cgv_account_status(uid, "error", error="CGV 서버 오류 (HTTP 500).")
+        account = store.cgv_account(uid)
+        self.assertEqual(account["status"], "error")
+        self.assertEqual(account["last_error"], "CGV 서버 오류 (HTTP 500).")
+        self.assertIsNone(account["last_login_at"])
+
+        # 성공하면 오류가 지워지고 로그인 시각이 찍힌다.
+        store.set_cgv_account_status(uid, "linked")
+        account = store.cgv_account(uid)
+        self.assertEqual(account["status"], "linked")
+        self.assertIsNone(account["last_error"])
+        self.assertIsNotNone(account["last_login_at"])
+
+    def test_delete_and_absent(self):
+        uid = self.make_user("owner")["id"]
+        self.assertIsNone(store.cgv_account(uid))
+        self.assertIsNone(store.cgv_password(uid))
+
+        store.set_cgv_account(uid, "hayato5246", "!Dnjsrnrl1")
+        self.assertTrue(store.delete_cgv_account(uid))
+        self.assertIsNone(store.cgv_account(uid))
+        self.assertFalse(store.delete_cgv_account(uid))
+
+    def test_removed_when_user_deleted(self):
+        # cgv_accounts.owner_id는 ON DELETE CASCADE — 사용자를 지우면 함께 사라진다.
+        self.make_user("owner")                       # 첫 계정이 소유자
+        member = self.make_user("member")["id"]
+        store.set_cgv_account(member, "hayato5246", "!Dnjsrnrl1")
+
+        self.assertTrue(store.delete_user(member))
+        self.assertIsNone(store.cgv_account(member))
+
+    def test_blank_fields_rejected(self):
+        uid = self.make_user("owner")["id"]
+        with self.assertRaises(ValueError):
+            store.set_cgv_account(uid, "  ", "!Dnjsrnrl1")
+        with self.assertRaises(ValueError):
+            store.set_cgv_account(uid, "hayato5246", "")
+
+    def test_session_token_roundtrip_and_clear(self):
+        uid = self.make_user("owner")["id"]
+        store.set_cgv_account(uid, "hayato5246", "!Dnjsrnrl1")
+        self.assertIsNone(store.cgv_tokens(uid))
+
+        tokens = {"accessToken": "aaa.bbb.ccc", "refresh_token": "r-123"}
+        store.set_cgv_tokens(uid, tokens)
+        self.assertEqual(store.cgv_tokens(uid), tokens)
+        # 토큰 저장은 계정을 linked로 올린다.
+        self.assertEqual(store.cgv_account(uid)["status"], "linked")
+
+        # 토큰도 평문으로 저장되면 안 된다.
+        with store.pool().connection() as conn:
+            raw = conn.execute(
+                "select session_enc from cgv_accounts where owner_id = %s", (uid,)
+            ).fetchone()["session_enc"]
+        self.assertNotIn(b"aaa.bbb.ccc", bytes(raw))
+
+        store.clear_cgv_tokens(uid)
+        self.assertIsNone(store.cgv_tokens(uid))
+
+
+class TestSeatWatchStore(DbCase):
+    """좌석 감시 저장·상태 (Phase 1)."""
+
+    def test_add_list_delete(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산아이파크몰", "20260825",
+                                 screen_types=["IMAX"], rows=["a", "B", "a"])
+        self.assertEqual(w["scn_ymd"], "20260825")
+        self.assertEqual(w["rows"], ["A", "B"])          # 정규화됨
+        self.assertEqual(w["screen_types"], ["IMAX"])
+
+        listed = store.seat_watches(owner_id=uid)
+        self.assertEqual(len(listed), 1)
+
+        self.assertTrue(store.delete_seat_watch(w["id"], owner_id=uid))
+        self.assertEqual(store.seat_watches(owner_id=uid), [])
+
+    def test_duplicate_reenables(self):
+        uid = self.make_user("owner")["id"]
+        a = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["A"])
+        b = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["A"])
+        self.assertEqual(a["id"], b["id"])               # 같은 조합은 한 행
+
+    def test_state_baseline_then_diff(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825")["id"]
+        self.assertEqual(store.prev_seat_state(w), {})   # 첫 관측
+
+        store.save_seat_state(w, {"001|5": ["A1", "A2"]})
+        self.assertEqual(store.prev_seat_state(w), {"001|5": ["A1", "A2"]})
+
+        store.save_seat_state(w, {"001|5": ["A1", "A2", "A3"]})
+        self.assertEqual(store.prev_seat_state(w)["001|5"], ["A1", "A2", "A3"])
+
+    def test_removed_when_user_deleted(self):
+        self.make_user("owner")
+        member = self.make_user("member")["id"]
+        store.add_seat_watch(member, "오디세이", "용산", "20260825")
+        self.assertTrue(store.delete_user(member))
+        self.assertEqual(store.seat_watches(owner_id=member), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,5 +20,11 @@ psycopg==3.3.4
 psycopg-binary==3.3.4
 psycopg-pool==3.3.1
 
-# 테스트는 표준 라이브러리 unittest만 쓴다 — 추가 의존성이 없다.
+# 저장하는 CGV 로그인 비밀번호를 되돌릴 수 있게 암호화하는 데만 쓴다(secretbox).
+# .env 로더·OAuth·웹훅은 표준 라이브러리로 직접 짰지만, 안전한 대칭 암호화는
+# stdlib에 없어서 이 한 곳에만 검증된 라이브러리를 들인다.
+cryptography==43.0.3
+
+# 테스트는 표준 라이브러리 unittest만 쓴다 (cryptography 외 추가 의존성 없음).
 #   python3 -m unittest discover -s tests -v
+# 좌석 로직 테스트는 tests/fixtures/seatdata.json(실제 배치도 응답)을 픽스처로 쓴다.

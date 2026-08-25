@@ -510,6 +510,267 @@ def delete_user(user_id: int) -> bool:
         return cur.rowcount > 0
 
 
+# ── CGV 로그인 자격증명 (Phase 1) ────────────────────────────────────────────
+# 사용자별로 감시 대상 CGV 계정의 아이디·비밀번호를 보관한다. 비밀번호는 원문을
+# 되찾을 수 있어야 로그인할 수 있으므로(cgv_login 참고) 되돌릴 수 있는 암호문으로
+# 저장한다 — secretbox가 그 한 곳을 담당한다.
+#
+# 화면·API로 나가는 값에는 비밀번호를 절대 싣지 않는다. cgv_account_view가 상태와
+# 아이디만 추려 내보내고, 원문 비밀번호는 cgv_password()로 로그인 직전에만 푼다.
+CGV_ACCOUNT_COLUMNS = """
+    owner_id, cgv_user_id, status, last_login_at, last_error, created_at, updated_at
+"""
+
+
+def set_cgv_account(owner_id: int, cgv_user_id: str, password: str) -> dict:
+    """CGV 자격증명을 저장하거나 갱신한다. 비밀번호는 암호화해 넣는다.
+
+    아이디나 비밀번호가 바뀌면 이전 로그인 성공 여부는 의미가 없어지므로
+    status를 unlinked로 되돌리고 last_error를 지운다 — 다음 로그인 시도가
+    새로 판정한다.
+    """
+    import secretbox
+
+    cgv_user_id = (cgv_user_id or "").strip()
+    if not cgv_user_id:
+        raise ValueError("CGV 아이디가 비어 있습니다")
+    if not password:
+        raise ValueError("CGV 비밀번호가 비어 있습니다")
+
+    enc = secretbox.encrypt(password)
+    stamp = _now()
+    with pool().connection() as conn:
+        conn.execute(
+            "insert into cgv_accounts"
+            "   (owner_id, cgv_user_id, password_enc, status, last_error,"
+            "    created_at, updated_at)"
+            " values (%s, %s, %s, 'unlinked', null, %s, %s)"
+            " on conflict (owner_id) do update set"
+            "   cgv_user_id = excluded.cgv_user_id,"
+            "   password_enc = excluded.password_enc,"
+            "   status = 'unlinked', last_error = null,"
+            "   updated_at = excluded.updated_at",
+            (owner_id, cgv_user_id, enc, stamp, stamp),
+        )
+    return cgv_account(owner_id)
+
+
+def cgv_account(owner_id: int) -> dict | None:
+    """저장된 CGV 자격증명의 상태. 비밀번호(암호문)는 담지 않는다."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            f"select {CGV_ACCOUNT_COLUMNS} from cgv_accounts where owner_id = %s",
+            (owner_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def cgv_password(owner_id: int) -> str | None:
+    """저장된 원문 비밀번호를 복호화해 돌려준다. 로그인 직전에만 부른다.
+
+    이 값은 메모리 밖으로 내보내지 않는다 — 로그를 남기거나 API로 실어 보내면
+    안 된다. 저장된 계정이 없으면 None.
+    """
+    import secretbox
+
+    with pool().connection() as conn:
+        row = conn.execute(
+            "select password_enc from cgv_accounts where owner_id = %s",
+            (owner_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return secretbox.decrypt(row["password_enc"])
+
+
+def set_cgv_account_status(owner_id: int, status: str,
+                           *, error: str | None = None) -> dict | None:
+    """로그인 시도 결과를 기록한다. linked면 성공 시각도 함께 남긴다.
+
+    linked  — 로그인 성공. last_login_at을 지금으로, last_error를 지운다.
+    error   — 로그인 실패. last_error에 사유를 남긴다.
+    unlinked — 아직 시도 전(비밀번호 갱신 직후 등).
+    """
+    if status not in ("unlinked", "linked", "error"):
+        raise ValueError(f"알 수 없는 상태: {status}")
+    stamp = _now()
+    with pool().connection() as conn:
+        if status == "linked":
+            conn.execute(
+                "update cgv_accounts set status = 'linked', last_login_at = %s,"
+                "   last_error = null, updated_at = %s where owner_id = %s",
+                (stamp, stamp, owner_id),
+            )
+        else:
+            conn.execute(
+                "update cgv_accounts set status = %s, last_error = %s,"
+                "   updated_at = %s where owner_id = %s",
+                (status, error, stamp, owner_id),
+            )
+    return cgv_account(owner_id)
+
+
+def delete_cgv_account(owner_id: int) -> bool:
+    """저장된 CGV 자격증명을 지운다."""
+    with pool().connection() as conn:
+        cur = conn.execute(
+            "delete from cgv_accounts where owner_id = %s", (owner_id,)
+        )
+        return cur.rowcount > 0
+
+
+def set_cgv_tokens(owner_id: int, tokens: dict[str, str]) -> None:
+    """로그인으로 받은 세션 쿠키를 암호화해 저장하고 status를 linked로 올린다.
+
+    tokens는 accessToken·refresh_token 등을 담은 dict다. 로그인 직후·refresh
+    직후에 부른다. 비어 있으면 세션을 지운다(clear_cgv_tokens와 같은 효과).
+    """
+    import json as _json
+
+    import secretbox
+
+    if not tokens:
+        clear_cgv_tokens(owner_id)
+        return
+    enc = secretbox.encrypt(_json.dumps(tokens))
+    stamp = _now()
+    with pool().connection() as conn:
+        conn.execute(
+            "update cgv_accounts set session_enc = %s, status = 'linked',"
+            "   last_login_at = %s, last_error = null, updated_at = %s"
+            " where owner_id = %s",
+            (enc, stamp, stamp, owner_id),
+        )
+
+
+def cgv_tokens(owner_id: int) -> dict[str, str] | None:
+    """저장된 세션 쿠키를 복호화해 돌려준다. 없으면 None."""
+    import json as _json
+
+    import secretbox
+
+    with pool().connection() as conn:
+        row = conn.execute(
+            "select session_enc from cgv_accounts where owner_id = %s", (owner_id,)
+        ).fetchone()
+    if row is None or row["session_enc"] is None:
+        return None
+    return _json.loads(secretbox.decrypt(row["session_enc"]))
+
+
+def clear_cgv_tokens(owner_id: int) -> None:
+    """저장된 세션 쿠키를 지운다 — refresh까지 만료돼 재로그인이 필요할 때."""
+    with pool().connection() as conn:
+        conn.execute(
+            "update cgv_accounts set session_enc = null, updated_at = %s"
+            " where owner_id = %s",
+            (_now(), owner_id),
+        )
+
+
+# ── 좌석 감시 (Phase 1) ──────────────────────────────────────────────────────
+SEAT_WATCH_COLUMNS = """
+    id, owner_id, movie_query, site_query, scn_ymd, screen_types, rows,
+    enabled, created_at
+"""
+
+
+def seat_watches(*, enabled_only: bool = False,
+                 owner_id: int | None = None) -> list[dict]:
+    """좌석 감시 목록. owner_id를 주면 그 사람 것만."""
+    where, params = [], []
+    if enabled_only:
+        where.append("enabled")
+    if owner_id is not None:
+        where.append("owner_id = %s")
+        params.append(owner_id)
+    clause = (" where " + " and ".join(where)) if where else ""
+    with pool().connection() as conn:
+        rows = conn.execute(
+            f"select {SEAT_WATCH_COLUMNS} from seat_watches{clause}"
+            " order by scn_ymd, created_at",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
+                   scn_ymd: str, screen_types=None, rows=None) -> dict:
+    """좌석 감시를 추가한다. 같은 조합이 있으면 그 행을 돌려준다."""
+    movie_query = (movie_query or "").strip()
+    site_query = (site_query or "").strip()
+    scn_ymd = (scn_ymd or "").strip()
+    if not (movie_query and site_query and scn_ymd):
+        raise ValueError("영화·극장·날짜는 비울 수 없습니다")
+    types = normalize_screen_types(screen_types)
+    row_filter = normalize_rows(rows)
+    with pool().connection() as conn:
+        row = conn.execute(
+            f"insert into seat_watches"
+            f"   (owner_id, movie_query, site_query, scn_ymd, screen_types, rows)"
+            f" values (%s, %s, %s, %s, %s, %s)"
+            f" on conflict (owner_id, movie_query, site_query, scn_ymd,"
+            f"              screen_types, rows) do update set enabled = true"
+            f" returning {SEAT_WATCH_COLUMNS}",
+            (owner_id, movie_query, site_query, scn_ymd, types, row_filter),
+        ).fetchone()
+    return dict(row)
+
+
+def delete_seat_watch(seat_watch_id: int, owner_id: int | None = None) -> bool:
+    """좌석 감시를 지운다. owner_id를 주면 그 사람 것만 지운다."""
+    sql_txt = "delete from seat_watches where id = %s"
+    params: list = [seat_watch_id]
+    if owner_id is not None:
+        sql_txt += " and owner_id = %s"
+        params.append(owner_id)
+    with pool().connection() as conn:
+        return conn.execute(sql_txt, params).rowcount > 0
+
+
+def prev_seat_state(seat_watch_id: int) -> dict:
+    """직전 관측의 회차별 빈좌석 집합. 없으면 빈 dict(= 첫 관측)."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            "select available from seat_watch_state where seat_watch_id = %s",
+            (seat_watch_id,),
+        ).fetchone()
+    return (row["available"] if row else {}) or {}
+
+
+def save_seat_state(seat_watch_id: int, available: dict,
+                    *, error: str | None = None) -> None:
+    """회차별 빈좌석 집합을 저장한다. error를 주면 last_error에 남긴다."""
+    stamp = _now()
+    with pool().connection() as conn:
+        conn.execute(
+            "insert into seat_watch_state"
+            "   (seat_watch_id, available, last_ok, last_error, updated_at)"
+            " values (%s, %s, %s, %s, %s)"
+            " on conflict (seat_watch_id) do update set"
+            "   available = excluded.available,"
+            "   last_ok = coalesce(excluded.last_ok, seat_watch_state.last_ok),"
+            "   last_error = excluded.last_error, updated_at = excluded.updated_at",
+            (seat_watch_id, Json(available), None if error else stamp,
+             error, stamp),
+        )
+
+
+def normalize_rows(rows) -> list[str]:
+    """좌석 열 필터를 대문자·중복제거된 리스트로. seats.normalize_rows와 같은 규칙."""
+    if not rows:
+        return []
+    if isinstance(rows, str):
+        rows = rows.replace(",", " ").split()
+    seen, out = set(), []
+    for r in rows:
+        key = str(r).strip().upper()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 # ── 감시 대상 ───────────────────────────────────────────────────────────────
 TARGET_COLUMNS = """
     t.id, t.owner_id, t.movie_query, t.site_query, t.screen_types, t.enabled,

@@ -13,3 +13,6 @@ com.lwg.cgv-web.plist.generated
 web/static/
 frontend/node_modules/
 frontend/dist/
+
+# vim 스왑 파일
+*.swp

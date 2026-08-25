@@ -177,3 +177,59 @@ END $$;
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS webhook_url  text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS webhook_kind text NOT NULL DEFAULT 'slack';
+
+-- ── CGV 로그인 자격증명 (Phase 1) ───────────────────────────────────────────
+-- 감시 대상 CGV 계정의 아이디·비밀번호를 사용자별로 보관한다. 로그인은
+-- oidc.cgv.co.kr/cjone/cjoneLogin에 비밀번호의 SHA-256(hex)을 보내는 방식이라
+-- 서버가 원문 비밀번호를 다시 볼 일은 없지만, CGV 클라이언트가 매 로그인마다
+-- 원문을 직접 해시하므로 우리도 원문을 되찾을 수 있어야 한다. 그래서 단방향
+-- 해시가 아니라 되돌릴 수 있는 암호문으로 저장한다 (secretbox.encrypt).
+--   password_enc — Fernet 암호문. 키는 .env의 CGV_CRED_KEY (secretbox 참고).
+--   status: unlinked(아직 로그인 안 해 봄) | linked(마지막 로그인 성공)
+--           | error(마지막 로그인 실패 — last_error에 사유)
+CREATE TABLE IF NOT EXISTS cgv_accounts (
+    owner_id      integer PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    cgv_user_id   text        NOT NULL,
+    password_enc  bytea       NOT NULL,
+    status        text        NOT NULL DEFAULT 'unlinked',
+    last_login_at timestamptz,
+    last_error    text,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- 로그인 성공 시 발급되는 세션 쿠키(accessToken·refresh_token 등)를 암호문으로
+-- 보관한다. 폴링마다 캡차를 풀지 않도록 재사용하고, accessToken이 만료되면
+-- refresh_token으로 갱신한다. 둘 다 만료되면 지우고 다시 로그인한다.
+ALTER TABLE cgv_accounts ADD COLUMN IF NOT EXISTS session_enc bytea;
+
+-- ── 좌석 감시 (Phase 1) ──────────────────────────────────────────────────────
+-- 특정 날짜의 회차에서 원하는 열(row)에 빈좌석이 생기는지 본다. 감시 대상(영화×
+-- 극장)과 달리 **날짜가 고정**이고, screen_types로 상영관을, rows로 열을 좁힌다.
+--   rows        — 감시할 열 이름들(예: {A,B}). 비면 전 열.
+--   screen_types — IMAX 등 상영관 필터. 비면 그 날짜의 모든 회차.
+CREATE TABLE IF NOT EXISTS seat_watches (
+    id           serial PRIMARY KEY,
+    owner_id     integer REFERENCES users(id) ON DELETE CASCADE,
+    movie_query  text   NOT NULL,
+    site_query   text   NOT NULL,
+    scn_ymd      text   NOT NULL,
+    screen_types text[] NOT NULL DEFAULT '{}',
+    rows         text[] NOT NULL DEFAULT '{}',
+    enabled      boolean     NOT NULL DEFAULT true,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (owner_id, movie_query, site_query, scn_ymd, screen_types, rows)
+);
+
+CREATE INDEX IF NOT EXISTS seat_watches_owner_idx ON seat_watches (owner_id);
+
+-- 좌석 감시의 직전 관측. available은 회차별로 비어 있던 좌석 라벨 집합을 담는다:
+--   { "<scnsNo>|<scnSseq>": ["A6","B1", ...], ... }
+-- 여기 없는 회차·좌석은 "처음 본 것"이라 기준선만 잡고 알리지 않는다.
+CREATE TABLE IF NOT EXISTS seat_watch_state (
+    seat_watch_id integer PRIMARY KEY REFERENCES seat_watches(id) ON DELETE CASCADE,
+    available     jsonb       NOT NULL DEFAULT '{}',
+    last_ok       timestamptz,
+    last_error    text,
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);

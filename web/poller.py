@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+import seats
 import store
 import watch
 from browser_worker import BrowserWorker
@@ -98,9 +99,24 @@ class Poller:
             return {"error": str(exc)}
 
         store.finish_cycle(cycle_id, ok=True, **watch.summary_fields(summary))
+        # 좌석 감시는 로그인이 필요해 무거우므로, 대상이 있을 때만 이어서 돈다.
+        # 여기서 새는 예외로 방금 성공한 사이클을 실패로 만들지 않는다.
+        self._run_seat_cycle(trigger)
         with self._lock:
             self._last_summary = summary
         return summary
+
+    def _run_seat_cycle(self, trigger: str) -> None:
+        """좌석 감시 한 바퀴. 같은 브라우저 세션을 재사용해 로그인·좌석을 본다."""
+        try:
+            if not store.seat_watches(enabled_only=True):
+                return
+            result = self._worker.run(seats.check_seat_watches,
+                                      label=f"seats:{trigger}")
+            log.info("좌석 감시 %s: 확인 %s건 · 알림 %s건", trigger,
+                     result.get("watches_checked"), result.get("alerts_sent"))
+        except Exception:  # noqa: BLE001 - 좌석 감시 실패로 메인 사이클을 망치지 않는다
+            log.exception("좌석 감시 사이클에서 오류가 났습니다")
 
     # ── 내부 ──
     def _loop(self) -> None:

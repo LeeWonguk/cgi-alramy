@@ -48,6 +48,39 @@ EP_SCHEDULE = (
     "/api/v1/booking/searchSchByMov"
     f"?coCd={CO_CD}&siteNo={{site_no}}&scnYmd={{ymd}}&movNo={{mov_no}}&rtctlScopCd=08"
 )
+# 좌석 배치도. CGV 웹은 api.cgv.co.kr/cnm/atkt/searchIfSeatData를 부르지만,
+# 페이지의 URL 매퍼가 /cnm/atkt → /api/v1/booking으로 바꿔 같은 오리진(cgv.co.kr)
+# BFF로 보낸다. 그래서 우리도 같은 오리진 경로로 부르며, 로그인 쿠키(accessToken)를
+# 자동으로 실어 보낸다. 로그인 안 된 상태면 401이 떨어진다.
+EP_SEAT = (
+    "/api/v1/booking/searchIfSeatData"
+    f"?coCd={CO_CD}&siteNo={{site_no}}&scnsNo={{scns_no}}"
+    "&scnYmd={ymd}&scnSseq={scn_sseq}"
+)
+
+# ── CGV 로그인 (계정 세션) ──────────────────────────────────────────────────
+# 로그인은 cgv.co.kr/mem/login에서 이뤄진다. 비밀번호 암호화·바디 구성은 페이지의
+# 자체 JS가 하므로, 우리는 폼을 채우고 제출만 한다. 화면의 숫자 캡차는 canvas에
+# 클라이언트가 fillText로 그리고 클라이언트가 검증하며(서버 요청에 캡차 필드가
+# 없다), 우리는 fillText를 후킹해 그려지는 숫자를 그대로 읽어 입력한다.
+LOGIN_PAGE_URL = f"{BASE_URL}/mem/login"
+REFRESH_URL = "https://oidc.cgv.co.kr/common/auth/refreshtoken"
+# 로그인 성공 시 발급돼 세션을 이루는 쿠키들. 저장·복원할 때 이만큼을 다룬다.
+SESSION_COOKIES = ("accessToken", "refresh_token", "cjssoq",
+                   "CJONE_SSO", "CJONE_SSO_SYS")
+# canvas의 fillText를 후킹해 캡차 숫자를 모으는 스크립트. 페이지 JS보다 먼저
+# 심어야 하므로 add_init_script로 넣는다.
+_CAPTCHA_HOOK = """
+window.__cap = [];
+const __origFillText = CanvasRenderingContext2D.prototype.fillText;
+CanvasRenderingContext2D.prototype.fillText = function (t) {
+    try {
+        if (typeof t === 'string' && t.length === 1 && /[0-9]/.test(t))
+            window.__cap.push(t);
+    } catch (e) {}
+    return __origFillText.apply(this, arguments);
+};
+"""
 
 CHROME_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -259,6 +292,108 @@ class CgvSession:
             EP_SCHEDULE.format(site_no=site_no, mov_no=mov_no, ymd=ymd), retries=1
         )
         return payload.get("data") or []
+
+    def seat_map(self, site_no: str, scns_no: str, ymd: str,
+                 scn_sseq: str) -> dict:
+        """한 회차의 좌석 배치도. **로그인된 세션에서만** 열린다(아니면 401).
+
+        같은 오리진 BFF라 get_json이 로그인 쿠키를 자동으로 실어 보낸다.
+        반환은 CGV 원본 data — seats.parse_seats로 좌석 목록을 뽑는다.
+        """
+        payload = self.get_json(
+            EP_SEAT.format(site_no=site_no, scns_no=scns_no, ymd=ymd,
+                           scn_sseq=scn_sseq),
+            retries=1,
+        )
+        return payload.get("data") or {}
+
+    # ── 계정 로그인 / 세션 ──
+    def logged_in(self) -> bool:
+        """accessToken 쿠키가 있으면 로그인된 것으로 본다."""
+        return any(c["name"] == "accessToken" and c.get("value")
+                   for c in self._page.context.cookies())
+
+    def session_tokens(self) -> dict[str, str]:
+        """현재 세션 쿠키 중 저장해 둘 값들(accessToken·refresh_token 등)."""
+        jar = {c["name"]: c["value"] for c in self._page.context.cookies()}
+        return {name: jar[name] for name in SESSION_COOKIES if jar.get(name)}
+
+    def restore_tokens(self, tokens: dict[str, str]) -> None:
+        """저장해 둔 세션 쿠키를 되살린다 — 캡차 없이 다시 로그인 상태가 된다."""
+        cookies = [
+            {"name": name, "value": value, "domain": "cgv.co.kr", "path": "/"}
+            for name, value in tokens.items() if value
+        ]
+        if cookies:
+            self._page.context.add_cookies(cookies)
+
+    def refresh_session(self) -> bool:
+        """refresh_token으로 accessToken을 갱신한다. 성공하면 True.
+
+        refresh 토큰이 만료됐으면(401) False — 캡차를 다시 풀어 로그인해야 한다.
+        """
+        access = next((c["value"] for c in self._page.context.cookies()
+                       if c["name"] == "accessToken"), "")
+        try:
+            out = self._page.evaluate(
+                """async ([url, body]) => {
+                    const r = await fetch(url, {method: 'POST', credentials: 'include',
+                        headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+                    return {status: r.status};
+                }""",
+                [REFRESH_URL, {"accessToken": access}],
+            )
+        except Exception as exc:  # noqa: BLE001 - 실패하면 재로그인으로 폴백한다
+            log.debug("refresh 호출 실패 (재로그인으로 폴백): %s", exc)
+            return False
+        ok = out["status"] == 200 and self.logged_in()
+        if ok:
+            log.info("CGV accessToken을 refresh로 갱신했습니다")
+        return ok
+
+    def login_cgv(self, user_id: str, password: str, *,
+                  timeout_ms: int = 20_000) -> dict[str, str]:
+        """cgv.co.kr/mem/login에서 로그인한다. 성공하면 세션 쿠키를 돌려준다.
+
+        비밀번호 암호화·요청 바디 구성은 페이지 JS가 처리한다. 숫자 캡차는
+        fillText 후킹으로 읽어 입력한다. 실패하면 LoginError를 올린다.
+        """
+        page = self._page
+        page.add_init_script(_CAPTCHA_HOOK)
+        page.goto(LOGIN_PAGE_URL + "?returnUrl=%2F",
+                  wait_until="networkidle", timeout=timeout_ms + 25_000)
+        page.wait_for_timeout(2500)
+
+        captcha = "".join((page.evaluate("() => (window.__cap || []).slice()"))[-6:])
+        if len(captcha) != 6:
+            raise LoginError("캡차 숫자를 읽지 못했습니다")
+
+        # 입력칸: userId / password / captcha (id는 loginInput1~3)
+        page.fill("#loginInput1", user_id)
+        page.fill("#loginInput2", password)
+        page.fill("#loginInput3", captcha)
+
+        # 폼 onSubmit이 암호화·POST를 한다 — 헤더의 '로그인' 링크와 헷갈리지 않게
+        # 캡차 입력칸이 속한 form을 직접 제출한다.
+        page.evaluate("""() => {
+            const inp = document.querySelector('#loginInput3');
+            const f = inp && inp.closest('form');
+            if (f) { f.requestSubmit ? f.requestSubmit() : f.submit(); }
+        }""")
+
+        # 로그인 성공은 accessToken 쿠키로 판별한다 — 리다이렉트를 기다린다.
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if self.logged_in():
+                log.info("CGV 로그인 성공: %s", user_id)
+                return self.session_tokens()
+            page.wait_for_timeout(500)
+
+        raise LoginError("로그인에 실패했습니다 (아이디·비밀번호·캡차를 확인하세요)")
+
+
+class LoginError(RuntimeError):
+    """CGV 로그인 실패 — 사용자에게 보여줄 수 있는 오류."""
 
 
 # ── 이름 -> 코드 해석 ───────────────────────────────────────────────────────
@@ -940,6 +1075,26 @@ def run_once(dry_run: bool) -> int:
     return 0
 
 
+def cmd_check_seats(dry_run: bool) -> int:
+    """좌석 감시를 1회 확인한다. 세션 하나를 띄워 로그인·좌석 조회를 처리한다."""
+    import seats
+
+    watches = store.seat_watches(enabled_only=True)
+    if not watches:
+        log.info("좌석 감시 대상이 없습니다 — 웹에서 추가하세요")
+        return 0
+
+    with single_instance() as acquired:
+        if not acquired:
+            log.info("다른 확인이 진행 중이라 이번 차례는 건너뜁니다")
+            return 0
+        with CgvSession(headless=_headless()) as session:
+            result = seats.check_seat_watches(session, dry_run=dry_run)
+    log.info("좌석 감시 완료 — 확인 %d건 / 알림 %d건",
+             result["watches_checked"], result["alerts_sent"])
+    return 0
+
+
 def summary_fields(summary: dict) -> dict:
     """check_all의 요약을 store.finish_cycle 인자로 옮긴다."""
     return {
@@ -982,6 +1137,8 @@ def main() -> int:
                         help="config.toml·state.json을 DB로 이관 (1회용)")
     parser.add_argument("--test-notify", action="store_true",
                         help="웹훅 연동만 테스트 (.env의 전역 웹훅)")
+    parser.add_argument("--check-seats", action="store_true",
+                        help="좌석 감시를 1회 확인 (로그인 필요)")
     parser.add_argument("-v", "--verbose", action="store_true", help="상세 로그")
     args = parser.parse_args()
 
@@ -1018,6 +1175,8 @@ def main() -> int:
         if args.list_sites is not None:
             cmd_list_sites(args.list_sites or None)
             return 0
+        if args.check_seats:
+            return cmd_check_seats(dry_run=args.dry_run)
         return run_once(dry_run=args.dry_run)
     except RuntimeError as exc:
         report_connect_failure(exc, args.dry_run)
