@@ -671,7 +671,7 @@ def clear_cgv_tokens(owner_id: int) -> None:
 # ── 좌석 감시 (Phase 1) ──────────────────────────────────────────────────────
 SEAT_WATCH_COLUMNS = """
     id, owner_id, movie_query, site_query, scn_ymd, screen_types, rows,
-    enabled, created_at
+    min_consecutive, enabled, created_at
 """
 
 
@@ -695,8 +695,9 @@ def seat_watches(*, enabled_only: bool = False,
 
 
 def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
-                   scn_ymd: str, screen_types=None, rows=None) -> dict:
-    """좌석 감시를 추가한다. 같은 조합이 있으면 그 행을 돌려준다."""
+                   scn_ymd: str, screen_types=None, rows=None,
+                   min_consecutive: int = 0) -> dict:
+    """좌석 감시를 추가한다. 같은 조합이 있으면 연속 조건만 갱신해 돌려준다."""
     movie_query = (movie_query or "").strip()
     site_query = (site_query or "").strip()
     scn_ymd = (scn_ymd or "").strip()
@@ -704,15 +705,21 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
         raise ValueError("영화·극장·날짜는 비울 수 없습니다")
     types = normalize_screen_types(screen_types)
     row_filter = normalize_rows(rows)
+    try:
+        need = max(0, int(min_consecutive or 0))
+    except (TypeError, ValueError):
+        raise ValueError("연속 좌석 수는 숫자여야 합니다")
     with pool().connection() as conn:
         row = conn.execute(
             f"insert into seat_watches"
-            f"   (owner_id, movie_query, site_query, scn_ymd, screen_types, rows)"
-            f" values (%s, %s, %s, %s, %s, %s)"
+            f"   (owner_id, movie_query, site_query, scn_ymd, screen_types, rows,"
+            f"    min_consecutive)"
+            f" values (%s, %s, %s, %s, %s, %s, %s)"
             f" on conflict (owner_id, movie_query, site_query, scn_ymd,"
-            f"              screen_types, rows) do update set enabled = true"
+            f"              screen_types, rows) do update set enabled = true,"
+            f"              min_consecutive = excluded.min_consecutive"
             f" returning {SEAT_WATCH_COLUMNS}",
-            (owner_id, movie_query, site_query, scn_ymd, types, row_filter),
+            (owner_id, movie_query, site_query, scn_ymd, types, row_filter, need),
         ).fetchone()
     return dict(row)
 

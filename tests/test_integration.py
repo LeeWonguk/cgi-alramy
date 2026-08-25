@@ -324,6 +324,17 @@ class TestSeatWatchStore(DbCase):
         b = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["A"])
         self.assertEqual(a["id"], b["id"])               # 같은 조합은 한 행
 
+    def test_min_consecutive_stored_and_updated(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 rows=["A"], min_consecutive=3)
+        self.assertEqual(w["min_consecutive"], 3)
+        # 같은 조합을 다시 추가하면 연속 조건이 갱신된다.
+        again = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                     rows=["A"], min_consecutive=2)
+        self.assertEqual(again["id"], w["id"])
+        self.assertEqual(again["min_consecutive"], 2)
+
     def test_state_baseline_then_diff(self):
         uid = self.make_user("owner")["id"]
         w = store.add_seat_watch(uid, "오디세이", "용산", "20260825")["id"]

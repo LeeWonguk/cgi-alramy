@@ -233,3 +233,8 @@ CREATE TABLE IF NOT EXISTS seat_watch_state (
     last_error    text,
     updated_at    timestamptz NOT NULL DEFAULT now()
 );
+
+-- 연속(나란히 붙은) 좌석 감시. min_consecutive석 이상 나란히 빈자리가 새로
+-- 생기면 알린다. 0·1이면 개별 좌석 감시(기본).
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    min_consecutive integer NOT NULL DEFAULT 0;

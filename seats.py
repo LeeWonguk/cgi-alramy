@@ -38,8 +38,20 @@ def parse_seats(seat_data: dict) -> list[dict]:
             "available": s.get("seatSaleYn") == "Y",
             "kind": s.get("stkndNm") or "",
             "zone": s.get("szoneExpoNm") or s.get("szoneNm") or "",
+            # 인접(연속) 판정용 — 같은 열에서 x좌표가 딱 붙고 통로가 없으면 이웃이다.
+            "x_start": _to_int(s.get("xcoordStartVal")),
+            "x_end": _to_int(s.get("xcoordEndVal")),
+            "left_pway": s.get("leftPwayYn") == "Y",
+            "right_pway": s.get("rghtPwayYn") == "Y",
         })
     return out
+
+
+def _to_int(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def normalize_rows(rows) -> list[str]:
@@ -66,6 +78,88 @@ def available_labels(seats: list[dict], rows=None) -> set[str]:
     }
 
 
+# ── 연속(나란히 붙은) 좌석 ────────────────────────────────────────────────────
+def _adjacent(a: dict, b: dict) -> bool:
+    """b가 a의 바로 오른쪽 이웃인지. 같은 열에서 x좌표가 딱 붙고 통로가 없어야 한다.
+
+    좌표가 없으면(예전·이형 응답) 좌석 번호가 1 차이인지로 보수적으로 판정한다.
+    """
+    if a["row"] != b["row"]:
+        return False
+    if a["x_end"] is not None and b["x_start"] is not None:
+        touching = a["x_end"] == b["x_start"]
+        no_aisle = not a["right_pway"] and not b["left_pway"]
+        return touching and no_aisle
+    # 좌표가 없을 때의 폴백 — 번호 연속 (통로를 못 보므로 과대평가일 수 있다)
+    an, bn = _to_int(a["no"]), _to_int(b["no"])
+    return an is not None and bn is not None and bn - an == 1
+
+
+def _rows_by_x(seats: list[dict], rows=None) -> dict[str, list[dict]]:
+    """열별로 x좌표(없으면 번호) 순으로 정렬한 좌석 리스트."""
+    wanted = normalize_rows(rows)
+    grouped: dict[str, list[dict]] = {}
+    for s in seats:
+        if wanted and s["row"].upper() not in wanted:
+            continue
+        grouped.setdefault(s["row"], []).append(s)
+    for row in grouped:
+        grouped[row].sort(key=lambda s: (s["x_start"] if s["x_start"] is not None
+                                         else (_to_int(s["no"]) or 0)))
+    return grouped
+
+
+def consecutive_runs(seats: list[dict], available: set[str] | None = None,
+                     rows=None) -> list[list[str]]:
+    """비어 있는 좌석들이 이루는 '연속 구간'들의 라벨 리스트.
+
+    available을 주면 그 집합에 든 좌석만 비어 있는 것으로 본다(이전 상태를 현재
+    배치에 대입해 비교할 때 쓴다). 안 주면 지금 판매 가능한 좌석을 쓴다.
+    """
+    runs: list[list[str]] = []
+    for row_seats in _rows_by_x(seats, rows).values():
+        current: list[dict] = []
+        for seat in row_seats:
+            free = seat["label"] in available if available is not None \
+                else seat["available"]
+            if not free:
+                if current:
+                    runs.append([s["label"] for s in current])
+                current = []
+                continue
+            if current and not _adjacent(current[-1], seat):
+                runs.append([s["label"] for s in current])
+                current = [seat]
+            else:
+                current.append(seat)
+        if current:
+            runs.append([s["label"] for s in current])
+    return runs
+
+
+def max_consecutive(seats: list[dict], available: set[str] | None = None,
+                    rows=None) -> int:
+    """지금 나란히 붙은 빈자리의 최대 개수. 아무도 없으면 0."""
+    runs = consecutive_runs(seats, available, rows)
+    return max((len(r) for r in runs), default=0)
+
+
+def consecutive_starts(seats: list[dict], available: set[str], n: int,
+                       rows=None) -> set[str]:
+    """n석을 나란히 앉을 수 있는 '시작 좌석' 라벨 집합.
+
+    길이 L인 연속 구간은 시작점이 L-n+1개 나온다(A1~A3에서 2연속이면 A1·A2).
+    이 집합을 이전/현재로 각각 만들어 차집합을 내면 '새로 생긴 n연속'만 남는다.
+    """
+    if n < 1:
+        return set()
+    starts: set[str] = set()
+    for run in consecutive_runs(seats, available, rows):
+        for i in range(len(run) - n + 1):
+            starts.add(run[i])
+    return starts
+
+
 def summarize(seats: list[dict], rows=None) -> dict:
     """열 필터를 적용한 좌석 요약 — {total, available, rows}."""
     wanted = normalize_rows(rows)
@@ -75,6 +169,7 @@ def summarize(seats: list[dict], rows=None) -> dict:
         "total": len(scoped),
         "available": sum(1 for s in scoped if s["available"]),
         "rows": sorted({s["row"] for s in scoped}),
+        "max_consecutive": max_consecutive(seats, rows=rows),
     }
 
 
@@ -106,6 +201,52 @@ def build_seat_alert(mov_nm: str, site_nm: str, ymd: str, start_hhmm: str,
     seats_line = "➕ " + ", ".join(sort_labels(new_labels))
     tail = f"▶ 지금 비어 있는 좌석 {available_now}석"
     return f"{head}\n{seats_line}\n{tail}"
+
+
+def run_range(run: list[str]) -> str:
+    """연속 구간을 'A3–A5'처럼 시작~끝으로 표기한다."""
+    ordered = sort_labels(run)
+    return ordered[0] if len(ordered) == 1 else f"{ordered[0]}–{ordered[-1]}"
+
+
+def build_consecutive_alert(mov_nm: str, site_nm: str, ymd: str, start_hhmm: str,
+                            screen_label: str, new_runs: list[list[str]], n: int,
+                            rows=None) -> str:
+    """새로 생긴 'n석 연속' 빈자리 알림 문구.
+
+    new_runs는 n석 이상 나란히 붙은 새 구간들이다 — 함께 앉을 자리를 찾는 알림이다.
+    """
+    wanted = normalize_rows(rows)
+    scope = f" ({'·'.join(wanted)}열)" if wanted else ""
+    head = (f"👥 *{n}석 연속 빈자리*{scope}\n"
+            f"*{mov_nm}* · CGV {site_nm}\n"
+            f"{fmt_date(ymd)} {fmt_time(start_hhmm)} · {screen_label}")
+    lines = "\n".join(f"➕ {run_range(r)} ({len(r)}연속)"
+                      for r in sorted(new_runs, key=lambda r: sort_labels(r)[0]))
+    return f"{head}\n{lines}"
+
+
+def new_consecutive_runs(seats: list[dict], prev_available: set[str],
+                         current: set[str], n: int, rows=None) -> list[list[str]]:
+    """이전엔 n연속이 안 되던 곳에 이번에 새로 생긴 n석 이상 연속 구간들.
+
+    현재 연속 구간 중, 그 시작 좌석이 '새로 생긴 n연속 시작'을 포함하는 구간만
+    골라 돌려준다 — 이미 알린 구간을 다시 알리지 않는다.
+    """
+    prev_starts = consecutive_starts(seats, prev_available, n, rows)
+    cur_starts = consecutive_starts(seats, current, n, rows)
+    fresh_starts = cur_starts - prev_starts
+    if not fresh_starts:
+        return []
+    result = []
+    for run in consecutive_runs(seats, current, rows):
+        if len(run) < n:
+            continue
+        # 이 구간의 n연속 시작점 중 새로 생긴 게 있으면 알린다.
+        run_starts = set(sort_labels(run)[:len(run) - n + 1])
+        if run_starts & fresh_starts:
+            result.append(run)
+    return result
 
 
 def showtime_key(row: dict) -> str:
@@ -190,6 +331,7 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
 
     wanted_screens = store.normalize_screen_types(w["screen_types"])
     rows = w["rows"]
+    need = int(w.get("min_consecutive") or 0)   # 0·1 = 개별 좌석, 2+ = 연속 좌석
     prev = store.prev_seat_state(w["id"])
     fresh_state: dict[str, list[str]] = {}
     alerts: list[dict] = []
@@ -214,16 +356,24 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         seats = parse_seats(seat_data)
         current = available_labels(seats, rows)
         fresh_state[key] = sort_labels(current)
+        start_hhmm = row.get("scnsrtTm") or ""
 
-        if key in prev:  # 이 회차를 전에 봤다면 새로 생긴 좌석만 알린다
+        if key not in prev:      # 첫 관측 — 기준선만 잡는다
+            continue
+
+        if need >= 2:
+            # 나란히 붙은 n석이 새로 생긴 회차만 알린다.
+            runs = new_consecutive_runs(seats, set(prev[key]), current, need, rows)
+            if runs:
+                alerts.append({"body": build_consecutive_alert(
+                    mov_nm, site_nm, w["scn_ymd"], start_hhmm,
+                    watch.screen_label(row), runs, need, rows)})
+        else:
             newly = diff_available(set(prev[key]), current)
             if newly:
-                alerts.append({
-                    "body": build_seat_alert(
-                        mov_nm, site_nm, w["scn_ymd"], row.get("scnsrtTm") or "",
-                        watch.screen_label(row), newly, len(current), rows),
-                    "start": row.get("scnsrtTm") or "",
-                })
+                alerts.append({"body": build_seat_alert(
+                    mov_nm, site_nm, w["scn_ymd"], start_hhmm,
+                    watch.screen_label(row), newly, len(current), rows)})
 
     error = None if fresh_state else "확인된 회차가 없습니다"
     if not dry_run:

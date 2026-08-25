@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import seats  # noqa: E402
+import seats as seats_mod  # 지역변수 seats에 가려지지 않게 별칭도 둔다  # noqa: E402
 
 FIXTURE = json.loads(
     (ROOT / "tests" / "fixtures" / "seatdata.json").read_text(encoding="utf-8")
@@ -30,7 +31,10 @@ class TestParseSeats(unittest.TestCase):
         parsed = seats.parse_seats(SEAT_DATA)
         self.assertEqual(len(parsed), 64)
         s = parsed[0]
-        self.assertEqual(set(s), {"row", "no", "label", "available", "kind", "zone"})
+        self.assertEqual(
+            set(s),
+            {"row", "no", "label", "available", "kind", "zone",
+             "x_start", "x_end", "left_pway", "right_pway"})
         self.assertEqual(s["label"], s["row"] + s["no"])
 
     def test_available_matches_saleyn(self):
@@ -87,6 +91,68 @@ class TestDiffAndSort(unittest.TestCase):
             seats.sort_labels(["A10", "A2", "B1", "A1"]),
             ["A1", "A2", "A10", "B1"],
         )
+
+
+def _seat(row, no, x_start, x_end, available, *, left=False, right=False):
+    """테스트용 좌석 하나. parse_seats가 내는 모양과 같게 만든다."""
+    return {"row": row, "no": str(no), "label": f"{row}{no}",
+            "available": available, "kind": "", "zone": "",
+            "x_start": x_start, "x_end": x_end,
+            "left_pway": left, "right_pway": right}
+
+
+class TestConsecutive(unittest.TestCase):
+    def _row(self, avails, aisle_after=()):
+        """A열 좌석들을 만든다. avails[i]=예매가능, aisle_after에 든 번호 뒤엔 통로."""
+        seats, x = [], 1
+        for i, free in enumerate(avails, start=1):
+            right = i in aisle_after
+            seats.append(_seat("A", i, x, x + 2, free,
+                               left=(i - 1) in aisle_after, right=right))
+            x = x + 2 + (2 if right else 0)  # 통로가 있으면 x가 벌어진다
+        return seats
+
+    def test_runs_split_by_taken_seat(self):
+        # A1 A2 [X] A4 A5  → 두 구간
+        seats = self._row([True, True, False, True, True])
+        runs = seats_mod.consecutive_runs(seats)
+        self.assertEqual([len(r) for r in runs], [2, 2])
+
+    def test_runs_split_by_aisle(self):
+        # 좌표·통로로 A2와 A3 사이가 끊긴다 → 다 비어도 2+2 (한 줄 4연속 아님)
+        seats = self._row([True, True, True, True], aisle_after={2})
+        runs = seats_mod.consecutive_runs(seats)
+        self.assertEqual(sorted(len(r) for r in runs), [2, 2])
+
+    def test_max_consecutive(self):
+        seats = self._row([True, True, True, False, True])
+        self.assertEqual(seats_mod.max_consecutive(seats), 3)
+
+    def test_consecutive_starts(self):
+        # A1 A2 A3 비면 2연속 시작은 A1·A2, 3연속 시작은 A1
+        seats = self._row([True, True, True, False, False])
+        self.assertEqual(seats_mod.consecutive_starts(seats, {"A1", "A2", "A3"}, 2),
+                         {"A1", "A2"})
+        self.assertEqual(seats_mod.consecutive_starts(seats, {"A1", "A2", "A3"}, 3),
+                         {"A1"})
+
+    def test_new_consecutive_runs_detects_new_pair(self):
+        # 이전엔 A2만, 이번에 A1이 풀려 A1-A2 2연속이 새로 생김
+        seats = self._row([True, True, False, False, False])
+        runs = seats_mod.new_consecutive_runs(seats, {"A2"}, {"A1", "A2"}, 2)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(seats_mod.run_range(runs[0]), "A1–A2")
+
+    def test_new_consecutive_runs_ignores_already_known(self):
+        # 이전에 이미 A1-A2 2연속이었으면 다시 알리지 않는다
+        seats = self._row([True, True, False, False, False])
+        runs = seats_mod.new_consecutive_runs(seats, {"A1", "A2"}, {"A1", "A2"}, 2)
+        self.assertEqual(runs, [])
+
+    def test_fixture_max_consecutive_in_row_a(self):
+        # 실제 픽스처: A열 8석 전부 판매가능이지만 통로로 끊겨 최대 연속은 2다.
+        parsed = seats_mod.parse_seats(SEAT_DATA)
+        self.assertEqual(seats_mod.max_consecutive(parsed, rows=["A"]), 2)
 
 
 class TestAlertMessage(unittest.TestCase):

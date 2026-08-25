@@ -21,6 +21,7 @@
   let site = $state('')
   let ymd = $state('') // YYYY-MM-DD (입력) → 저장 시 YYYYMMDD로 보냄
   let rowsText = $state('')
+  let minConsecutive = $state(0) // 0·1 = 개별 좌석, 2+ = 나란히 붙은 N석
   let types = $state(new Set())
   let savingWatch = $state(false)
   let watchMsg = $state(null)
@@ -112,6 +113,7 @@
         scn_ymd: ymd.replaceAll('-', ''),
         screen_types: [...types],
         rows: rowsText.split(/[,\s]+/).map((r) => r.trim()).filter(Boolean),
+        min_consecutive: Number(minConsecutive) || 0,
       })
       watchMsg = '좌석 감시를 추가했습니다'
       rowsText = ''
@@ -246,6 +248,21 @@
     </div>
 
     <div class="field">
+      <label for="s-consec">연속 좌석</label>
+      <select id="s-consec" bind:value={minConsecutive}>
+        <option value={0}>개별 좌석 (한 자리라도)</option>
+        <option value={2}>2석 연속 (나란히)</option>
+        <option value={3}>3석 연속</option>
+        <option value={4}>4석 연속</option>
+        <option value={5}>5석 연속</option>
+      </select>
+      <div class="small muted">
+        고르면 <strong>나란히 붙은</strong> 그만큼의 빈자리가 새로 생겼을 때만 알립니다
+        (통로로 끊긴 자리는 연속으로 치지 않습니다).
+      </div>
+    </div>
+
+    <div class="field">
       <label for="s-types">상영관 필터</label>
       <div class="row">
         {#each SCREEN_TYPES as name, i (name)}
@@ -282,6 +299,7 @@
           <th>날짜</th>
           <th>상영관</th>
           <th>열</th>
+          <th>연속</th>
           <th></th>
         </tr>
       </thead>
@@ -293,6 +311,7 @@
             <td>{fmtYmd(w.scn_ymd)}</td>
             <td>{w.screen_types.length ? w.screen_types.join(', ') : '전체'}</td>
             <td>{w.rows.length ? w.rows.join(', ') : '전 열'}</td>
+            <td>{w.min_consecutive >= 2 ? `${w.min_consecutive}석` : '개별'}</td>
             <td class="row" style="justify-content: flex-end">
               <button class="ghost small danger" onclick={() => removeWatch(w)}>삭제</button>
             </td>

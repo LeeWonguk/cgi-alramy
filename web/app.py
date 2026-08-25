@@ -189,6 +189,7 @@ def seat_watch_view(row: dict) -> dict:
         "scn_ymd": row["scn_ymd"],
         "screen_types": row["screen_types"] or [],
         "rows": row["rows"] or [],
+        "min_consecutive": row["min_consecutive"] or 0,
         "enabled": row["enabled"],
         "created_at": row["created_at"],
     }
@@ -666,7 +667,8 @@ def register_api(app: Flask) -> None:
         try:
             row = store.add_seat_watch(
                 me()["id"], movie, site, scn_ymd,
-                screen_types=data.get("screen_types"), rows=data.get("rows"))
+                screen_types=data.get("screen_types"), rows=data.get("rows"),
+                min_consecutive=data.get("min_consecutive", 0))
         except ValueError as exc:
             return fail(str(exc))
         return jsonify(seat_watch_view(row)), 201
