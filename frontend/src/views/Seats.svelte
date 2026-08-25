@@ -20,6 +20,9 @@
   let movie = $state('')
   let site = $state('')
   let ymd = $state('') // YYYY-MM-DD (입력) → 저장 시 YYYYMMDD로 보냄
+  let scnTime = $state('') // 상영 시간(HH:MM). 비우면 모든 회차
+  let times = $state([]) // 선택한 영화·극장·날짜의 회차 시간 목록
+  let loadingTimes = $state(false)
   let rowsText = $state('')
   let minConsecutive = $state(0) // 0·1 = 개별 좌석, 2+ = 나란히 붙은 N석
   let autoBook = $state(false) // 좌석 확보 시 자동 선점
@@ -69,6 +72,36 @@
   }
 
   const sitesInRegion = $derived(catalog.sites.filter((s) => s.region === region))
+
+  // 영화·극장·날짜가 모두 정해지면 그 조합의 회차 시간 목록을 받아 드롭다운을 채운다.
+  $effect(() => {
+    const m = catalog.movies.find((x) => x.mov_nm === movie)
+    const s = catalog.sites.find((x) => x.site_nm === site)
+    if (!m || !s || !ymd) {
+      times = []
+      return
+    }
+    loadTimes(m.mov_no, s.site_no, ymd.replaceAll('-', ''))
+  })
+
+  async function loadTimes(movNo, siteNo, ymdDigits) {
+    loadingTimes = true
+    try {
+      const res = await post('/api/lookup/showtimes', {
+        mov_no: movNo,
+        site_no: siteNo,
+        date: ymdDigits,
+      })
+      // groups: [{label, times:[HH:MM,...]}] → 시간만 모아 정렬·중복제거
+      const all = (res.groups ?? []).flatMap((g) => g.times ?? [])
+      times = [...new Set(all)].sort()
+      if (scnTime && !times.includes(scnTime)) scnTime = '' // 없는 시간이면 초기화
+    } catch (exc) {
+      times = [] // 조회 실패 시 '모든 회차'로만 진행
+    } finally {
+      loadingTimes = false
+    }
+  }
 
   async function saveAccount() {
     accountMsg = null
@@ -125,6 +158,7 @@
         scn_ymd: ymd.replaceAll('-', ''),
         screen_types: [...types],
         rows: rowsText.split(/[,\s]+/).map((r) => r.trim()).filter(Boolean),
+        scn_time: scnTime,
         min_consecutive: Number(minConsecutive) || 0,
         auto_book: autoBook,
         party_size: Number(partySize) || 1,
@@ -257,6 +291,27 @@
     </div>
 
     <div class="field">
+      <label for="s-time">상영 시간</label>
+      <select id="s-time" bind:value={scnTime} disabled={!times.length}>
+        <option value="">모든 회차</option>
+        {#each times as t (t)}
+          <option value={t}>{t}</option>
+        {/each}
+      </select>
+      <div class="small muted">
+        {#if loadingTimes}
+          회차 불러오는 중…
+        {:else if !ymd || !movie || !site}
+          영화·극장·날짜를 고르면 회차가 표시됩니다.
+        {:else if !times.length}
+          이 조합의 회차를 불러오지 못했습니다 (모든 회차로 감시).
+        {:else}
+          비우면 그 날짜의 모든 회차를 봅니다.
+        {/if}
+      </div>
+    </div>
+
+    <div class="field">
       <label for="s-rows">열 필터</label>
       <input id="s-rows" bind:value={rowsText} placeholder="예: A, B (비우면 전 열)" />
       <div class="small muted">쉼표·공백으로 구분. 비우면 모든 열의 빈좌석을 봅니다.</div>
@@ -354,7 +409,7 @@
           <tr class:off={!w.enabled}>
             <td>{w.movie_query}</td>
             <td>{w.site_query}</td>
-            <td>{fmtYmd(w.scn_ymd)}</td>
+            <td>{fmtYmd(w.scn_ymd)}{w.scn_time ? ` ${w.scn_time}` : ''}</td>
             <td>{w.screen_types.length ? w.screen_types.join(', ') : '전체'}</td>
             <td>{w.rows.length ? w.rows.join(', ') : '전 열'}</td>
             <td>{w.min_consecutive >= 2 ? `${w.min_consecutive}석` : '개별'}</td>

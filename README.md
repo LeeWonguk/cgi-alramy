@@ -206,9 +206,10 @@ DB에 넣지만, 그러면 키와 암호문이 같은 DB에 있게 됩니다).
 `accessToken`이 만료되면 `refresh_token`으로 갱신하고, 그마저 만료됐을 때만 캡차를
 다시 풀어 재로그인합니다. 즉 **캡차는 사실상 최초 1회**만 필요합니다.
 
-**좌석 알림.** 좌석 감시는 (영화 × 극장 × 날짜)에 상영관 필터와 **열(row) 필터**를
-얹습니다. 예: "8/25 · 씨네드쉐프 용산 · A~B열에 빈자리가 생기면 알림". 첫 관측은
-기준선만 잡고, 이후 **새로 생긴** 빈좌석만 알립니다(취소표 감지).
+**좌석 알림.** 좌석 감시는 (영화 × 극장 × 날짜)에 **상영 시간(회차)**·상영관 필터·
+**열(row) 필터**를 얹습니다. 상영 시간을 비우면 그 날짜의 모든 회차를 봅니다. 예:
+"8/25 22:10 · 씨네드쉐프 용산 · A~B열에 빈자리가 생기면 알림". 첫 관측은 기준선만
+잡고, 이후 **새로 생긴** 빈좌석만 알립니다(취소표 감지).
 
 **연속 좌석.** `연속 좌석`을 2석 이상으로 정하면 **나란히 붙은** 그만큼의 빈자리가
 새로 생겼을 때만 알립니다 — 일행이 함께 앉을 자리를 찾을 때 씁니다. 인접은 좌석
@@ -316,7 +317,7 @@ DB에 넣지만, 그러면 키와 암호문이 같은 DB에 있게 됩니다).
 | GET | `/api/cgv-account` | 내 CGV 계정 연동 상태 (비밀번호·토큰은 안 나감) |
 | PUT | `/api/cgv-account` | `{cgv_user_id, password}` 저장 → 즉시 로그인 시도 |
 | DELETE | `/api/cgv-account` | 저장된 CGV 계정 삭제 |
-| GET/POST | `/api/seat-watches` | 내 좌석 감시 목록 / 추가(`{movie, site, scn_ymd, rows?, screen_types?, min_consecutive?, auto_book?, party_size?}`) |
+| GET/POST | `/api/seat-watches` | 내 좌석 감시 목록 / 추가(`{movie, site, scn_ymd, scn_time?, rows?, screen_types?, min_consecutive?, auto_book?, party_size?}`) — `scn_time`(HH:MM) 비우면 그 날짜 모든 회차 |
 | PATCH | `/api/seat-watches/<id>` | 감시 옵션 수정(`enabled`·`auto_book`·`party_size`·`min_consecutive`) |
 | DELETE | `/api/seat-watches/<id>` | 좌석 감시 삭제 |
 | GET | `/api/bookings` | 내 자동 예매(선점) 시도 이력 |

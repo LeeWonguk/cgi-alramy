@@ -670,9 +670,22 @@ def clear_cgv_tokens(owner_id: int) -> None:
 
 # ── 좌석 감시 (Phase 1) ──────────────────────────────────────────────────────
 SEAT_WATCH_COLUMNS = """
-    id, owner_id, movie_query, site_query, scn_ymd, screen_types, rows,
+    id, owner_id, movie_query, site_query, scn_ymd, scn_time, screen_types, rows,
     min_consecutive, auto_book, party_size, ticket_spec, enabled, created_at
 """
+
+
+def normalize_scn_time(value) -> str:
+    """상영 시간을 'HH:MM'으로 정규화. 비어 있으면 '' (= 모든 회차).
+
+    '22:10'·'2210' 모두 받는다. CGV는 자정 넘김을 '24:30'·'2530'처럼 24~28시로도
+    주므로 시(hour) 상한을 두지 않는다.
+    """
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) < 3:
+        return ""
+    digits = digits[:4].rjust(4, "0") if len(digits) == 3 else digits[:4]
+    return f"{digits[:2]}:{digits[2:4]}"
 
 
 def seat_watches(*, enabled_only: bool = False,
@@ -720,7 +733,7 @@ def normalize_ticket_spec(spec) -> dict:
 def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
                    scn_ymd: str, screen_types=None, rows=None,
                    min_consecutive: int = 0, auto_book: bool = False,
-                   party_size: int = 1, ticket_spec=None) -> dict:
+                   party_size: int = 1, ticket_spec=None, scn_time="") -> dict:
     """좌석 감시를 추가한다. 같은 조합이 있으면 옵션을 갱신해 돌려준다."""
     movie_query = (movie_query or "").strip()
     site_query = (site_query or "").strip()
@@ -729,6 +742,7 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
         raise ValueError("영화·극장·날짜는 비울 수 없습니다")
     types = normalize_screen_types(screen_types)
     row_filter = normalize_rows(rows)
+    stime = normalize_scn_time(scn_time)
     try:
         need = max(0, int(min_consecutive or 0))
     except (TypeError, ValueError):
@@ -741,18 +755,19 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
     with pool().connection() as conn:
         row = conn.execute(
             f"insert into seat_watches"
-            f"   (owner_id, movie_query, site_query, scn_ymd, screen_types, rows,"
+            f"   (owner_id, movie_query, site_query, scn_ymd, scn_time,"
+            f"    screen_types, rows,"
             f"    min_consecutive, auto_book, party_size, ticket_spec)"
-            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
-            f" on conflict (owner_id, movie_query, site_query, scn_ymd,"
+            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            f" on conflict (owner_id, movie_query, site_query, scn_ymd, scn_time,"
             f"              screen_types, rows) do update set enabled = true,"
             f"              min_consecutive = excluded.min_consecutive,"
             f"              auto_book = excluded.auto_book,"
             f"              party_size = excluded.party_size,"
             f"              ticket_spec = excluded.ticket_spec"
             f" returning {SEAT_WATCH_COLUMNS}",
-            (owner_id, movie_query, site_query, scn_ymd, types, row_filter, need,
-             bool(auto_book), party, Json(spec)),
+            (owner_id, movie_query, site_query, scn_ymd, stime, types, row_filter,
+             need, bool(auto_book), party, Json(spec)),
         ).fetchone()
     return dict(row)
 

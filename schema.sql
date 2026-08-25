@@ -279,3 +279,23 @@ CREATE TABLE IF NOT EXISTS booking_attempts (
 
 CREATE INDEX IF NOT EXISTS booking_attempts_owner_idx
     ON booking_attempts (owner_id, created_at DESC);
+
+-- ── 좌석 감시에 상영 시간(회차) 지정 ─────────────────────────────────────────
+-- 지금까지 좌석 감시는 (영화×극장×날짜)라 그 날짜의 모든 회차를 봤다. 특정 회차만
+-- 보려면 scn_time(HH:MM)을 지정한다. 비어 있으면 예전처럼 모든 회차를 본다.
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS scn_time text NOT NULL DEFAULT '';
+
+-- 같은 날짜의 서로 다른 회차를 따로 감시할 수 있도록, 유일성에 scn_time을 넣는다.
+-- 기존 인라인 UNIQUE(scn_time 없음)를 지우고 새 유니크 인덱스로 바꾼다(멱등).
+DO $$
+DECLARE c record;
+BEGIN
+    FOR c IN SELECT conname FROM pg_constraint
+             WHERE conrelid = 'seat_watches'::regclass AND contype = 'u' LOOP
+        EXECUTE 'ALTER TABLE seat_watches DROP CONSTRAINT ' || quote_ident(c.conname);
+    END LOOP;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_idx
+    ON seat_watches (owner_id, movie_query, site_query, scn_ymd, scn_time,
+                     screen_types, rows);

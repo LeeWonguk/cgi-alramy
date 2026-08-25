@@ -324,6 +324,23 @@ class TestSeatWatchStore(DbCase):
         b = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["A"])
         self.assertEqual(a["id"], b["id"])               # 같은 조합은 한 행
 
+    def test_scn_time_normalized_and_distinct(self):
+        # 정규화: '2210'·'22:10' 모두 'HH:MM'으로.
+        self.assertEqual(store.normalize_scn_time("2210"), "22:10")
+        self.assertEqual(store.normalize_scn_time("22:10"), "22:10")
+        self.assertEqual(store.normalize_scn_time(""), "")
+        self.assertEqual(store.normalize_scn_time("2530"), "25:30")  # 자정 넘김
+
+        uid = self.make_user("owner")["id"]
+        allw = store.add_seat_watch(uid, "오디세이", "용산", "20260825")
+        t2210 = store.add_seat_watch(uid, "오디세이", "용산", "20260825", scn_time="2210")
+        t1900 = store.add_seat_watch(uid, "오디세이", "용산", "20260825", scn_time="19:00")
+        # 시간이 다르면 별개의 감시다.
+        ids = {allw["id"], t2210["id"], t1900["id"]}
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(t2210["scn_time"], "22:10")
+        self.assertEqual(allw["scn_time"], "")
+
     def test_min_consecutive_stored_and_updated(self):
         uid = self.make_user("owner")["id"]
         w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",

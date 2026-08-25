@@ -372,6 +372,11 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         return 0
 
     wanted_screens = store.normalize_screen_types(w["screen_types"])
+    # 특정 상영 시간(회차)만 볼 수 있다. 비어 있으면 그 날짜의 모든 회차.
+    want_time = "".join(ch for ch in (w.get("scn_time") or "") if ch.isdigit())
+    if want_time:
+        schedule = [r for r in schedule
+                    if (r.get("scnsrtTm") or "").startswith(want_time)]
     rows = w["rows"]
     need = int(w.get("min_consecutive") or 0)   # 0·1 = 개별 좌석, 2+ = 연속 좌석
     prev = store.prev_seat_state(w["id"])
