@@ -87,6 +87,11 @@ CHROME_UA = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+# 웹훅 전송용 User-Agent. Discord 앞단 Cloudflare가 파이썬 기본 UA
+# (Python-urllib/x.y)를 봇으로 보고 403 error code 1010으로 막으므로, 우리를
+# 식별하는 UA를 명시한다. Slack도 이 헤더가 있어 문제되지 않는다.
+WEBHOOK_UA = "cgv-watch/1.0 (+https://github.com/LeeWonguk/cgi-alramy)"
+
 # ── 경로 ────────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent
 LOCK_PATH = ROOT / ".watch.lock"
@@ -482,8 +487,11 @@ def send_webhook(text: str, dry_run: bool = False,
 
     label = WEBHOOK_LABELS.get(kind, kind)
     body = json.dumps(webhook_payload(text, kind)).encode("utf-8")
+    # User-Agent를 반드시 붙인다. Discord 앞단 Cloudflare는 파이썬 기본 UA
+    # (Python-urllib/x.y)를 봇으로 보고 403 error code 1010으로 막는다.
     req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}
+        url, data=body,
+        headers={"Content-Type": "application/json", "User-Agent": WEBHOOK_UA},
     )
     for attempt in range(3):
         if attempt:
