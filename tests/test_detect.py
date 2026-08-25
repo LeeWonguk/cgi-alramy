@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import store  # noqa: E402
 import watch  # noqa: E402
 
 
@@ -233,6 +234,87 @@ class TestWebhookPayload(unittest.TestCase):
         # 2000자를 넘기면 400이 떨어져 알림을 통째로 잃는다 — 잘라 보내는 게 낫다.
         payload = watch.webhook_payload("가" * 3000, "discord")
         self.assertEqual(len(payload["content"]), watch.DISCORD_LIMIT)
+
+
+class TestShowtimeMinutes(unittest.TestCase):
+    """상영 시각을 분으로 펴기. CGV의 24시 이상 표기를 그대로 살린다."""
+
+    def test_both_notations(self):
+        self.assertEqual(store.hhmm_minutes("22:10"), 22 * 60 + 10)
+        self.assertEqual(store.hhmm_minutes("2210"), 22 * 60 + 10)
+
+    def test_past_midnight_stays_above_24h(self):
+        # '2530'을 01:30으로 접으면 "23:00보다 늦은 회차" 비교가 뒤집힌다.
+        self.assertEqual(store.hhmm_minutes("2530"), 25 * 60 + 30)
+        self.assertGreater(store.hhmm_minutes("2530"), store.hhmm_minutes("2300"))
+
+    def test_unreadable_values(self):
+        for bad in ("", None, "abc", "99:99", "2999"):
+            self.assertIsNone(store.hhmm_minutes(bad), bad)
+
+
+class TestNormalizeTimeRange(unittest.TestCase):
+    def test_normalizes_both_notations(self):
+        self.assertEqual(store.normalize_time_range("1800", "23:30"),
+                         ("18:00", "23:30"))
+
+    def test_half_open_range_is_dropped(self):
+        self.assertEqual(store.normalize_time_range("18:00", ""), ("", ""))
+        self.assertEqual(store.normalize_time_range("", "23:30"), ("", ""))
+        self.assertEqual(store.normalize_time_range("", ""), ("", ""))
+
+    def test_overnight_is_kept_as_written(self):
+        # 26:00으로 미리 펴지 않는다 — 화면의 <input type=time>이 못 그린다.
+        self.assertEqual(store.normalize_time_range("22:00", "02:00"),
+                         ("22:00", "02:00"))
+
+    def test_garbage_is_rejected(self):
+        with self.assertRaises(ValueError):
+            store.normalize_time_range("99:99", "10:00")
+
+
+class TestWebhookUrlAllowlist(unittest.TestCase):
+    """서버가 사용자가 적어 준 주소로 직접 요청을 나가므로, 저장 시점에 막는다.
+
+    막지 않으면 승인된 사용자가 사설망 주소를 넣고 '테스트 전송'을 눌러 내부
+    서비스의 응답을 알아낼 수 있다(SSRF).
+    """
+
+    def test_slack_and_discord_pass(self):
+        for url in ("https://hooks.slack.com/services/T00/B00/xxx",
+                    "https://discord.com/api/webhooks/123/abc",
+                    "https://discordapp.com/api/webhooks/123/abc",
+                    "https://canary.discord.com/api/webhooks/123/abc"):
+            self.assertEqual(store.normalize_webhook_url(url), url)
+
+    def test_blank_falls_back_to_global(self):
+        self.assertIsNone(store.normalize_webhook_url(""))
+        self.assertIsNone(store.normalize_webhook_url("   "))
+        self.assertIsNone(store.normalize_webhook_url(None))
+
+    def test_private_and_metadata_addresses_are_rejected(self):
+        for url in ("http://169.254.169.254/latest/meta-data/",
+                    "http://127.0.0.1:8787/api/users",
+                    "https://192.168.0.1/",
+                    "http://[::1]:5432/"):
+            with self.assertRaises(ValueError):
+                store.normalize_webhook_url(url)
+
+    def test_http_is_rejected_even_for_allowed_host(self):
+        with self.assertRaises(ValueError):
+            store.normalize_webhook_url("http://hooks.slack.com/services/x")
+
+    def test_lookalike_domain_is_rejected(self):
+        # endswith 비교를 문자열로만 하면 통과해 버리는 모양들.
+        for url in ("https://evil-discord.com/api/webhooks/1/x",
+                    "https://discord.com.attacker.example/x",
+                    "https://notslack.com/"):
+            with self.assertRaises(ValueError):
+                store.normalize_webhook_url(url)
+
+    def test_subdomain_of_allowed_host_passes(self):
+        url = "https://ptb.discord.com/api/webhooks/1/x"
+        self.assertEqual(store.normalize_webhook_url(url), url)
 
 
 class TestMessageBuilders(unittest.TestCase):

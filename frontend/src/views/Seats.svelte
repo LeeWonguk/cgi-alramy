@@ -20,7 +20,13 @@
   let movie = $state('')
   let site = $state('')
   let ymd = $state('') // YYYY-MM-DD (입력) → 저장 시 YYYYMMDD로 보냄
+  // 회차 고르는 방법: 'all' 모든 회차 · 'one' 특정 회차 · 'range' 시간대
+  // 'range'는 아직 상영표가 열리지 않은 영화를 미리 걸어 둘 때 쓴다 — 회차
+  // 드롭다운이 실제 회차로 채워지므로 미상영이면 'one'을 고를 수가 없다.
+  let timeMode = $state('all')
   let scnTime = $state('') // 상영 시간(HH:MM). 비우면 모든 회차
+  let timeFrom = $state('18:00') // 시간대 시작
+  let timeTo = $state('23:59') // 시간대 끝 (시작보다 이르면 자정 넘김)
   let times = $state([]) // 선택한 영화·극장·날짜의 회차 시간 목록
   let loadingTimes = $state(false)
   let rowsText = $state('')
@@ -96,6 +102,8 @@
       const all = (res.groups ?? []).flatMap((g) => g.times ?? [])
       times = [...new Set(all)].sort()
       if (scnTime && !times.includes(scnTime)) scnTime = '' // 없는 시간이면 초기화
+      // 회차가 하나도 없으면 '특정 회차'는 고를 수 없다 — 시간대로 넘겨준다.
+      if (!times.length && timeMode === 'one') timeMode = 'range'
     } catch (exc) {
       times = [] // 조회 실패 시 '모든 회차'로만 진행
     } finally {
@@ -150,6 +158,14 @@
       watchErr = '영화·극장·날짜를 모두 지정하세요'
       return
     }
+    if (timeMode === 'range' && (!timeFrom || !timeTo)) {
+      watchErr = '시간대의 시작과 끝을 모두 지정하세요'
+      return
+    }
+    if (timeMode === 'one' && !scnTime) {
+      watchErr = '회차를 고르거나 다른 방법을 선택하세요'
+      return
+    }
     savingWatch = true
     try {
       await post('/api/seat-watches', {
@@ -158,7 +174,9 @@
         scn_ymd: ymd.replaceAll('-', ''),
         screen_types: [...types],
         rows: rowsText.split(/[,\s]+/).map((r) => r.trim()).filter(Boolean),
-        scn_time: scnTime,
+        scn_time: timeMode === 'one' ? scnTime : '',
+        scn_time_from: timeMode === 'range' ? timeFrom : '',
+        scn_time_to: timeMode === 'range' ? timeTo : '',
         min_consecutive: Number(minConsecutive) || 0,
         auto_book: autoBook,
         party_size: Number(partySize) || 1,
@@ -179,6 +197,16 @@
       return
     await del(`/api/seat-watches/${w.id}`)
     await loadWatches()
+  }
+
+  /** 감시가 어느 회차를 보는지 한 줄로. 시간대면 늦은 회차 우선이라고 알린다. */
+  function fmtWhen(w) {
+    if (w.scn_time) return w.scn_time
+    if (w.scn_time_from && w.scn_time_to) {
+      const overnight = w.scn_time_to < w.scn_time_from ? '+1' : ''
+      return `${w.scn_time_from}~${w.scn_time_to}${overnight} ↓늦은순`
+    }
+    return '모든 회차'
   }
 
   function fmtYmd(s) {
@@ -291,22 +319,51 @@
     </div>
 
     <div class="field">
-      <label for="s-time">상영 시간</label>
-      <select id="s-time" bind:value={scnTime} disabled={!times.length}>
-        <option value="">모든 회차</option>
-        {#each times as t (t)}
-          <option value={t}>{t}</option>
-        {/each}
+      <label for="s-timemode">상영 시간</label>
+      <select id="s-timemode" bind:value={timeMode}>
+        <option value="all">모든 회차</option>
+        <option value="one" disabled={!times.length}>특정 회차</option>
+        <option value="range">시간대로 (미상영 영화도 가능)</option>
       </select>
+
+      {#if timeMode === 'one'}
+        <select
+          class="stacked"
+          aria-label="회차"
+          bind:value={scnTime}
+          disabled={!times.length}
+        >
+          <option value="">회차를 고르세요</option>
+          {#each times as t (t)}
+            <option value={t}>{t}</option>
+          {/each}
+        </select>
+      {:else if timeMode === 'range'}
+        <div class="range">
+          <input type="time" aria-label="시간대 시작" bind:value={timeFrom} />
+          <span class="tilde">~</span>
+          <input type="time" aria-label="시간대 끝" bind:value={timeTo} />
+        </div>
+      {/if}
+
       <div class="small muted">
-        {#if loadingTimes}
+        {#if timeMode === 'range'}
+          이 시간대의 회차를 봅니다. 상영표가 아직 열리지 않은 영화도 미리 걸어 둘 수
+          있습니다 — 열리는 순간부터 확인합니다. 자동 예매를 켜 두면 시간대 안에서
+          <strong>가장 늦은 회차부터</strong> 좌석을 잡습니다.
+          {#if timeTo && timeFrom && timeTo < timeFrom}
+            <br />끝이 시작보다 이르므로 <strong>자정을 넘긴 것</strong>으로 봅니다
+            ({timeFrom} ~ 다음날 {timeTo}).
+          {/if}
+        {:else if loadingTimes}
           회차 불러오는 중…
         {:else if !ymd || !movie || !site}
           영화·극장·날짜를 고르면 회차가 표시됩니다.
         {:else if !times.length}
-          이 조합의 회차를 불러오지 못했습니다 (모든 회차로 감시).
-        {:else}
-          비우면 그 날짜의 모든 회차를 봅니다.
+          이 조합의 회차를 불러오지 못했습니다 — 아직 상영표가 열리지 않았다면
+          '시간대로'를 고르세요.
+        {:else if timeMode === 'all'}
+          그 날짜의 모든 회차를 봅니다.
         {/if}
       </div>
     </div>
@@ -409,7 +466,7 @@
           <tr class:off={!w.enabled}>
             <td>{w.movie_query}</td>
             <td>{w.site_query}</td>
-            <td>{fmtYmd(w.scn_ymd)}{w.scn_time ? ` ${w.scn_time}` : ''}</td>
+            <td>{fmtYmd(w.scn_ymd)} <span class="small muted">{fmtWhen(w)}</span></td>
             <td>{w.screen_types.length ? w.screen_types.join(', ') : '전체'}</td>
             <td>{w.rows.length ? w.rows.join(', ') : '전 열'}</td>
             <td>{w.min_consecutive >= 2 ? `${w.min_consecutive}석` : '개별'}</td>
@@ -488,6 +545,23 @@
     font-size: 12px;
     color: var(--muted);
     font-weight: 600;
+  }
+  /* 회차를 '시간대로' 고를 때의 시작~끝 입력 */
+  .range {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .range input {
+    flex: 1;
+    min-width: 0;
+  }
+  .tilde {
+    color: var(--muted);
+  }
+  /* 모드 선택 아래에 딸려 나오는 두 번째 컨트롤 */
+  .stacked {
+    width: 100%;
   }
   .chip {
     padding: 2px 9px;

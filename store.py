@@ -348,6 +348,43 @@ def normalize_webhook_kind(value: Any) -> str:
     return kind
 
 
+# 웹훅으로 인정하는 호스트. 서버가 사용자가 적어 준 주소로 직접 요청을 나가므로
+# (watch.send_webhook), 아무 주소나 받으면 사설망·클라우드 메타데이터 주소를
+# 대신 찔러 보는 통로가 된다 — 응답 코드와 본문 앞부분이 로그에 남고 화면의
+# '테스트 전송' 성공/실패로도 새어 나간다. 보낼 곳은 어차피 둘뿐이라 막아 둔다.
+WEBHOOK_HOSTS = {
+    "slack": ("hooks.slack.com",),
+    "discord": ("discord.com", "discordapp.com", "ptb.discord.com",
+                "canary.discord.com"),
+}
+
+
+def normalize_webhook_url(value: Any) -> str | None:
+    """사용자가 넣은 웹훅 주소를 검사한다. 빈 값이면 None(전역 웹훅으로 되돌림).
+
+    https + 알려진 호스트만 통과시킨다. 어긋나면 ValueError — 호출자가 400으로
+    돌려준다.
+    """
+    if value is None:
+        return None
+    url = str(value).strip()
+    if not url:
+        return None
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("웹훅 주소는 https:// 로 시작해야 합니다")
+    host = (parsed.hostname or "").lower()
+    allowed = [h for hosts in WEBHOOK_HOSTS.values() for h in hosts]
+    # 정확히 일치하거나 그 도메인의 하위 호스트만 (evil-discord.com은 걸러진다).
+    if not any(host == h or host.endswith("." + h) for h in allowed):
+        raise ValueError(
+            f"웹훅 주소로 쓸 수 없는 호스트입니다: {host or '(없음)'} "
+            f"— Slack({WEBHOOK_HOSTS['slack'][0]}) 또는 "
+            f"Discord({WEBHOOK_HOSTS['discord'][0]}) 주소만 됩니다")
+    return url
+
+
 def detect_webhook_kind(url: str | None) -> str | None:
     """웹훅 주소에서 종류를 알아낸다. 확실하지 않으면 None.
 
@@ -473,15 +510,18 @@ def update_user(user_id: int, **fields: Any) -> dict | None:
 
     webhook_url을 새로 주면 주소에서 알아낸 종류로 webhook_kind를 덮어쓴다 —
     Slack 주소를 Discord로 표시해 두면 문법이 어긋난 문구가 나가기 때문이다.
+    쓸 수 없는 주소(https가 아니거나 Slack·Discord가 아닌 호스트)면 ValueError.
     """
     fields = dict(fields)
     if fields.get("webhook_url"):
+        # 먼저 검사한다 — 못 쓸 주소면 종류를 손대기 전에 ValueError로 끝난다.
+        normalize_webhook_url(fields["webhook_url"])
         detected = detect_webhook_kind(fields["webhook_url"])
         if detected:
             fields["webhook_kind"] = detected
 
     allowed = {
-        "webhook_url": lambda v: (str(v).strip() or None) if v is not None else None,
+        "webhook_url": normalize_webhook_url,
         "webhook_kind": normalize_webhook_kind,
         "include_showtimes": lambda v: coerce_setting("include_showtimes", v),
         "lookahead_days": lambda v: coerce_setting("lookahead_days", v),
@@ -670,9 +710,14 @@ def clear_cgv_tokens(owner_id: int) -> None:
 
 # ── 좌석 감시 (Phase 1) ──────────────────────────────────────────────────────
 SEAT_WATCH_COLUMNS = """
-    id, owner_id, movie_query, site_query, scn_ymd, scn_time, screen_types, rows,
+    id, owner_id, movie_query, site_query, scn_ymd, scn_time,
+    scn_time_from, scn_time_to, screen_types, rows,
     min_consecutive, auto_book, party_size, ticket_spec, enabled, created_at
 """
+
+# 자정을 넘긴 회차를 24시 이상으로 적는 CGV 표기의 상한. '2530' = 25:30 = 새벽 1:30.
+# 하루치 상영표라 28시(= 새벽 4시)를 넘는 회차는 없다.
+MAX_SHOWTIME_HOUR = 28
 
 
 def normalize_scn_time(value) -> str:
@@ -686,6 +731,37 @@ def normalize_scn_time(value) -> str:
         return ""
     digits = digits[:4].rjust(4, "0") if len(digits) == 3 else digits[:4]
     return f"{digits[:2]}:{digits[2:4]}"
+
+
+def hhmm_minutes(value) -> int | None:
+    """'22:10'·'2210' → 자정부터의 분(1330). 읽을 수 없으면 None.
+
+    CGV는 심야 회차를 '2530'처럼 24시 이상으로 준다. 그 표기를 그대로 살려
+    분으로 펴 두면 '25:30 > 23:00' 비교가 자연스럽게 맞는다.
+    """
+    text = normalize_scn_time(value)
+    if not text:
+        return None
+    hh, mm = int(text[:2]), int(text[3:5])
+    if mm > 59 or hh > MAX_SHOWTIME_HOUR:
+        return None
+    return hh * 60 + mm
+
+
+def normalize_time_range(start, end) -> tuple[str, str]:
+    """상영 시간 범위를 ('HH:MM','HH:MM')으로. 한쪽이라도 비면 ('','').
+
+    범위는 **양 끝을 포함**한다. 끝이 시작보다 이르면 자정을 넘긴 것으로 보고
+    그대로 둔다 — 22:00~02:00은 seats 쪽에서 22:00~26:00으로 편다. 여기서 미리
+    26:00으로 바꾸지 않는 건 사용자가 화면에 적은 값 그대로 되돌려 보여주기
+    위해서다(<input type=time>은 26:00을 표시하지 못한다).
+    """
+    a, b = normalize_scn_time(start), normalize_scn_time(end)
+    if not a or not b:
+        return "", ""
+    if hhmm_minutes(a) is None or hhmm_minutes(b) is None:
+        raise ValueError("상영 시간 범위를 이해할 수 없습니다 (예: 18:00 ~ 23:30)")
+    return a, b
 
 
 def seat_watches(*, enabled_only: bool = False,
@@ -733,8 +809,17 @@ def normalize_ticket_spec(spec) -> dict:
 def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
                    scn_ymd: str, screen_types=None, rows=None,
                    min_consecutive: int = 0, auto_book: bool = False,
-                   party_size: int = 1, ticket_spec=None, scn_time="") -> dict:
-    """좌석 감시를 추가한다. 같은 조합이 있으면 옵션을 갱신해 돌려준다."""
+                   party_size: int = 1, ticket_spec=None, scn_time="",
+                   scn_time_from="", scn_time_to="") -> dict:
+    """좌석 감시를 추가한다. 같은 조합이 있으면 옵션을 갱신해 돌려준다.
+
+    회차 지정은 셋 중 하나다:
+      · scn_time                    — 그 회차 하나만 (상영표가 이미 열렸을 때)
+      · scn_time_from ~ scn_time_to — 그 시간대의 회차 (미상영 영화를 미리 걸 때)
+      · 둘 다 비움                  — 그 날짜의 모든 회차
+    scn_time이 있으면 그게 이긴다 — 회차를 콕 집어 놓고 범위를 함께 두는 건
+    말이 안 되므로, 화면에서도 셋 중 하나만 고르게 되어 있다.
+    """
     movie_query = (movie_query or "").strip()
     site_query = (site_query or "").strip()
     scn_ymd = (scn_ymd or "").strip()
@@ -743,6 +828,9 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
     types = normalize_screen_types(screen_types)
     row_filter = normalize_rows(rows)
     stime = normalize_scn_time(scn_time)
+    tfrom, tto = normalize_time_range(scn_time_from, scn_time_to)
+    if stime:
+        tfrom = tto = ""      # 회차를 콕 집었으면 범위는 의미가 없다
     try:
         need = max(0, int(min_consecutive or 0))
     except (TypeError, ValueError):
@@ -756,18 +844,19 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
         row = conn.execute(
             f"insert into seat_watches"
             f"   (owner_id, movie_query, site_query, scn_ymd, scn_time,"
-            f"    screen_types, rows,"
+            f"    scn_time_from, scn_time_to, screen_types, rows,"
             f"    min_consecutive, auto_book, party_size, ticket_spec)"
-            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
             f" on conflict (owner_id, movie_query, site_query, scn_ymd, scn_time,"
+            f"              scn_time_from, scn_time_to,"
             f"              screen_types, rows) do update set enabled = true,"
             f"              min_consecutive = excluded.min_consecutive,"
             f"              auto_book = excluded.auto_book,"
             f"              party_size = excluded.party_size,"
             f"              ticket_spec = excluded.ticket_spec"
             f" returning {SEAT_WATCH_COLUMNS}",
-            (owner_id, movie_query, site_query, scn_ymd, stime, types, row_filter,
-             need, bool(auto_book), party, Json(spec)),
+            (owner_id, movie_query, site_query, scn_ymd, stime, tfrom, tto,
+             types, row_filter, need, bool(auto_book), party, Json(spec)),
         ).fetchone()
     return dict(row)
 

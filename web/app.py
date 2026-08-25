@@ -188,6 +188,9 @@ def seat_watch_view(row: dict) -> dict:
         "site_query": row["site_query"],
         "scn_ymd": row["scn_ymd"],
         "scn_time": row["scn_time"] or "",
+        # 시간대로 건 감시(미상영 영화를 미리 걸어 둔 경우). 둘 다 ''면 안 쓴다.
+        "scn_time_from": row["scn_time_from"] or "",
+        "scn_time_to": row["scn_time_to"] or "",
         "screen_types": row["screen_types"] or [],
         "rows": row["rows"] or [],
         "min_consecutive": row["min_consecutive"] or 0,
@@ -696,7 +699,9 @@ def register_api(app: Flask) -> None:
                 min_consecutive=data.get("min_consecutive", 0),
                 auto_book=auto_book, party_size=data.get("party_size", 1),
                 ticket_spec=data.get("ticket_spec"),
-                scn_time=data.get("scn_time", ""))
+                scn_time=data.get("scn_time", ""),
+                scn_time_from=data.get("scn_time_from", ""),
+                scn_time_to=data.get("scn_time_to", ""))
         except ValueError as exc:
             return fail(str(exc))
         return jsonify(seat_watch_view(row)), 201

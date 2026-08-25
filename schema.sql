@@ -299,3 +299,30 @@ END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_idx
     ON seat_watches (owner_id, movie_query, site_query, scn_ymd, scn_time,
                      screen_types, rows);
+
+
+-- ── 좌석 감시에 상영 시간 '범위' 지정 ────────────────────────────────────────
+-- scn_time은 회차 하나를 콕 집는 값이라, **아직 상영표가 열리지 않은** 영화에는
+-- 쓸 수 없다 — 화면의 회차 드롭다운이 그 조합의 실제 회차로 채워지기 때문이다.
+-- 미상영 영화를 미리 걸어 두려면 "이 시간대 안이면 아무 회차나"라고 말할 수
+-- 있어야 한다. 그 시간대가 scn_time_from ~ scn_time_to (둘 다 'HH:MM')이다.
+--
+-- 범위 안에 회차가 여럿이면 **늦은 회차부터** 선점한다 (seats.select_showtimes).
+-- to < from이면 자정을 넘긴 것으로 본다: 22:00~02:00 = 22:00~26:00.
+-- CGV가 심야 회차를 '2530'처럼 24시 이상으로 주는 표기와 같은 뜻이다.
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    scn_time_from text NOT NULL DEFAULT '';
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    scn_time_to   text NOT NULL DEFAULT '';
+
+-- 같은 날짜에 시간대만 다른 감시를 따로 둘 수 있어야 한다 — 유일성에도 넣는다.
+--
+-- 이 파일은 서버가 뜰 때마다 통째로 실행된다(store.init_db). 그래서 예전 인덱스를
+-- DROP하고 다시 만드는 대신 **이름을 새로 쓴다** — IF NOT EXISTS가 두 번째
+-- 기동부터 통째로 건너뛰므로 매번 인덱스를 다시 세우지 않는다. 컬럼이 늘기만 한
+-- 인덱스라 기존 행이 새 조건을 어길 일은 없다.
+CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_range_idx
+    ON seat_watches (owner_id, movie_query, site_query, scn_ymd, scn_time,
+                     scn_time_from, scn_time_to, screen_types, rows);
+
+DROP INDEX IF EXISTS seat_watches_uniq_idx;

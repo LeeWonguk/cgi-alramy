@@ -341,6 +341,39 @@ class TestSeatWatchStore(DbCase):
         self.assertEqual(t2210["scn_time"], "22:10")
         self.assertEqual(allw["scn_time"], "")
 
+    def test_time_range_stored_and_distinct(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 scn_time_from="1800", scn_time_to="23:30")
+        self.assertEqual((w["scn_time_from"], w["scn_time_to"]),
+                         ("18:00", "23:30"))
+        self.assertEqual(w["scn_time"], "")
+
+        # 시간대가 다르면 별개의 감시다.
+        other = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                     scn_time_from="09:00", scn_time_to="12:00")
+        self.assertNotEqual(w["id"], other["id"])
+
+        # 같은 시간대를 다시 추가하면 같은 행이다.
+        again = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                     scn_time_from="18:00", scn_time_to="23:30")
+        self.assertEqual(w["id"], again["id"])
+
+    def test_exact_time_clears_the_range(self):
+        # 회차를 콕 집으면 시간대는 의미가 없다 — 둘이 함께 저장되면 안 된다.
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 scn_time="22:10",
+                                 scn_time_from="09:00", scn_time_to="12:00")
+        self.assertEqual(w["scn_time"], "22:10")
+        self.assertEqual((w["scn_time_from"], w["scn_time_to"]), ("", ""))
+
+    def test_half_open_range_is_dropped(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 scn_time_from="18:00")
+        self.assertEqual((w["scn_time_from"], w["scn_time_to"]), ("", ""))
+
     def test_min_consecutive_stored_and_updated(self):
         uid = self.make_user("owner")["id"]
         w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",

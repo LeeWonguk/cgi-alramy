@@ -1,0 +1,49 @@
+# 이미지에 들어가면 안 되는 것들.
+#
+# Dockerfile이 `COPY . .`을 하므로 여기서 걸러내지 않으면 전부 레이어에 굽힌다.
+# 특히 .env는 compose가 env_file로 주입하니 이미지에 있을 이유가 전혀 없다 —
+# 한 번 구워지면 이미지를 넘겨받은 사람이 웹훅 URL·OAuth 시크릿·CGV_CRED_KEY를
+# 그대로 꺼내 볼 수 있다.
+
+# 비밀
+.env
+*.pem
+*.key
+nginx/certs/
+
+# 런타임 상태 — 컨테이너가 자기 것을 새로 만든다
+logs/
+state.json
+state.json.tmp
+state.json.bak
+.watch.lock
+
+# 프론트엔드는 frontend 스테이지에서 빌드해 COPY --from으로 가져온다
+frontend/node_modules/
+frontend/dist/
+web/static/
+
+# 파이썬 부산물 (호스트가 macOS면 아키텍처도 다르다)
+__pycache__/
+*.pyc
+*.pyo
+
+# 개발 도구·메타데이터
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 컨테이너 안에서 쓰지 않는 것들 — launchd(macOS) 설치 스크립트와 문서
+install.sh
+uninstall.sh
+make_plists.py
+*.plist.generated
+tests/
+README.md
+Dockerfile
+docker-compose.yaml
+.dockerignore

@@ -296,6 +296,108 @@ def showtime_key(row: dict) -> str:
     return f"{row.get('scnsNo')}|{row.get('scnSseq')}"
 
 
+# ── 회차 고르기 ─────────────────────────────────────────────────────────────
+# 하루 상영표는 자정을 넘긴 회차를 24시 이상으로 적는다('2530' = 새벽 1:30).
+# 그 표기를 분으로 그대로 펴 두면 "23:00보다 늦은 회차"가 자연스럽게 맞는다.
+DAY_MINUTES = 24 * 60
+
+
+def showtime_minutes(row: dict) -> int | None:
+    """회차의 시작 시각을 자정부터의 분으로. 읽을 수 없으면 None."""
+    import store
+
+    return store.hhmm_minutes(row.get("scnsrtTm"))
+
+
+def time_range_minutes(start: str, end: str) -> tuple[int, int] | None:
+    """('22:00','02:00') → (1320, 1560). 범위가 아니면 None.
+
+    끝이 시작보다 이르면 자정을 넘긴 것으로 보고 24시간을 더한다 — CGV가 심야
+    회차를 26:00으로 적는 것과 같은 뜻이 되어, 그대로 비교하면 맞아떨어진다.
+    """
+    import store
+
+    a, b = store.hhmm_minutes(start), store.hhmm_minutes(end)
+    if a is None or b is None:
+        return None
+    return (a, b if b >= a else b + DAY_MINUTES)
+
+
+def select_showtimes(schedule: list[dict], *, scn_time: str = "",
+                     scn_time_from: str = "", scn_time_to: str = "") -> list[dict]:
+    """감시가 볼 회차만 골라 **늦은 시각부터** 돌려준다.
+
+    고르는 방법은 셋이다:
+      · scn_time      — 그 회차 하나 (상영표가 이미 열렸을 때 화면에서 고른 값)
+      · from~to       — 그 시간대의 모든 회차 (미상영 영화를 미리 걸어 둔 경우)
+      · 아무것도 없음 — 그 날짜의 모든 회차
+
+    순서가 곧 자동 선점의 우선순위다. 시간대로 걸었다면 그 안에서 **가장 늦은
+    회차**를 먼저 잡는다 — 시간대를 적는 사람은 "이 중 아무거나"가 아니라 보통
+    "되도록 늦게"를 뜻하기 때문이다. 시각을 못 읽는 회차는 맨 뒤로 보낸다.
+    """
+    want = "".join(ch for ch in (scn_time or "") if ch.isdigit())
+    if want:
+        return [r for r in schedule
+                if (r.get("scnsrtTm") or "").startswith(want)]
+
+    span = time_range_minutes(scn_time_from, scn_time_to)
+    if span is None:
+        return list(schedule)
+
+    low, high = span
+    picked: list[tuple[int, dict]] = []
+    for row in schedule:
+        at = showtime_minutes(row)
+        if at is None:
+            continue
+        # 22:00~26:00 범위는 새벽 회차를 '0130'으로 적은 극장도 잡아야 하므로
+        # 하루를 더해 한 번 더 본다. **범위에 걸린 그 값을 정렬 키로 쓴다** —
+        # 자정을 넘긴 01:30은 22:10보다 늦은 회차다. 적힌 숫자로 줄을 세우면
+        # 그게 뒤집혀서, 하필 '늦은 회차 우선'이 가장 이른 회차를 고른다.
+        for minutes in (at, at + DAY_MINUTES):
+            if low <= minutes <= high:
+                picked.append((minutes, row))
+                break
+    picked.sort(key=lambda pair: pair[0], reverse=True)
+    return [row for _, row in picked]
+
+
+class _AuthGuard:
+    """401을 만났을 때 세션을 되살린다 — 소유자당 사이클 1회까지.
+
+    좌석 조회는 회차마다 한 번씩 나가므로, 토큰이 죽었으면 401이 줄줄이 난다.
+    그때마다 캡차를 다시 푸는 재로그인을 돌리면 CGV 쪽에도 우리 쪽에도 부담이라
+    한 소유자에 대해 사이클당 한 번만 시도하고, 실패하면 이번 바퀴는 포기한다.
+    """
+
+    def __init__(self, owner_id: int) -> None:
+        self.owner_id = owner_id
+        self.tried = False
+        self.ok = False
+
+    def recover(self, session) -> bool:
+        import cgv_login
+
+        if self.tried:
+            return self.ok
+        self.tried = True
+        self.ok = cgv_login.recover_session(self.owner_id, session)
+        return self.ok
+
+
+def _seat_map(session, guard, **kwargs) -> dict:
+    """좌석 배치도를 읽는다. 401이면 세션을 되살리고 한 번만 다시 시도한다."""
+    import watch
+
+    try:
+        return session.seat_map(**kwargs)
+    except watch.AuthRequired:
+        if guard is None or not guard.recover(session):
+            raise
+        return session.seat_map(**kwargs)
+
+
 # ── 사이클: 좌석 감시 한 바퀴 ────────────────────────────────────────────────
 def check_seat_watches(session, *, dry_run: bool = False) -> dict:
     """모든 좌석 감시를 한 바퀴 확인한다. 세션은 로그인 가능한 상태여야 한다.
@@ -336,17 +438,50 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
         if owner:
             webhook, webhook_kind = owner.get("webhook_url"), owner.get("webhook_kind")
 
+        # 이 소유자의 감시들이 공유한다 — 401 복구는 사이클당 한 번이면 충분하다.
+        guard = _AuthGuard(owner_id)
         for w in group:
             summary["watches_checked"] += 1
             sent = _check_one_seat_watch(
-                session, catalog, w, webhook, webhook_kind, dry_run=dry_run)
+                session, catalog, w, webhook, webhook_kind, guard=guard,
+                dry_run=dry_run)
             summary["alerts_sent"] += sent
 
     return summary
 
 
+def _resolve_error(w: dict, movie: dict | None, problem: str) -> str:
+    """영화·극장을 못 찾았을 때 화면에 적을 말.
+
+    영화 목록에는 **예매가 열린 영화만** 들어 있다(watch.Catalog). 그래서 미상영
+    영화를 미리 걸어 두면 오픈 전까지는 반드시 "일치하는 항목이 없습니다"가 뜬다 —
+    그게 정상 대기 상태인데 '확인 실패'라고만 적으면 잘못 건 줄 알고 지우게 된다.
+    """
+    if movie is None and problem == "일치하는 항목이 없습니다":
+        return (f"'{w['movie_query']}': 아직 예매가 열리지 않았습니다"
+                f" (또는 영화 이름이 다릅니다) — 열리면 자동으로 확인합니다")
+    return f"영화·극장 확인 실패: {problem}"
+
+
+def _cycle_error(checked: int, failures: list[str]) -> str | None:
+    """이번 바퀴를 화면에 뭐라고 적을지. 정상이면 None.
+
+    회차를 하나도 못 봤으면 실패다 — 예전에는 실패한 회차도 직전 상태를 복사해
+    넣는 바람에 "전부 실패"가 "정상"으로 보였다. 일부만 실패한 경우도 조용히
+    넘기지 않는다: 감시하던 회차가 빠지면 알림이 안 오는 게 정상처럼 보인다.
+    """
+    if not failures:
+        return None if checked else "확인된 회차가 없습니다"
+    head = failures[0]
+    if not checked:
+        more = f" 외 {len(failures) - 1}건" if len(failures) > 1 else ""
+        return f"회차 {len(failures)}건을 모두 확인하지 못했습니다 — {head}{more}"
+    return f"{checked}개 회차 확인, {len(failures)}개 실패 — {head}"
+
+
 def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
-                          *, dry_run: bool) -> int:
+                          *, guard: "_AuthGuard | None" = None,
+                          dry_run: bool) -> int:
     """좌석 감시 하나를 확인하고 보낸 알림 수를 돌려준다."""
     import store
     import watch
@@ -357,7 +492,7 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         problem = movie_problem if movie is None else site_problem
         if not dry_run:
             store.save_seat_state(w["id"], store.prev_seat_state(w["id"]),
-                                  error=f"영화·극장 확인 실패: {problem}")
+                                  error=_resolve_error(w, movie, problem))
         return 0
 
     mov_no, site_no = movie["movNo"], site["siteNo"]
@@ -372,23 +507,30 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         return 0
 
     wanted_screens = store.normalize_screen_types(w["screen_types"])
-    # 특정 상영 시간(회차)만 볼 수 있다. 비어 있으면 그 날짜의 모든 회차.
-    want_time = "".join(ch for ch in (w.get("scn_time") or "") if ch.isdigit())
-    if want_time:
-        schedule = [r for r in schedule
-                    if (r.get("scnsrtTm") or "").startswith(want_time)]
+    # 볼 회차를 고른다. 시간대로 걸었다면 늦은 회차부터 나오고, 그 순서가 곧
+    # 자동 선점의 우선순위가 된다(첫 성공에서 멈추므로).
+    schedule = select_showtimes(
+        schedule, scn_time=w.get("scn_time") or "",
+        scn_time_from=w.get("scn_time_from") or "",
+        scn_time_to=w.get("scn_time_to") or "")
     rows = w["rows"]
     need = int(w.get("min_consecutive") or 0)   # 0·1 = 개별 좌석, 2+ = 연속 좌석
     prev = store.prev_seat_state(w["id"])
     fresh_state: dict[str, list[str]] = {}
     alerts: list[dict] = []
+    # 실제로 좌석을 본 회차와 실패한 회차를 따로 센다. fresh_state만으로는 구분이
+    # 안 된다 — 실패한 회차도 직전 상태를 복사해 넣기 때문에, 전부 실패해도
+    # fresh_state가 비어 있지 않아 "정상 확인"처럼 보인다.
+    checked = 0
+    failures: list[str] = []
 
     for row in schedule:
         if wanted_screens and not watch.matches_screen_types(row, wanted_screens):
             continue
         key = showtime_key(row)
         try:
-            seat_data = session.seat_map(
+            seat_data = _seat_map(
+                session, guard,
                 site_no=row.get("siteNo") or site_no,
                 scns_no=row["scnsNo"], ymd=w["scn_ymd"],
                 scn_sseq=row["scnSseq"])
@@ -396,19 +538,34 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
             # 이 회차만 실패 — 직전 상태를 유지해 다음에 다시 본다.
             if key in prev:
                 fresh_state[key] = prev[key]
+            failures.append(f"{row.get('scnsrtTm') or key}: {exc}")
             watch.log.warning("좌석 배치도 조회 실패 (%s %s): %s",
                               site_nm, key, exc)
             continue
+        checked += 1
 
         seats = parse_seats(seat_data)
         current = available_labels(seats, rows)
         fresh_state[key] = sort_labels(current)
         start_hhmm = row.get("scnsrtTm") or ""
 
-        if key not in prev:      # 첫 관측 — 기준선만 잡는다
+        first_sight = key not in prev
+        booking_on = bool(w.get("auto_book")) and not dry_run
+
+        # 첫 관측은 기준선만 잡고 넘어간다 — 처음 본 회차의 빈자리를 "새로
+        # 생겼다"고 알릴 수는 없다. **자동 예매는 예외다.** 미상영 영화를 미리
+        # 걸어 두는 게 시간대 감시의 목적인데, 회차가 처음 열리는 순간을 기준선으로
+        # 흘려보내면 다음 사이클까지 기다리게 된다 — 오픈 직후 좌석이 가장 빨리
+        # 빠지는 그 한 바퀴를 통째로 놓치는 셈이다.
+        if first_sight and not booking_on:
             continue
 
-        if need >= 2:
+        if first_sight:
+            # "새로 생긴 자리"라는 개념이 없다. 지금 비어 있는 자리를 그대로
+            # 후보로 넘기고, 실제로 몇 석을 잡을 수 있는지는 try_auto_book이 본다.
+            event = bool(current)
+            seat_alert = None
+        elif need >= 2:
             # 나란히 붙은 n석이 새로 생긴 회차만 본다.
             runs = new_consecutive_runs(seats, set(prev[key]), current, need, rows)
             event = bool(runs)
@@ -426,7 +583,7 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
             continue
 
         # 자동 예매가 켜져 있으면 선점을 시도하고, 그 결과를 알린다(좌석 알림 대체).
-        if w.get("auto_book") and not dry_run:
+        if booking_on:
             import booking
             outcome = booking.try_auto_book(
                 session, w, row, seats, mov_nm=mov_nm, site_nm=site_nm)
@@ -440,7 +597,8 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
             elif act == "failed":
                 alerts.append({"kind": "book_failed", "body":
                     f"⚠️ *자동 예매 실패*\n*{mov_nm}* · CGV {site_nm}\n"
-                    f"{watch.fmt_date(w['scn_ymd'])} {start_hhmm} · "
+                    f"{watch.fmt_date(w['scn_ymd'])} "
+                    f"{watch.fmt_time(start_hhmm)} · "
                     f"{', '.join(outcome.get('seats') or [])}\n"
                     f"사유: {outcome.get('error') or '알 수 없음'}\n"
                     f"직접 예매를 진행해 주세요."})
@@ -452,7 +610,7 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         elif seat_alert:
             alerts.append({"kind": "seat_open", "body": seat_alert})
 
-    error = None if fresh_state else "확인된 회차가 없습니다"
+    error = _cycle_error(checked, failures)
     if not dry_run:
         # 실패 회차만 있고 새 상태가 하나도 없으면 이전 상태를 지키지 않도록,
         # fresh_state가 비어 있어도 error만 남기고 상태는 유지한다.
