@@ -353,6 +353,128 @@ class TestSeatWatchStore(DbCase):
         self.assertTrue(store.delete_user(member))
         self.assertEqual(store.seat_watches(owner_id=member), [])
 
+    def test_auto_book_fields_and_update(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 auto_book=True, party_size=2,
+                                 ticket_spec={"adult": 2, "youth": 0})
+        self.assertTrue(w["auto_book"])
+        self.assertEqual(w["party_size"], 2)
+        self.assertEqual(w["ticket_spec"], {"adult": 2})   # 0은 제거됨
+
+        upd = store.set_seat_watch(w["id"], owner_id=uid, auto_book=False,
+                                   party_size=3)
+        self.assertFalse(upd["auto_book"])
+        self.assertEqual(upd["party_size"], 3)
+
+    def test_set_seat_watch_respects_owner(self):
+        owner = self.make_user("owner")["id"]
+        other = self.make_user("other")["id"]
+        w = store.add_seat_watch(owner, "오디세이", "용산", "20260825")
+        # 남의 감시는 못 바꾼다.
+        store.set_seat_watch(w["id"], owner_id=other, enabled=False)
+        self.assertTrue(store.seat_watch(w["id"])["enabled"])
+
+
+class TestAutoBookOrchestration(DbCase):
+    """booking.try_auto_book — 브라우저 없이 가짜 hold 함수로 오케스트레이션 검증."""
+
+    @staticmethod
+    def _seats(labels_avail):
+        """A열 좌석 8개. labels_avail에 든 번호만 available."""
+        out, x = [], 1
+        for i in range(1, 9):
+            out.append({"row": "A", "no": str(i), "label": f"A{i}",
+                        "available": i in labels_avail, "kind": "", "zone": "",
+                        "x_start": x, "x_end": x + 2, "left_pway": False,
+                        "right_pway": False, "seat_loc_no": f"LOC{i}",
+                        "sbord_no": "001", "seat_area_no": "001", "szone_no": "01001",
+                        "stknd_cd": "27", "szone_kind_cd": "01", "seat_salfrm_cd": "01"})
+            x += 2
+        return out
+
+    def _watch(self, uid, **kw):
+        return store.add_seat_watch(uid, "오디세이", "용산", "20260825", **kw)
+
+    def _row(self):
+        return {"scnsNo": "001", "scnSseq": "5", "scnsrtTm": "2210", "siteNm": "용산"}
+
+    def test_held_records_and_disables_watch(self):
+        import booking
+        from datetime import datetime, timedelta
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2)
+        exp = (datetime.now().astimezone() + timedelta(minutes=7))
+
+        def fake_hold(session, ctx):
+            self.assertEqual(ctx["seat_labels"], ["A4", "A5"])   # 가운데 2석
+            return {"ok": True, "mov_atkt_no": "P013X", "hold_expires_at": exp,
+                    "amount": 28000}
+
+        out = booking.try_auto_book(None, w, self._row(), self._seats(set(range(1, 9))),
+                                    mov_nm="오디세이", site_nm="용산", hold_fn=fake_hold)
+        self.assertEqual(out["action"], "held")
+        self.assertEqual(out["mov_atkt_no"], "P013X")
+        # 이력에 held로 남고, 감시는 비활성화된다.
+        att = store.booking_attempts(owner_id=uid)
+        self.assertEqual(att[0]["status"], "held")
+        self.assertEqual(att[0]["seat_labels"], ["A4", "A5"])
+        self.assertFalse(store.seat_watch(w["id"])["enabled"])
+        self.assertIsNotNone(store.active_hold(w["id"]))
+
+    def test_failed_records_failure_keeps_watch(self):
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2)
+
+        def fake_hold(session, ctx):
+            return {"ok": False, "error": "선점 응답 없음"}
+
+        out = booking.try_auto_book(None, w, self._row(), self._seats(set(range(1, 9))),
+                                    mov_nm="오디세이", site_nm="용산", hold_fn=fake_hold)
+        self.assertEqual(out["action"], "failed")
+        self.assertEqual(store.booking_attempts(owner_id=uid)[0]["status"], "failed")
+        self.assertTrue(store.seat_watch(w["id"])["enabled"])   # 유지
+        self.assertIsNone(store.active_hold(w["id"]))
+
+    def test_no_seats_when_block_too_small(self):
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=3)
+        # A1,A2만 available → 3연속 불가
+        out = booking.try_auto_book(None, w, self._row(), self._seats({1, 2}),
+                                    mov_nm="오디세이", site_nm="용산",
+                                    hold_fn=lambda s, c: {"ok": True})
+        self.assertEqual(out["action"], "no_seats")
+        self.assertEqual(store.booking_attempts(owner_id=uid), [])
+
+    def test_skip_when_already_held(self):
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=1)
+        called = {"n": 0}
+
+        def fake_hold(session, ctx):
+            called["n"] += 1
+            return {"ok": True, "mov_atkt_no": "X"}
+
+        booking.try_auto_book(None, w, self._row(), self._seats({1}),
+                              mov_nm="오디세이", site_nm="용산", hold_fn=fake_hold)
+        # 두 번째 시도는 이미 held라 건너뛴다.
+        out = booking.try_auto_book(None, w, self._row(), self._seats({1}),
+                                    mov_nm="오디세이", site_nm="용산", hold_fn=fake_hold)
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(called["n"], 1)
+
+    def test_off_when_auto_book_disabled(self):
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=False, party_size=1)
+        out = booking.try_auto_book(None, w, self._row(), self._seats({1}),
+                                    mov_nm="오디세이", site_nm="용산",
+                                    hold_fn=lambda s, c: {"ok": True})
+        self.assertEqual(out["action"], "skip")
+
 
 if __name__ == "__main__":
     unittest.main()

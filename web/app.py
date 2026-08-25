@@ -190,7 +190,27 @@ def seat_watch_view(row: dict) -> dict:
         "screen_types": row["screen_types"] or [],
         "rows": row["rows"] or [],
         "min_consecutive": row["min_consecutive"] or 0,
+        "auto_book": row["auto_book"],
+        "party_size": row["party_size"] or 1,
+        "ticket_spec": row["ticket_spec"] or {},
         "enabled": row["enabled"],
+        "created_at": row["created_at"],
+    }
+
+
+def booking_view(row: dict) -> dict:
+    """선점 시도 한 건을 화면용으로."""
+    return {
+        "id": row["id"],
+        "mov_nm": row["mov_nm"],
+        "site_nm": row["site_nm"],
+        "scn_ymd": row["scn_ymd"],
+        "start_hhmm": row["start_hhmm"],
+        "seat_labels": row["seat_labels"] or [],
+        "status": row["status"],
+        "amount": row["amount"],
+        "hold_expires_at": row["hold_expires_at"],
+        "last_error": row["last_error"],
         "created_at": row["created_at"],
     }
 
@@ -664,20 +684,50 @@ def register_api(app: Flask) -> None:
         scn_ymd = str(data.get("scn_ymd", "")).strip()
         if not (movie and site and scn_ymd):
             return fail("영화·극장·날짜를 모두 지정하세요")
+        auto_book = bool(data.get("auto_book"))
+        # 자동 예매는 CGV 로그인이 연동돼 있어야 의미가 있다.
+        if auto_book and store.cgv_account(me()["id"]) is None:
+            return fail("자동 예매를 켜려면 먼저 CGV 계정을 연동하세요")
         try:
             row = store.add_seat_watch(
                 me()["id"], movie, site, scn_ymd,
                 screen_types=data.get("screen_types"), rows=data.get("rows"),
-                min_consecutive=data.get("min_consecutive", 0))
+                min_consecutive=data.get("min_consecutive", 0),
+                auto_book=auto_book, party_size=data.get("party_size", 1),
+                ticket_spec=data.get("ticket_spec"))
         except ValueError as exc:
             return fail(str(exc))
         return jsonify(seat_watch_view(row)), 201
+
+    @app.patch("/api/seat-watches/<int:watch_id>")
+    def patch_seat_watch(watch_id: int):
+        if store.seat_watch(watch_id) is None or \
+                store.seat_watch(watch_id).get("owner_id") != me()["id"]:
+            return fail("없는 좌석 감시입니다", 404)
+        data = body()
+        if data.get("auto_book") and store.cgv_account(me()["id"]) is None:
+            return fail("자동 예매를 켜려면 먼저 CGV 계정을 연동하세요")
+        fields = {k: data[k] for k in
+                  ("enabled", "auto_book", "party_size", "min_consecutive",
+                   "ticket_spec") if k in data}
+        try:
+            row = store.set_seat_watch(watch_id, owner_id=me()["id"], **fields)
+        except (TypeError, ValueError) as exc:
+            return fail(f"설정 값을 이해할 수 없습니다: {exc}")
+        return jsonify(seat_watch_view(row))
 
     @app.delete("/api/seat-watches/<int:watch_id>")
     def remove_seat_watch(watch_id: int):
         if not store.delete_seat_watch(watch_id, owner_id=me()["id"]):
             return fail("없는 좌석 감시입니다", 404)
         return jsonify({"deleted": watch_id})
+
+    @app.get("/api/bookings")
+    def list_bookings():
+        """내 자동 예매(선점) 시도 이력."""
+        return jsonify([booking_view(r) for r in
+                        store.booking_attempts(owner_id=me()["id"],
+                                               limit=int_arg("limit", 20, 100))])
 
     @app.post("/api/check-now")
     def check_now():

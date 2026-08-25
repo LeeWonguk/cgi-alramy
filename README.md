@@ -226,6 +226,27 @@ DB에 넣지만, 그러면 키와 암호문이 같은 DB에 있게 됩니다).
 폴링은 메인 사이클 뒤에 좌석 감시를 이어서 돌립니다(대상이 있을 때만). CLI로는
 `python3 watch.py --check-seats`로 1회 확인합니다.
 
+### 자동 예매(좌석 선점) *(auto-book)*
+
+좌석 감시에 **자동 예매**를 켜면, 빈자리(또는 연속 블록)가 감지되는 즉시 시스템이
+인원수만큼 좌석을 골라 CGV에 **임시 선점(hold)** 까지 합니다. **결제 확정은 사람이**
+합니다 — 시스템은 돈이 움직이는 "결제하기" 확정을 하지 않고, 선점이 되면 알림으로
+"만료 전에 결제를 완료하세요"라고 안내합니다.
+
+- **좌석 선택**: 인원수만큼 나란히 붙은 **가장 좋은 연속 블록**을 고릅니다(뒤쪽 열
+  선호, 통로로 끊긴 자리는 연속으로 치지 않음 — `seats.pick_block`).
+- **선점 방식**: CGV 예매 화면을 그대로 몰아 `seatTempPrmp`까지 진행합니다. 사이트의
+  자체 로직이 요청을 만들므로 우리가 결제·금융 요청을 재구성하지 않습니다
+  (`booking.hold_block`). 선점 성공 시 예매번호·만료시각을 받아 기록합니다.
+- **안전장치**: 선점에 성공하면 그 감시는 자동으로 꺼져 **중복 선점**을 막습니다.
+  이미 유효한 선점이 있으면 다시 잡지 않습니다(`booking_attempts`). CGV 계정이
+  연동돼 있어야만 켤 수 있습니다.
+- **결제**: 카드번호 등 금융정보는 시스템이 입력하지 않으며, 최종 결제는 사용자가
+  CGV 앱/웹의 진행 중 예매 건에서 직접 완료합니다.
+
+'좌석 감시' 화면에서 감시별로 자동 예매·인원을 정하고, **자동 예매 이력**에서 선점
+결과(선점됨·실패·만료)를 봅니다.
+
 ## 영화·극장 목록
 
 감시 대상이 모두 코드 캐시에 걸리면 확인 사이클은 목록 API를 아예 부르지 않습니다.
@@ -295,8 +316,10 @@ DB에 넣지만, 그러면 키와 암호문이 같은 DB에 있게 됩니다).
 | GET | `/api/cgv-account` | 내 CGV 계정 연동 상태 (비밀번호·토큰은 안 나감) |
 | PUT | `/api/cgv-account` | `{cgv_user_id, password}` 저장 → 즉시 로그인 시도 |
 | DELETE | `/api/cgv-account` | 저장된 CGV 계정 삭제 |
-| GET/POST | `/api/seat-watches` | 내 좌석 감시 목록 / 추가(`{movie, site, scn_ymd, rows?, screen_types?}`) |
+| GET/POST | `/api/seat-watches` | 내 좌석 감시 목록 / 추가(`{movie, site, scn_ymd, rows?, screen_types?, min_consecutive?, auto_book?, party_size?}`) |
+| PATCH | `/api/seat-watches/<id>` | 감시 옵션 수정(`enabled`·`auto_book`·`party_size`·`min_consecutive`) |
 | DELETE | `/api/seat-watches/<id>` | 좌석 감시 삭제 |
+| GET | `/api/bookings` | 내 자동 예매(선점) 시도 이력 |
 | GET | `/api/alerts` | 내 알림 이력 (`?limit=`) |
 | GET | `/api/cycles`, `/api/logs` | **소유자 전용** — 사이클 이력, 로그 tail |
 | GET/PATCH | `/api/users`, `/api/users/<id>` | **소유자 전용** — 승인·차단·삭제 |

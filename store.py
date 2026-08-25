@@ -671,7 +671,7 @@ def clear_cgv_tokens(owner_id: int) -> None:
 # ── 좌석 감시 (Phase 1) ──────────────────────────────────────────────────────
 SEAT_WATCH_COLUMNS = """
     id, owner_id, movie_query, site_query, scn_ymd, screen_types, rows,
-    min_consecutive, enabled, created_at
+    min_consecutive, auto_book, party_size, ticket_spec, enabled, created_at
 """
 
 
@@ -694,10 +694,34 @@ def seat_watches(*, enabled_only: bool = False,
     return [dict(r) for r in rows]
 
 
+def normalize_ticket_spec(spec) -> dict:
+    """권종별 수량 dict로 정규화. {'adult':2,'youth':1} 형태, 음수·0은 제거."""
+    if not spec:
+        return {}
+    if isinstance(spec, str):
+        import json as _json
+        try:
+            spec = _json.loads(spec)
+        except Exception:  # noqa: BLE001
+            raise ValueError("권종 설정을 이해할 수 없습니다")
+    if not isinstance(spec, dict):
+        raise ValueError("권종 설정은 객체여야 합니다")
+    out = {}
+    for k, v in spec.items():
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"권종 수량이 숫자가 아닙니다: {k}={v!r}")
+        if n > 0:
+            out[str(k)] = n
+    return out
+
+
 def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
                    scn_ymd: str, screen_types=None, rows=None,
-                   min_consecutive: int = 0) -> dict:
-    """좌석 감시를 추가한다. 같은 조합이 있으면 연속 조건만 갱신해 돌려준다."""
+                   min_consecutive: int = 0, auto_book: bool = False,
+                   party_size: int = 1, ticket_spec=None) -> dict:
+    """좌석 감시를 추가한다. 같은 조합이 있으면 옵션을 갱신해 돌려준다."""
     movie_query = (movie_query or "").strip()
     site_query = (site_query or "").strip()
     scn_ymd = (scn_ymd or "").strip()
@@ -709,19 +733,68 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
         need = max(0, int(min_consecutive or 0))
     except (TypeError, ValueError):
         raise ValueError("연속 좌석 수는 숫자여야 합니다")
+    try:
+        party = max(1, int(party_size or 1))
+    except (TypeError, ValueError):
+        raise ValueError("인원수는 숫자여야 합니다")
+    spec = normalize_ticket_spec(ticket_spec)
     with pool().connection() as conn:
         row = conn.execute(
             f"insert into seat_watches"
             f"   (owner_id, movie_query, site_query, scn_ymd, screen_types, rows,"
-            f"    min_consecutive)"
-            f" values (%s, %s, %s, %s, %s, %s, %s)"
+            f"    min_consecutive, auto_book, party_size, ticket_spec)"
+            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
             f" on conflict (owner_id, movie_query, site_query, scn_ymd,"
             f"              screen_types, rows) do update set enabled = true,"
-            f"              min_consecutive = excluded.min_consecutive"
+            f"              min_consecutive = excluded.min_consecutive,"
+            f"              auto_book = excluded.auto_book,"
+            f"              party_size = excluded.party_size,"
+            f"              ticket_spec = excluded.ticket_spec"
             f" returning {SEAT_WATCH_COLUMNS}",
-            (owner_id, movie_query, site_query, scn_ymd, types, row_filter, need),
+            (owner_id, movie_query, site_query, scn_ymd, types, row_filter, need,
+             bool(auto_book), party, Json(spec)),
         ).fetchone()
     return dict(row)
+
+
+def set_seat_watch(seat_watch_id: int, owner_id: int | None = None,
+                   **fields) -> dict | None:
+    """좌석 감시의 옵션을 부분 갱신한다(enabled·auto_book·party_size·ticket_spec 등).
+
+    owner_id를 주면 그 사람 소유일 때만 갱신한다.
+    """
+    allowed = {
+        "enabled": lambda v: bool(v),
+        "auto_book": lambda v: bool(v),
+        "min_consecutive": lambda v: max(0, int(v or 0)),
+        "party_size": lambda v: max(1, int(v or 1)),
+        "ticket_spec": lambda v: Json(normalize_ticket_spec(v)),
+    }
+    sets, params = [], []
+    for key, coerce in allowed.items():
+        if key in fields and fields[key] is not None:
+            sets.append(f"{key} = %s")
+            params.append(coerce(fields[key]))
+    if not sets:
+        return seat_watch(seat_watch_id)
+    where = "id = %s"
+    params.append(seat_watch_id)
+    if owner_id is not None:
+        where += " and owner_id = %s"
+        params.append(owner_id)
+    with pool().connection() as conn:
+        conn.execute(f"update seat_watches set {', '.join(sets)} where {where}",
+                     params)
+    return seat_watch(seat_watch_id)
+
+
+def seat_watch(seat_watch_id: int) -> dict | None:
+    with pool().connection() as conn:
+        row = conn.execute(
+            f"select {SEAT_WATCH_COLUMNS} from seat_watches where id = %s",
+            (seat_watch_id,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def delete_seat_watch(seat_watch_id: int, owner_id: int | None = None) -> bool:
@@ -776,6 +849,73 @@ def normalize_rows(rows) -> list[str]:
             seen.add(key)
             out.append(key)
     return out
+
+
+# ── 자동 예매(선점) 시도 이력 (Phase 1 auto-book) ────────────────────────────
+BOOKING_COLUMNS = """
+    id, seat_watch_id, owner_id, showtime_key, mov_nm, site_nm, scn_ymd,
+    start_hhmm, seat_labels, seat_loc_nos, mov_atkt_no, amount, status,
+    hold_expires_at, last_error, created_at, updated_at
+"""
+
+
+def create_booking_attempt(*, seat_watch_id: int | None, owner_id: int | None,
+                           showtime_key: str, mov_nm: str, site_nm: str,
+                           scn_ymd: str, start_hhmm: str, seat_labels: list[str],
+                           seat_loc_nos: list[str]) -> int:
+    """선점 시도를 pending으로 남기고 id를 돌려준다. 결과는 finish로 확정한다."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            "insert into booking_attempts"
+            "  (seat_watch_id, owner_id, showtime_key, mov_nm, site_nm, scn_ymd,"
+            "   start_hhmm, seat_labels, seat_loc_nos, status)"
+            " values (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending') returning id",
+            (seat_watch_id, owner_id, showtime_key, mov_nm, site_nm, scn_ymd,
+             start_hhmm, list(seat_labels or []), list(seat_loc_nos or [])),
+        ).fetchone()
+    return row["id"]
+
+
+def finish_booking_attempt(attempt_id: int, status: str, *,
+                           mov_atkt_no: str | None = None,
+                           amount: int | None = None,
+                           hold_expires_at: datetime | None = None,
+                           error: str | None = None) -> None:
+    """선점 시도 결과를 확정한다. status: held|failed|expired|cancelled."""
+    if status not in ("held", "failed", "expired", "cancelled", "pending"):
+        raise ValueError(f"알 수 없는 상태: {status}")
+    with pool().connection() as conn:
+        conn.execute(
+            "update booking_attempts set status=%s, mov_atkt_no=%s, amount=%s,"
+            "  hold_expires_at=%s, last_error=%s, updated_at=%s where id=%s",
+            (status, mov_atkt_no, amount, hold_expires_at, error, _now(),
+             attempt_id),
+        )
+
+
+def booking_attempts(*, owner_id: int | None = None, limit: int = 20) -> list[dict]:
+    """선점 시도 이력. owner_id를 주면 그 사람 것만."""
+    where, params = "", []
+    if owner_id is not None:
+        where = "where owner_id = %s"
+        params.append(owner_id)
+    params.append(limit)
+    with pool().connection() as conn:
+        rows = conn.execute(
+            f"select {BOOKING_COLUMNS} from booking_attempts {where}"
+            f" order by created_at desc limit %s", params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def active_hold(seat_watch_id: int) -> dict | None:
+    """아직 유효한(held, 만료 전) 선점이 있으면 돌려준다 — 중복 선점을 막는 데 쓴다."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            f"select {BOOKING_COLUMNS} from booking_attempts"
+            " where seat_watch_id = %s and status = 'held'"
+            "   and (hold_expires_at is null or hold_expires_at > now())"
+            " order by created_at desc limit 1", (seat_watch_id,)).fetchone()
+    return dict(row) if row else None
 
 
 # ── 감시 대상 ───────────────────────────────────────────────────────────────

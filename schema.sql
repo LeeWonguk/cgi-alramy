@@ -238,3 +238,44 @@ CREATE TABLE IF NOT EXISTS seat_watch_state (
 -- 생기면 알린다. 0·1이면 개별 좌석 감시(기본).
 ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
     min_consecutive integer NOT NULL DEFAULT 0;
+
+-- ── 자동 예매(좌석 선점) (Phase 1 auto-book) ─────────────────────────────────
+-- 좌석 감시에 자동 선점 옵션을 붙인다. auto_book이 켜지면 빈자리(또는 연속 블록)가
+-- 감지될 때 인원수만큼 좌석을 골라 CGV에 임시 선점(seatTempPrmp)까지 하고, 결제
+-- 확정은 사람이 한다. party_size는 잡을 좌석 수, ticket_spec은 권종별 수량이다.
+--   ticket_spec 예: {"adult": 2}  (권종 코드 매핑은 booking.py)
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    auto_book   boolean NOT NULL DEFAULT false;
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    party_size  integer NOT NULL DEFAULT 1;
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    ticket_spec jsonb   NOT NULL DEFAULT '{}';
+
+-- 선점 시도 이력. 대상이 삭제돼도 이력은 남기므로 seat_watch_id는 SET NULL,
+-- 소유자도 SET NULL로 남긴다.
+--   status: pending(시도 중) | held(선점 성공) | failed(실패) | expired(만료)
+--           | cancelled(취소)
+--   mov_atkt_no          — 선점 성공 시 CGV가 준 예매번호
+--   hold_expires_at      — 선점 만료 시각(이때까지 결제해야 한다)
+CREATE TABLE IF NOT EXISTS booking_attempts (
+    id             bigserial PRIMARY KEY,
+    seat_watch_id  integer REFERENCES seat_watches(id) ON DELETE SET NULL,
+    owner_id       integer REFERENCES users(id) ON DELETE SET NULL,
+    showtime_key   text,
+    mov_nm         text,
+    site_nm        text,
+    scn_ymd        text,
+    start_hhmm     text,
+    seat_labels    text[] NOT NULL DEFAULT '{}',
+    seat_loc_nos   text[] NOT NULL DEFAULT '{}',
+    mov_atkt_no    text,
+    amount         integer,
+    status         text NOT NULL DEFAULT 'pending',
+    hold_expires_at timestamptz,
+    last_error     text,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS booking_attempts_owner_idx
+    ON booking_attempts (owner_id, created_at DESC);

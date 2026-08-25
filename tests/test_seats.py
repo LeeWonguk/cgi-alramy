@@ -31,10 +31,10 @@ class TestParseSeats(unittest.TestCase):
         parsed = seats.parse_seats(SEAT_DATA)
         self.assertEqual(len(parsed), 64)
         s = parsed[0]
-        self.assertEqual(
-            set(s),
+        self.assertLessEqual(
             {"row", "no", "label", "available", "kind", "zone",
-             "x_start", "x_end", "left_pway", "right_pway"})
+             "x_start", "x_end", "left_pway", "right_pway"},
+            set(s))
         self.assertEqual(s["label"], s["row"] + s["no"])
 
     def test_available_matches_saleyn(self):
@@ -153,6 +153,57 @@ class TestConsecutive(unittest.TestCase):
         # 실제 픽스처: A열 8석 전부 판매가능이지만 통로로 끊겨 최대 연속은 2다.
         parsed = seats_mod.parse_seats(SEAT_DATA)
         self.assertEqual(seats_mod.max_consecutive(parsed, rows=["A"]), 2)
+
+
+class TestParseSeatsBookingFields(unittest.TestCase):
+    def test_keeps_seat_loc_no(self):
+        parsed = seats.parse_seats(SEAT_DATA)
+        s = parsed[0]
+        for k in ("seat_loc_no", "sbord_no", "seat_area_no", "szone_no",
+                  "stknd_cd", "szone_kind_cd", "seat_salfrm_cd"):
+            self.assertIn(k, s)
+        self.assertTrue(s["seat_loc_no"], "seatLocNo가 보존되지 않았다")
+
+
+class TestPickBlock(unittest.TestCase):
+    def _row(self, avails, aisle_after=(), rowname="A"):
+        seats_, x = [], 1
+        for i, free in enumerate(avails, start=1):
+            right = i in aisle_after
+            seats_.append(_seat(rowname, i, x, x + 2, free,
+                                left=(i - 1) in aisle_after, right=right))
+            x = x + 2 + (2 if right else 0)
+        return seats_
+
+    def test_picks_party_sized_block(self):
+        s = self._row([True, True, True, True, True])  # A1..A5 연속
+        got = seats_mod.pick_block(s, 3)
+        self.assertEqual([x["label"] for x in got], ["A2", "A3", "A4"])  # 가운데 3석
+
+    def test_returns_dicts_with_loc_no(self):
+        s = [_seat("A", 1, 1, 3, True), _seat("A", 2, 3, 5, True)]
+        s[0]["seat_loc_no"] = "LOC1"; s[1]["seat_loc_no"] = "LOC2"
+        got = seats_mod.pick_block(s, 2)
+        self.assertEqual([x["seat_loc_no"] for x in got], ["LOC1", "LOC2"])
+
+    def test_none_when_not_enough_consecutive(self):
+        # 통로로 2+2 → 3연속 불가
+        s = self._row([True, True, True, True], aisle_after={2})
+        self.assertEqual(seats_mod.pick_block(s, 3), [])
+
+    def test_prefers_rear_row(self):
+        front = self._row([True, True], rowname="A")
+        rear = self._row([True, True], rowname="C")
+        got = seats_mod.pick_block(front + rear, 2)
+        self.assertTrue(all(x["row"] == "C" for x in got), "뒤쪽 열을 우선해야 한다")
+
+    def test_fixture_pair_in_row_a(self):
+        parsed = seats.parse_seats(SEAT_DATA)
+        got = seats_mod.pick_block(parsed, 2, rows=["A"])
+        self.assertEqual(len(got), 2)
+        self.assertTrue(all(x["row"] == "A" for x in got))
+        # 인접한 두 좌석이어야 한다
+        self.assertTrue(seats_mod._adjacent(got[0], got[1]))
 
 
 class TestAlertMessage(unittest.TestCase):

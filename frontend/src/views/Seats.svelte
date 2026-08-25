@@ -22,14 +22,26 @@
   let ymd = $state('') // YYYY-MM-DD (입력) → 저장 시 YYYYMMDD로 보냄
   let rowsText = $state('')
   let minConsecutive = $state(0) // 0·1 = 개별 좌석, 2+ = 나란히 붙은 N석
+  let autoBook = $state(false) // 좌석 확보 시 자동 선점
+  let partySize = $state(1) // 잡을 좌석 수(인원)
   let types = $state(new Set())
   let savingWatch = $state(false)
   let watchMsg = $state(null)
   let watchErr = $state(null)
 
+  let bookings = $state([])
+
   onMount(async () => {
-    await Promise.all([loadAccount(), loadWatches(), loadCatalog()])
+    await Promise.all([loadAccount(), loadWatches(), loadCatalog(), loadBookings()])
   })
+
+  async function loadBookings() {
+    try {
+      bookings = await get('/api/bookings')
+    } catch (exc) {
+      /* 이력 조회 실패는 조용히 */
+    }
+  }
 
   async function loadAccount() {
     try {
@@ -114,8 +126,11 @@
         screen_types: [...types],
         rows: rowsText.split(/[,\s]+/).map((r) => r.trim()).filter(Boolean),
         min_consecutive: Number(minConsecutive) || 0,
+        auto_book: autoBook,
+        party_size: Number(partySize) || 1,
+        ticket_spec: autoBook ? { adult: Number(partySize) || 1 } : {},
       })
-      watchMsg = '좌석 감시를 추가했습니다'
+      watchMsg = autoBook ? '좌석 감시를 추가했습니다 (자동 예매 켜짐)' : '좌석 감시를 추가했습니다'
       rowsText = ''
       await loadWatches()
     } catch (exc) {
@@ -275,6 +290,36 @@
       </div>
       <div class="small muted">비우면 그 날짜의 모든 회차를 봅니다.</div>
     </div>
+
+    <div class="field">
+      <label for="s-auto">자동 예매</label>
+      <label class="check small">
+        <input
+          id="s-auto"
+          type="checkbox"
+          bind:checked={autoBook}
+          disabled={!account.linked} />
+        좌석이 확보되면 <strong>자동으로 선점</strong>합니다
+      </label>
+      {#if autoBook}
+        <div class="row" style="align-items: center; gap: 6px">
+          <span class="small muted">인원</span>
+          <select bind:value={partySize}>
+            {#each [1, 2, 3, 4, 5] as n (n)}
+              <option value={n}>성인 {n}명</option>
+            {/each}
+          </select>
+        </div>
+      {/if}
+      <div class="small muted">
+        {#if !account.linked}
+          먼저 위에서 CGV 계정을 연동하세요.
+        {:else}
+          ⚠️ 실제로 좌석을 잡습니다. <strong>결제 확정은 직접</strong> 하셔야 하며,
+          선점 후 알림의 안내대로 만료 전에 결제를 완료하세요.
+        {/if}
+      </div>
+    </div>
   </div>
 
   <div class="row">
@@ -300,18 +345,26 @@
           <th>상영관</th>
           <th>열</th>
           <th>연속</th>
+          <th>자동예매</th>
           <th></th>
         </tr>
       </thead>
       <tbody>
         {#each watches as w (w.id)}
-          <tr>
+          <tr class:off={!w.enabled}>
             <td>{w.movie_query}</td>
             <td>{w.site_query}</td>
             <td>{fmtYmd(w.scn_ymd)}</td>
             <td>{w.screen_types.length ? w.screen_types.join(', ') : '전체'}</td>
             <td>{w.rows.length ? w.rows.join(', ') : '전 열'}</td>
             <td>{w.min_consecutive >= 2 ? `${w.min_consecutive}석` : '개별'}</td>
+            <td>
+              {#if w.auto_book}
+                <span class="badge accent">성인 {w.party_size}</span>
+              {:else}
+                <span class="small muted">끔</span>
+              {/if}
+            </td>
             <td class="row" style="justify-content: flex-end">
               <button class="ghost small danger" onclick={() => removeWatch(w)}>삭제</button>
             </td>
@@ -321,6 +374,44 @@
     </table>
   {/if}
 </div>
+
+{#if bookings.length}
+  <div class="panel">
+    <h2 style="margin-bottom: 8px">자동 예매 이력</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>영화</th>
+          <th>극장</th>
+          <th>일시</th>
+          <th>좌석</th>
+          <th>상태</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each bookings as b (b.id)}
+          <tr>
+            <td>{b.mov_nm}</td>
+            <td>{b.site_nm}</td>
+            <td>{fmtYmd(b.scn_ymd)} {b.start_hhmm}</td>
+            <td>{b.seat_labels.join(', ')}</td>
+            <td>
+              {#if b.status === 'held'}
+                <span class="badge ok">선점됨 — 결제 필요</span>
+              {:else if b.status === 'failed'}
+                <span class="badge warn" title={b.last_error}>실패</span>
+              {:else if b.status === 'expired'}
+                <span class="badge">만료</span>
+              {:else}
+                <span class="badge">{b.status}</span>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
+{/if}
 
 <style>
   .form {

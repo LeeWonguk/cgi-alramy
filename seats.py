@@ -43,6 +43,14 @@ def parse_seats(seat_data: dict) -> list[dict]:
             "x_end": _to_int(s.get("xcoordEndVal")),
             "left_pway": s.get("leftPwayYn") == "Y",
             "right_pway": s.get("rghtPwayYn") == "Y",
+            # 예매(선점)에 필요한 좌석 식별자 — seatTempPrmp 바디가 이 값들을 쓴다.
+            "seat_loc_no": s.get("seatLocNo") or "",
+            "sbord_no": s.get("sbordNo") or "",
+            "seat_area_no": s.get("seatAreaNo") or "",
+            "szone_no": s.get("szoneNo") or "",
+            "stknd_cd": s.get("stkndCd") or "",
+            "szone_kind_cd": s.get("szoneKindCd") or "",
+            "seat_salfrm_cd": s.get("seatSalfrmCd") or "",
         })
     return out
 
@@ -158,6 +166,40 @@ def consecutive_starts(seats: list[dict], available: set[str], n: int,
         for i in range(len(run) - n + 1):
             starts.add(run[i])
     return starts
+
+
+def pick_block(seats: list[dict], party: int, rows=None) -> list[dict]:
+    """인원수(party)만큼 나란히 붙은 '가장 좋은' 좌석 블록을 고른다.
+
+    자동 예매가 이 함수로 잡을 좌석을 정한다. 규칙:
+      1. 지금 비어 있고 서로 인접한 구간(consecutive_runs) 중 길이 ≥ party인 것만 후보.
+      2. 후보 중 **뒤쪽 열**을 선호한다(열 이름이 뒤일수록 스크린에서 멀다 — 통상 선호).
+      3. 같은 열이면 구간이 짧을수록(딱 맞을수록) 선호해 큰 연속 블록을 쪼개지 않는다.
+      4. 고른 구간 안에서 **가운데**로 party석을 잘라낸다.
+    좌석이 부족하면 빈 리스트. party ≤ 1이면 가장 좋은 한 자리를 고른다.
+
+    반환은 seats의 원소(dict) 리스트라 seat_loc_no 등 예매 식별자를 그대로 쓴다.
+    """
+    party = max(1, int(party or 1))
+    by_label = {s["label"]: s for s in seats}
+    runs = [r for r in consecutive_runs(seats, rows=rows) if len(r) >= party]
+    if not runs:
+        return []
+
+    def row_rank(label: str) -> str:
+        # 라벨 앞의 열 문자. 뒤쪽 열(사전순 뒤)일수록 선호하므로 그대로 비교값.
+        i = 0
+        while i < len(label) and not label[i].isdigit():
+            i += 1
+        return label[:i]
+
+    # 뒤쪽 열 우선(내림차순), 그다음 party에 가까운(=덜 낭비하는) 구간 우선.
+    best = sorted(runs, key=lambda r: (row_rank(sort_labels(r)[0]), -len(r)),
+                  reverse=True)[0]
+    ordered = sort_labels(best)
+    start = (len(ordered) - party) // 2          # 구간 가운데에서 party석
+    chosen = ordered[start:start + party]
+    return [by_label[l] for l in chosen]
 
 
 def summarize(seats: list[dict], rows=None) -> dict:
@@ -362,18 +404,48 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
             continue
 
         if need >= 2:
-            # 나란히 붙은 n석이 새로 생긴 회차만 알린다.
+            # 나란히 붙은 n석이 새로 생긴 회차만 본다.
             runs = new_consecutive_runs(seats, set(prev[key]), current, need, rows)
-            if runs:
-                alerts.append({"body": build_consecutive_alert(
-                    mov_nm, site_nm, w["scn_ymd"], start_hhmm,
-                    watch.screen_label(row), runs, need, rows)})
+            event = bool(runs)
+            seat_alert = (build_consecutive_alert(
+                mov_nm, site_nm, w["scn_ymd"], start_hhmm,
+                watch.screen_label(row), runs, need, rows) if runs else None)
         else:
             newly = diff_available(set(prev[key]), current)
-            if newly:
-                alerts.append({"body": build_seat_alert(
-                    mov_nm, site_nm, w["scn_ymd"], start_hhmm,
-                    watch.screen_label(row), newly, len(current), rows)})
+            event = bool(newly)
+            seat_alert = (build_seat_alert(
+                mov_nm, site_nm, w["scn_ymd"], start_hhmm,
+                watch.screen_label(row), newly, len(current), rows) if newly else None)
+
+        if not event:
+            continue
+
+        # 자동 예매가 켜져 있으면 선점을 시도하고, 그 결과를 알린다(좌석 알림 대체).
+        if w.get("auto_book") and not dry_run:
+            import booking
+            outcome = booking.try_auto_book(
+                session, w, row, seats, mov_nm=mov_nm, site_nm=site_nm)
+            act = outcome.get("action")
+            if act == "held":
+                alerts.append({"kind": "book_held", "body": booking.build_hold_alert(
+                    mov_nm, site_nm, w["scn_ymd"], start_hhmm, outcome["seats"],
+                    outcome.get("hold_expires_at"), outcome.get("amount"))})
+                # 선점 성공 시 이 감시는 비활성화됐다 — 남은 회차는 보지 않는다.
+                break
+            elif act == "failed":
+                alerts.append({"kind": "book_failed", "body":
+                    f"⚠️ *자동 예매 실패*\n*{mov_nm}* · CGV {site_nm}\n"
+                    f"{watch.fmt_date(w['scn_ymd'])} {start_hhmm} · "
+                    f"{', '.join(outcome.get('seats') or [])}\n"
+                    f"사유: {outcome.get('error') or '알 수 없음'}\n"
+                    f"직접 예매를 진행해 주세요."})
+            elif act == "skip":
+                pass  # 이미 선점됨/자동예매 꺼짐 — 조용히
+            else:  # no_seats 등 — 자리 알림으로 대체
+                if seat_alert:
+                    alerts.append({"kind": "seat_open", "body": seat_alert})
+        elif seat_alert:
+            alerts.append({"kind": "seat_open", "body": seat_alert})
 
     error = None if fresh_state else "확인된 회차가 없습니다"
     if not dry_run:
@@ -383,9 +455,10 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
 
     sent = 0
     for alert in alerts:
-        if watch.deliver_alert("seat_open", alert["body"], dry_run=dry_run,
-                               owner_id=w["owner_id"], webhook_url=webhook,
-                               webhook_kind=webhook_kind, mov_nm=mov_nm,
-                               site_nm=site_nm, dates=[w["scn_ymd"]]):
+        if watch.deliver_alert(alert.get("kind", "seat_open"), alert["body"],
+                               dry_run=dry_run, owner_id=w["owner_id"],
+                               webhook_url=webhook, webhook_kind=webhook_kind,
+                               mov_nm=mov_nm, site_nm=site_nm,
+                               dates=[w["scn_ymd"]]):
             sent += 1
     return sent
