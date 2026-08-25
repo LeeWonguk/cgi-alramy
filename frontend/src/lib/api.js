@@ -33,6 +33,7 @@ function send(method, path, body) {
 
 export const get = (path) => fetch(path).then(unwrap)
 export const post = (path, body) => send('POST', path, body ?? {})
+export const put = (path, body) => send('PUT', path, body ?? {})
 export const patch = (path, body) => send('PATCH', path, body)
 export const del = (path) => send('DELETE', path)
 

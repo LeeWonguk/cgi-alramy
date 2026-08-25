@@ -5,6 +5,7 @@
   import Login from './views/Login.svelte'
   import Dashboard from './views/Dashboard.svelte'
   import Targets from './views/Targets.svelte'
+  import Seats from './views/Seats.svelte'
   import Lookup from './views/Lookup.svelte'
   import History from './views/History.svelte'
   import Settings from './views/Settings.svelte'
@@ -29,6 +30,7 @@
   const tabs = $derived([
     { id: 'dashboard', label: '대시보드' },
     { id: 'targets', label: '감시 대상' },
+    { id: 'seats', label: '좌석 감시' },
     { id: 'lookup', label: '상영표 조회' },
     { id: 'history', label: '이력' },
     ...(isOwner ? [{ id: 'users', label: '사용자' }] : []),
@@ -194,6 +196,8 @@
         targets={data?.targets ?? []}
         settings={user.settings}
         onchange={refresh} />
+    {:else if tab === 'seats'}
+      <Seats onchange={refresh} />
     {:else if tab === 'lookup'}
       <Lookup />
     {:else if tab === 'history'}

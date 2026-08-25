@@ -287,6 +287,11 @@ DB에 넣지만, 그러면 키와 암호문이 같은 DB에 있게 됩니다).
 | POST | `/api/lookup` | `{mov_no, site_no}` → 예매 가능 날짜 |
 | POST | `/api/lookup/showtimes` | `{mov_no, site_no, date, screen_types?}` → 시간표 |
 | GET | `/api/showtimes?target_id=&date=` | 캐시된 시간표 (내 대상만) |
+| GET | `/api/cgv-account` | 내 CGV 계정 연동 상태 (비밀번호·토큰은 안 나감) |
+| PUT | `/api/cgv-account` | `{cgv_user_id, password}` 저장 → 즉시 로그인 시도 |
+| DELETE | `/api/cgv-account` | 저장된 CGV 계정 삭제 |
+| GET/POST | `/api/seat-watches` | 내 좌석 감시 목록 / 추가(`{movie, site, scn_ymd, rows?, screen_types?}`) |
+| DELETE | `/api/seat-watches/<id>` | 좌석 감시 삭제 |
 | GET | `/api/alerts` | 내 알림 이력 (`?limit=`) |
 | GET | `/api/cycles`, `/api/logs` | **소유자 전용** — 사이클 이력, 로그 tail |
 | GET/PATCH | `/api/users`, `/api/users/<id>` | **소유자 전용** — 승인·차단·삭제 |

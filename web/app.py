@@ -44,6 +44,8 @@ DEFAULT_HOST = "127.0.0.1"  # TLS 종료는 앞단 프록시(터널·nginx)에 �
 DEFAULT_PORT = 8787  # 5000은 macOS AirPlay Receiver와 충돌한다
 
 LOOKUP_TIMEOUT = 90.0  # 즉석 조회는 앞선 확인 사이클을 기다릴 수 있다
+# CGV 로그인은 페이지 로딩·캡차 렌더·리다이렉트까지 기다려야 해 더 넉넉히 준다.
+LOGIN_TIMEOUT = 120.0
 
 log = logging.getLogger("cgv-watch.web")
 
@@ -163,6 +165,33 @@ def user_view(row: dict, *, full: bool = False) -> dict:
         view["has_webhook"] = bool(row["webhook_url"])
         view["webhook_kind"] = row["webhook_kind"] or "slack"
     return view
+
+
+def cgv_account_view(row: dict | None) -> dict:
+    """저장된 CGV 계정 상태를 화면용으로. 비밀번호·세션 토큰은 절대 싣지 않는다."""
+    if row is None:
+        return {"linked": False, "status": "none"}
+    return {
+        "linked": True,
+        "cgv_user_id": row["cgv_user_id"],
+        "status": row["status"],            # unlinked | linked | error
+        "last_login_at": row["last_login_at"],
+        "last_error": row["last_error"],
+    }
+
+
+def seat_watch_view(row: dict) -> dict:
+    """좌석 감시 한 건을 화면용으로."""
+    return {
+        "id": row["id"],
+        "movie_query": row["movie_query"],
+        "site_query": row["site_query"],
+        "scn_ymd": row["scn_ymd"],
+        "screen_types": row["screen_types"] or [],
+        "rows": row["rows"] or [],
+        "enabled": row["enabled"],
+        "created_at": row["created_at"],
+    }
 
 
 def target_view(row: dict, showtimes: dict[str, dict] | None = None) -> dict:
@@ -582,6 +611,72 @@ def register_api(app: Flask) -> None:
         return jsonify({"deleted": user_id})
 
     # ── 동작 ──
+    # ── CGV 계정 로그인 (Phase 1) ──
+    @app.get("/api/cgv-account")
+    def get_cgv_account():
+        """내 CGV 계정 연동 상태. 비밀번호·토큰은 나오지 않는다."""
+        return jsonify(cgv_account_view(store.cgv_account(me()["id"])))
+
+    @app.put("/api/cgv-account")
+    def put_cgv_account():
+        """CGV 아이디·비밀번호를 저장한다. 저장 즉시 로그인을 시도해 유효성을 확인."""
+        data = body()
+        cgv_id = str(data.get("cgv_user_id", "")).strip()
+        password = str(data.get("password", ""))
+        if not cgv_id or not password:
+            return fail("아이디와 비밀번호를 모두 입력하세요")
+        try:
+            store.set_cgv_account(me()["id"], cgv_id, password)
+        except ValueError as exc:
+            return fail(str(exc))
+
+        # 저장된 자격증명으로 바로 로그인해 본다(캡차 포함). 실패해도 자격증명은
+        # 저장돼 있으니, 나중에 CGV 상태가 나아지면 다음 좌석 사이클이 재시도한다.
+        owner_id = me()["id"]
+        try:
+            ok = parts(app)["worker"].run(
+                lambda s: __import__("cgv_login").login_now(owner_id, s),
+                label="cgv-login", timeout=LOGIN_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - 브라우저 기동 실패 등
+            log.warning("CGV 로그인 확인 실패: %s", exc)
+            ok = False
+        return jsonify({"account": cgv_account_view(store.cgv_account(owner_id)),
+                        "logged_in": bool(ok)})
+
+    @app.delete("/api/cgv-account")
+    def delete_cgv_account():
+        """저장된 CGV 계정을 지운다 (좌석 감시는 로그인이 없으면 확인되지 않는다)."""
+        store.delete_cgv_account(me()["id"])
+        return jsonify({"deleted": True})
+
+    # ── 좌석 감시 (Phase 1) ──
+    @app.get("/api/seat-watches")
+    def list_seat_watches():
+        return jsonify([seat_watch_view(row)
+                        for row in store.seat_watches(owner_id=me()["id"])])
+
+    @app.post("/api/seat-watches")
+    def create_seat_watch():
+        data = body()
+        movie = str(data.get("movie", "")).strip()
+        site = str(data.get("site", "")).strip()
+        scn_ymd = str(data.get("scn_ymd", "")).strip()
+        if not (movie and site and scn_ymd):
+            return fail("영화·극장·날짜를 모두 지정하세요")
+        try:
+            row = store.add_seat_watch(
+                me()["id"], movie, site, scn_ymd,
+                screen_types=data.get("screen_types"), rows=data.get("rows"))
+        except ValueError as exc:
+            return fail(str(exc))
+        return jsonify(seat_watch_view(row)), 201
+
+    @app.delete("/api/seat-watches/<int:watch_id>")
+    def remove_seat_watch(watch_id: int):
+        if not store.delete_seat_watch(watch_id, owner_id=me()["id"]):
+            return fail("없는 좌석 감시입니다", 404)
+        return jsonify({"deleted": watch_id})
+
     @app.post("/api/check-now")
     def check_now():
         # 사이클은 **모든 사용자의 대상**을 한 바퀴 확인한다 — 한 사람의 버튼이
