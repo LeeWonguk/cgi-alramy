@@ -323,6 +323,15 @@ def time_range_minutes(start: str, end: str) -> tuple[int, int] | None:
     return (a, b if b >= a else b + DAY_MINUTES)
 
 
+def _late_first(rows: list[dict]) -> list[dict]:
+    """늦은 회차부터. 시각을 못 읽는 회차는 순서를 지킨 채 맨 뒤로 보낸다."""
+    keyed = [(showtime_minutes(r), i, r) for i, r in enumerate(rows)]
+    unreadable = [r for at, _, r in keyed if at is None]
+    readable = sorted((k for k in keyed if k[0] is not None),
+                      key=lambda k: (k[0], -k[1]), reverse=True)
+    return [r for _, _, r in readable] + unreadable
+
+
 def select_showtimes(schedule: list[dict], *, scn_time: str = "",
                      scn_time_from: str = "", scn_time_to: str = "") -> list[dict]:
     """감시가 볼 회차만 골라 **늦은 시각부터** 돌려준다.
@@ -338,8 +347,10 @@ def select_showtimes(schedule: list[dict], *, scn_time: str = "",
     """
     want = "".join(ch for ch in (scn_time or "") if ch.isdigit())
     if want:
-        return [r for r in schedule
-                if (r.get("scnsrtTm") or "").startswith(want)]
+        # 시각을 콕 집어도 같은 시각이 여러 상영관에 있을 수 있다. 순서가 곧
+        # 선점 우선순위이므로 범위 지정과 같은 규칙(늦은 회차 우선)을 쓴다.
+        return _late_first([r for r in schedule
+                            if (r.get("scnsrtTm") or "").startswith(want)])
 
     span = time_range_minutes(scn_time_from, scn_time_to)
     if span is None:

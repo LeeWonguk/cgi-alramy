@@ -30,5 +30,23 @@ def load_env(force: bool = False) -> None:
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        # `export FOO=bar`도 받는다 — .env를 `source` 해서 쓰던 사람이 그대로
+        # 옮겨 오면 키 이름이 'export FOO'가 되어 조용히 무시된다.
+        if line.startswith("export ") or line.startswith("export\t"):
+            line = line[7:].lstrip()
+            if "=" not in line:
+                continue
         key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        os.environ.setdefault(key.strip(), _unquote(value.strip()))
+
+
+def _unquote(value: str) -> str:
+    """양끝을 감싼 따옴표만 벗긴다.
+
+    `.strip("'\\"")`은 짝이 맞는지 보지 않아서, 비밀번호가 따옴표로 끝나면
+    그 글자를 먹어 버린다. 값 안의 `#`은 건드리지 않는다 — 웹훅 URL이나
+    비밀번호에 그대로 들어 있을 수 있어, 주석으로 보고 자르면 값이 망가진다.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value

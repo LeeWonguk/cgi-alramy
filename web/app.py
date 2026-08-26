@@ -729,8 +729,10 @@ def register_api(app: Flask) -> None:
 
     @app.patch("/api/seat-watches/<int:watch_id>")
     def patch_seat_watch(watch_id: int):
-        if store.seat_watch(watch_id) is None or \
-                store.seat_watch(watch_id).get("owner_id") != me()["id"]:
+        # 한 번만 읽는다. 두 번 읽으면 그 사이에 지워졌을 때 두 번째가 None이라
+        # .get()에서 터진다 — 없는 감시는 404여야 한다.
+        existing = store.seat_watch(watch_id)
+        if existing is None or existing.get("owner_id") != me()["id"]:
             return fail("없는 좌석 감시입니다", 404)
         data = body()
         if data.get("auto_book") and store.cgv_account(me()["id"]) is None:

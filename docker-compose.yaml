@@ -22,7 +22,10 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      # 포트를 밖으로 열지 않으므로 compose 네트워크 안에서만 닿지만, 기본값을
+      # 코드에 박아 두면 바꿀 자리가 없다. .env에 POSTGRES_PASSWORD를 두면
+      # 그 값이 쓰인다 (app의 DATABASE_URL도 같은 값을 참조한다).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: cgv
     volumes:
       - db-data:/var/lib/postgresql/data
@@ -49,13 +52,22 @@ services:
       - .env
     environment:
       # compose 네트워크 안에서는 DB 호스트가 'db'다. .env의 값을 덮는다.
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/cgv
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/cgv
     volumes:
       # 로그는 호스트에서 tail 하고 싶으니 바인드 마운트.
       - ./logs:/app/logs
     # 8787은 밖으로 노출하지 않는다 — nginx만 프록시로 접근한다.
     expose:
       - "8787"
+    healthcheck:
+      # /api/health는 로그인 없이 열려 있고 익명에게는 {"ok": ...}만 낸다.
+      # DB가 죽으면 503이라 curl -f가 실패로 잡는다.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/api/health > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # 첫 기동은 Chromium을 띄우고 사이클을 한 바퀴 돈다 — 넉넉히 기다린다.
+      start_period: 90s
     restart: unless-stopped
 
   nginx:
