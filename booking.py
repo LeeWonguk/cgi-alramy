@@ -246,6 +246,46 @@ def _wait_for_any(page, selectors, timeout: int = 9000) -> None:
             continue
 
 
+def _click_visible(page, text: str, *, exact: bool, what: str,
+                   timeout: int = 8000) -> None:
+    """그 문구를 담은 **보이는** 요소를 누른다.
+
+    `get_by_text(...).first`를 그냥 쓰면 안 된다. 이 화면은 스와이퍼와 접힌
+    바텀시트가 같은 제목을 숨김 사본으로 한 벌 더 만들어 두는데, `.first`가 하필
+    그쪽을 잡으면 Playwright가 "element is not visible"로 타임아웃까지 기다렸다가
+    죽는다 — 8/25 자동 예매 실패가 이 모양이었다. `_click_date`가 `_visible()`로
+    거르는 것과 같은 이유다.
+    """
+    try:
+        page.wait_for_selector(f"text={text}", timeout=timeout, state="visible")
+    except Exception:  # noqa: BLE001 - 아래에서 후보를 세어 더 나은 문구를 낸다
+        pass
+    nodes = [n for n in page.get_by_text(text, exact=exact).all() if n.is_visible()]
+    if not nodes:
+        total = page.get_by_text(text, exact=exact).count()
+        raise RuntimeError(
+            f"{what} '{text}'을(를) 화면에서 찾지 못했습니다 "
+            f"(숨겨진 것 {total}개)")
+    nodes[0].click(timeout=timeout)
+
+
+def _click_role(page, name: str, *, what: str, exact: bool = False,
+                timeout: int = 5000) -> None:
+    """그 이름을 가진 **보이는** 버튼을 누른다.
+
+    `_click_visible`과 달리 접근성 이름으로 찾는다. 관람인원 버튼은 숫자와 '선택'이
+    서로 다른 요소라 텍스트 매칭으로는 걸리지 않는다.
+    """
+    try:
+        buttons = [b for b in page.get_by_role("button", name=name, exact=exact).all()
+                   if b.is_visible()]
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"{what} 버튼을 찾지 못했습니다: {exc}") from exc
+    if not buttons:
+        raise RuntimeError(f"{what} '{name}' 버튼이 화면에 없습니다")
+    buttons[0].click(timeout=timeout)
+
+
 def _click_date(page, scn_ymd: str) -> None:
     """상영 날짜를 고른다.
 
@@ -567,9 +607,9 @@ def hold_block(session, ctx: dict) -> dict:
     try:
         page.goto(BOOKING_PAGE, wait_until="domcontentloaded", timeout=40000)
         page.wait_for_timeout(3500)
-        page.get_by_text(ctx["mov_nm"], exact=True).first.click(timeout=10000)
+        _click_visible(page, ctx["mov_nm"], exact=True, what="영화", timeout=10000)
         page.wait_for_timeout(2500)
-        page.get_by_text(ctx["site_nm"], exact=False).first.click(timeout=6000)
+        _click_visible(page, ctx["site_nm"], exact=False, what="극장", timeout=6000)
         page.wait_for_timeout(2500)
         # 날짜를 고른다. 이 화면은 기본이 **오늘**이라, 건너뛰면 오늘 상영표에서
         # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한
@@ -584,12 +624,14 @@ def hold_block(session, ctx: dict) -> dict:
             except Exception:  # noqa: BLE001
                 pass
         # 관람인원: party명 (일반 기준). 권종 세분화는 후속 단계.
-        page.get_by_role("button", name=f"{ctx['party']} 선택").first.click(timeout=5000)
+        # 버튼 이름은 접근성 이름으로만 잡힌다 — 안의 숫자와 '선택'이 서로 다른
+        # 요소라 텍스트로 찾으면 걸리지 않는다.
+        _click_role(page, f"{ctx['party']} 선택", what="관람인원", timeout=5000)
         page.wait_for_timeout(1500)
-        # 좌석맵 열기
+        # 좌석맵 열기 — 이미 열려 있으면 이 버튼이 없다.
         try:
-            page.get_by_role("button", name="선택", exact=True).first.click(timeout=3000)
-        except Exception:  # noqa: BLE001
+            _click_role(page, "선택", what="좌석 선택", exact=True, timeout=3000)
+        except Exception:  # noqa: BLE001 - 없으면 이미 좌석맵이다
             pass
         page.wait_for_timeout(1500)
         # 좌석은 **여기 도착해서** 다시 고른다. 감지 때 읽은 배치도는 위의 화면
@@ -599,11 +641,17 @@ def hold_block(session, ctx: dict) -> dict:
             return {"ok": False, "error": picked["error"],
                     "seat_labels": picked["labels"]}
         chosen = picked["labels"]
-        page.get_by_role("button", name="선택완료").first.click(timeout=4000)
+        _click_role(page, "선택완료", what="좌석 선택완료", timeout=4000)
         page.wait_for_timeout(2500)
         # 결제하기 클릭 = 선점 트리거 (여기까지만! 결제 확정/푸시는 안 한다)
-        btn = page.locator("button", has_text="결제하기").first
-        btn.click(timeout=5000)
+        # 이 버튼도 숨겨진 사본이 있다 — `.first`로 잡으면 "element is not visible"로
+        # 타임아웃까지 기다렸다 죽는다. 선점이 한 번도 성공하지 못한 이유였다.
+        pay = [b for b in page.locator("button", has_text="결제하기").all()
+               if b.is_visible()]
+        if not pay:
+            raise RuntimeError("결제하기 버튼이 화면에 없습니다 "
+                               "(좌석 선택이 끝나지 않았을 수 있습니다)")
+        pay[0].click(timeout=5000)
         page.wait_for_timeout(5000)
     except Exception as exc:  # noqa: BLE001
         shot = _save_screenshot(page, ctx)

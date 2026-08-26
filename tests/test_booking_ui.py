@@ -502,6 +502,64 @@ class TestSelectBlockRepicksAtTheSeatMap(unittest.TestCase):
         self.assertEqual(len(self.shots), 1, "화면은 첫 실패에 한 번만")
 
 
+class TestClickVisibleSkipsHiddenTwins(unittest.TestCase):
+    """8/25 실패 재현: `.first`가 숨겨진 사본을 잡아 타임아웃까지 기다렸다.
+
+    스와이퍼와 접힌 바텀시트가 같은 제목을 한 벌 더 만들어 둔다.
+    """
+
+    class TitlePage:
+        def __init__(self, nodes):
+            self.nodes = nodes          # [(텍스트, 보이는가), ...]
+            self.clicked = []
+
+        def wait_for_selector(self, selector, **kw):
+            pass
+
+        def get_by_text(self, text, exact=False):
+            page = self
+            hits = [(t, vis) for t, vis in page.nodes
+                    if (t == text if exact else text in t)]
+
+            class Node:
+                def __init__(self, label, vis):
+                    self.label, self.vis = label, vis
+
+                def is_visible(self):
+                    return self.vis
+
+                def click(self, timeout=None):
+                    if not self.vis:
+                        raise RuntimeError("element is not visible")
+                    page.clicked.append(self.label)
+
+            class Loc:
+                def all(self):
+                    return [Node(t, v) for t, v in hits]
+
+                def count(self):
+                    return len(hits)
+
+                @property
+                def first(self):
+                    return Node(*hits[0])
+            return Loc()
+
+    def test_clicks_the_visible_copy_not_the_hidden_first_one(self):
+        page = self.TitlePage([("오디세이", False), ("오디세이", True)])
+        booking._click_visible(page, "오디세이", exact=True, what="영화")
+        self.assertEqual(page.clicked, ["오디세이"])
+
+    def test_reports_clearly_when_every_copy_is_hidden(self):
+        page = self.TitlePage([("오디세이", False), ("오디세이", False)])
+        with self.assertRaises(RuntimeError) as caught:
+            booking._click_visible(page, "오디세이", exact=True, what="영화")
+        msg = str(caught.exception)
+        self.assertIn("영화", msg)
+        self.assertIn("숨겨진 것 2개", msg)
+        self.assertEqual(page.clicked, [])
+
+
 class TestSelectorsAreNotPinnedToHashes(unittest.TestCase):
     """CSS 모듈 해시는 CGV가 다시 빌드하면 바뀐다 — 셀렉터가 거기 매달리면 안 된다."""
 
