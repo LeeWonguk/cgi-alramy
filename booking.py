@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import seats as seats_mod
 import store
@@ -27,6 +28,13 @@ import store
 log = logging.getLogger("cgv-watch.booking")
 
 SEAT_HOLD_URL_MARK = "seatTemp/seatTempPrmp"
+
+# CGV가 주는 시각은 전부 한국 시간이고 시간대 표시가 붙어 있지 않다. 서버가
+# 어디서 돌든 같은 뜻이어야 하므로 여기 한 곳에 못박는다 — 컨테이너는 보통
+# UTC라, 로컬 시간대로 해석하면 선점 만료가 9시간 뒤로 기록된다. 그러면
+# store.active_hold()가 이미 끝난 선점을 유효하다고 보고 그 감시는 영영
+# 다시 잡지 않는다.
+KST = ZoneInfo("Asia/Seoul")
 
 # 회차(상영 시작 시각) 버튼을 찾는 방법을 확실한 순서로 늘어놓는다.
 #
@@ -71,12 +79,16 @@ def _fmt_hhmm(scnsrt: str) -> str:
 
 
 def _parse_limit_dt(raw: str):
-    """'20260825160018' → datetime(aware). 실패하면 None."""
+    """'20260825160018' → datetime(KST, aware). 실패하면 None.
+
+    `.astimezone()`으로 붙이면 안 된다 — 그건 **실행 환경의** 시간대로 읽는
+    것이라 UTC 컨테이너에서는 같은 숫자가 9시간 다른 순간을 가리킨다.
+    """
     if not raw or len(raw) < 12:
         return None
     try:
         naive = datetime.strptime(raw[:14].ljust(14, "0"), "%Y%m%d%H%M%S")
-        return naive.astimezone()
+        return naive.replace(tzinfo=KST)
     except ValueError:
         return None
 
@@ -155,8 +167,9 @@ def build_hold_alert(mov_nm: str, site_nm: str, scn_ymd: str, start_hhmm: str,
 
     when = ""
     if hold_expires_at is not None:
+        # 읽는 사람은 극장 앞에 서 있다 — 서버가 어디서 돌든 한국 시각으로 적는다.
         try:
-            when = hold_expires_at.strftime("%H:%M")
+            when = hold_expires_at.astimezone(KST).strftime("%H:%M")
         except Exception:  # noqa: BLE001
             when = str(hold_expires_at)
     amt = f"\n💳 예상 금액 {amount:,}원" if amount else ""

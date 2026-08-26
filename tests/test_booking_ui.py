@@ -369,6 +369,35 @@ class TestSelectorsAreNotPinnedToHashes(unittest.TestCase):
             self.assertNotIn("timeWrap", selector)
 
 
+class TestHoldExpiryIsKoreanTime(unittest.TestCase):
+    """선점 만료는 CGV가 준 **한국 시각**이다.
+
+    회귀: `.astimezone()`으로 시간대를 붙이면 실행 환경 기준이라, UTC 컨테이너에서
+    같은 숫자가 9시간 뒤를 가리킨다. 그러면 store.active_hold()가 이미 끝난
+    선점을 유효하다고 봐서 그 감시는 영영 다시 잡지 않는다.
+    """
+
+    def test_parsed_instant_is_kst_regardless_of_local_timezone(self):
+        from datetime import datetime, timezone
+
+        got = booking._parse_limit_dt("20260825160018")
+        self.assertIsNotNone(got)
+        # 2026-08-25 16:00:18 KST == 07:00:18 UTC. 서버 시계와 무관하다.
+        self.assertEqual(
+            got.astimezone(timezone.utc),
+            datetime(2026, 8, 25, 7, 0, 18, tzinfo=timezone.utc))
+
+    def test_alert_prints_korean_wall_clock(self):
+        msg = booking.build_hold_alert(
+            "오디세이", "용산", "20260825", "22:10", ["A4", "A5"],
+            booking._parse_limit_dt("20260825160018"), 28000)
+        self.assertIn("16:00까지", msg)
+
+    def test_unparsable_limit_is_none(self):
+        self.assertIsNone(booking._parse_limit_dt(""))
+        self.assertIsNone(booking._parse_limit_dt("20261332000000"))
+
+
 class TestScreenshotIsBestEffort(unittest.TestCase):
     """스크린샷은 부가 기능이다 — 실패해도 예매 실패 경로를 망치면 안 된다."""
 
