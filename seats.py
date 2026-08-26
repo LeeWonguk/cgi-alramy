@@ -622,6 +622,6 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                                dry_run=dry_run, owner_id=w["owner_id"],
                                webhook_url=webhook, webhook_kind=webhook_kind,
                                mov_nm=mov_nm, site_nm=site_nm,
-                               dates=[w["scn_ymd"]]):
+                               dates=[w["scn_ymd"]], seat_watch_id=w["id"]):
             sent += 1
     return sent

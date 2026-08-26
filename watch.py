@@ -590,7 +590,8 @@ def deliver_alert(kind: str, body: str, *, dry_run: bool = False,
                   target_id: int | None = None, owner_id: int | None = None,
                   webhook_url: str | None = None,
                   webhook_kind: str | None = None, mov_nm: str | None = None,
-                  site_nm: str | None = None, dates: list[str] | None = None) -> bool:
+                  site_nm: str | None = None, dates: list[str] | None = None,
+                  seat_watch_id: int | None = None) -> bool:
     """알림을 이력에 남기고 그 소유자의 웹훅으로 보낸다. 전송 성공 여부를 반환.
 
     먼저 delivered=false로 적어 두므로, 전송이 실패해도 "무엇을 못 보냈는지"가
@@ -601,7 +602,7 @@ def deliver_alert(kind: str, body: str, *, dry_run: bool = False,
 
     alert_id = store.record_alert(
         kind, body, target_id=target_id, owner_id=owner_id, mov_nm=mov_nm,
-        site_nm=site_nm, dates=dates or [],
+        site_nm=site_nm, dates=dates or [], seat_watch_id=seat_watch_id,
     )
     if send_webhook(body, webhook_url=webhook_url, kind=webhook_kind):
         store.mark_alert_delivered(alert_id)

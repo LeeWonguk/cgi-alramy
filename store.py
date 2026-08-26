@@ -1253,7 +1253,8 @@ def prune_showtimes(target_id: int, keep: list[str]) -> None:
 # ── 알림 이력 ───────────────────────────────────────────────────────────────
 def record_alert(kind: str, body: str, *, target_id: int | None = None,
                  owner_id: int | None = None, mov_nm: str | None = None,
-                 site_nm: str | None = None, dates: Any = ()) -> int:
+                 site_nm: str | None = None, dates: Any = (),
+                 seat_watch_id: int | None = None) -> int:
     """알림을 이력에 남기고 id를 돌려준다.
 
     아직 못 보낸 **같은** 알림이 있으면 새 행을 만들지 않고 시도 횟수만 올린다.
@@ -1264,6 +1265,9 @@ def record_alert(kind: str, body: str, *, target_id: int | None = None,
     target_id가 없고 dates도 비어 있어서, 소유자를 보지 않으면 사용자 A의
     미전송 알림을 B의 알림이 덮어써 A의 본문이 바뀌고 B의 이력은 생기지 않는다.
     한 행만 고르는 것도 같은 이유다 — UPDATE에 LIMIT을 못 걸어 서브쿼리로 잡는다.
+
+    **좌석 감시도 포함된다.** 좌석 알림은 target_id가 없고 dates가 [scn_ymd]
+    하나뿐이라, 같은 사람이 같은 날짜에 감시를 둘 걸면 서로를 덮어쓴다.
     """
     dates = list(dates or [])
     with pool().connection() as conn:
@@ -1274,18 +1278,20 @@ def record_alert(kind: str, body: str, *, target_id: int | None = None,
             "      where not delivered and kind = %s and dates = %s"
             "        and target_id is not distinct from %s"
             "        and owner_id is not distinct from %s"
+            "        and seat_watch_id is not distinct from %s"
             "      order by id limit 1)"
             " returning id",
-            (body, _now(), kind, dates, target_id, owner_id),
+            (body, _now(), kind, dates, target_id, owner_id, seat_watch_id),
         ).fetchone()
         if pending:
             return int(pending["id"])
 
         row = conn.execute(
-            "insert into alerts (kind, target_id, owner_id, mov_nm, site_nm,"
-            "   dates, body, created_at)"
-            " values (%s, %s, %s, %s, %s, %s, %s, %s) returning id",
-            (kind, target_id, owner_id, mov_nm, site_nm, dates, body, _now()),
+            "insert into alerts (kind, target_id, owner_id, seat_watch_id,"
+            "   mov_nm, site_nm, dates, body, created_at)"
+            " values (%s, %s, %s, %s, %s, %s, %s, %s, %s) returning id",
+            (kind, target_id, owner_id, seat_watch_id, mov_nm, site_nm, dates,
+             body, _now()),
         ).fetchone()
     return int(row["id"])
 
@@ -1300,8 +1306,9 @@ def mark_alert_delivered(alert_id: int) -> None:
 
 def recent_alerts(limit: int = 50, *, owner_id: int | None = None) -> list[dict]:
     """알림 이력. owner_id를 주면 그 사용자 것만 (운영 알림은 소유자가 없다)."""
-    query = ("select id, created_at, kind, target_id, owner_id, mov_nm, site_nm,"
-             "   dates, body, delivered, delivered_at, attempts from alerts")
+    query = ("select id, created_at, kind, target_id, owner_id, seat_watch_id,"
+             "   mov_nm, site_nm, dates, body, delivered, delivered_at, attempts"
+             " from alerts")
     params: list[Any] = []
     if owner_id is not None:
         query += " where owner_id = %s"

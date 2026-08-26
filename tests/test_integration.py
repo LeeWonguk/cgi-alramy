@@ -662,5 +662,58 @@ class TestCgvSessionIsPerOwner(DbCase):
         self.assertIsNone(session.logged_in_owner)
 
 
+class TestAlertDedupeIsPerSeatWatch(DbCase):
+    """회귀: 미전송 알림의 중복 판정이 좌석 감시도 봐야 한다.
+
+    좌석 알림은 target_id가 없고 dates가 [scn_ymd] 하나뿐이다. 한 사람이 같은
+    날짜에 감시를 둘 걸면(A열·B열) 서로의 미전송 행을 덮어써 한쪽 알림이
+    조용히 사라진다.
+    """
+
+    def watches(self):
+        uid = self.make_user("owner")["id"]
+        a = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["A"])
+        b = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["B"])
+        return uid, a["id"], b["id"]
+
+    def test_two_watches_same_date_keep_separate_rows(self):
+        uid, a, b = self.watches()
+        first = store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                                   dates=["20260825"], seat_watch_id=a)
+        second = store.record_alert("seat_open", "B열 빈자리", owner_id=uid,
+                                    dates=["20260825"], seat_watch_id=b)
+
+        self.assertNotEqual(first, second)
+        bodies = {r["body"] for r in store.recent_alerts(owner_id=uid)}
+        self.assertEqual(bodies, {"A열 빈자리", "B열 빈자리"})
+
+    def test_same_watch_retry_reuses_the_row(self):
+        uid, a, _ = self.watches()
+        first = store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                                   dates=["20260825"], seat_watch_id=a)
+        again = store.record_alert("seat_open", "A열 빈자리(재시도)", owner_id=uid,
+                                   dates=["20260825"], seat_watch_id=a)
+
+        self.assertEqual(first, again)
+        rows = store.recent_alerts(owner_id=uid)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["attempts"], 2)
+
+    def test_history_carries_the_watch_id(self):
+        uid, a, _ = self.watches()
+        store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                           dates=["20260825"], seat_watch_id=a)
+        self.assertEqual(store.recent_alerts(owner_id=uid)[0]["seat_watch_id"], a)
+
+    def test_deleting_the_watch_keeps_the_history(self):
+        uid, a, _ = self.watches()
+        store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                           dates=["20260825"], seat_watch_id=a)
+        store.delete_seat_watch(a, owner_id=uid)
+        rows = store.recent_alerts(owner_id=uid)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["seat_watch_id"])
+
+
 if __name__ == "__main__":
     unittest.main()
