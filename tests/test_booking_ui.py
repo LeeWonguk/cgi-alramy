@@ -398,6 +398,26 @@ class TestHoldExpiryIsKoreanTime(unittest.TestCase):
         self.assertIsNone(booking._parse_limit_dt("20261332000000"))
 
 
+class TestPaymentTripwire(unittest.TestCase):
+    """'결제하기'가 선점 단계라는 전제가 깨지면 돈이 나간다 — 알아챌 수 있어야 한다."""
+
+    def test_seat_hold_response_is_never_mistaken_for_payment(self):
+        url = "https://cgv.co.kr/api/v1/booking/seatTemp/seatTempPrmp"
+        self.assertIsNone(booking.payment_mark(url))
+
+    def test_payment_paths_are_flagged(self):
+        for url in ("https://cgv.co.kr/api/v1/pay/ready",
+                    "https://cgv.co.kr/api/v1/booking/movAtktPayApprov",
+                    "https://cgv.co.kr/api/v1/order/approvePayment"):
+            self.assertIsNotNone(booking.payment_mark(url), url)
+
+    def test_ordinary_traffic_is_not_flagged(self):
+        for url in ("https://cgv.co.kr/api/v1/booking/searchSchByMov",
+                    "https://cgv.co.kr/api/v1/booking/searchIfSeatData",
+                    "https://cgv.co.kr/_next/static/chunk.js"):
+            self.assertIsNone(booking.payment_mark(url), url)
+
+
 class TestScreenshotIsBestEffort(unittest.TestCase):
     """스크린샷은 부가 기능이다 — 실패해도 예매 실패 경로를 망치면 안 된다."""
 
