@@ -517,6 +517,94 @@ class TestAutoBookOrchestration(DbCase):
         self.assertEqual(out["action"], "skip")
         self.assertEqual(called["n"], 1)
 
+    def test_auto_pay_requests_payment_and_keeps_the_link(self):
+        """auto_pay를 켜면 선점에 이어 결제를 요청하고 링크를 남긴다."""
+        import booking
+        from datetime import datetime, timedelta
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, auto_pay=True, party_size=1)
+        link = "https://online-pay.kakaopay.com/pay/r1/abc123"
+        pay_exp = datetime.now().astimezone() + timedelta(minutes=15)
+        seen = {}
+
+        def fake_pay(session, ctx, *, method):
+            seen["method"] = method
+            seen["seats"] = list(ctx["seat_labels"])
+            return {"ok": True, "method": method, "pay_url": link,
+                    "pay_expires_at": pay_exp, "amount": 15000, "error": ""}
+
+        out = booking.try_auto_book(
+            None, w, self._row(), self._seats({4}), mov_nm="오디세이",
+            site_nm="용산", hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"},
+            pay_fn=fake_pay)
+
+        self.assertEqual(out["action"], "held")
+        self.assertEqual(out["pay_url"], link)
+        self.assertEqual(seen["method"], "kakaopay")
+        att = store.booking_attempts(owner_id=uid)[0]
+        self.assertEqual(att["status"], "held")
+        self.assertEqual(att["pay_url"], link)
+        self.assertEqual(att["pay_method"], "kakaopay")
+        self.assertEqual(att["amount"], 15000)   # 금액은 결제 화면에서 읽는다
+        self.assertIsNone(att["pay_error"])
+
+    def test_payment_failure_does_not_undo_the_hold(self):
+        """결제 요청이 실패해도 좌석은 잡혀 있다 — 사람이 손으로 마칠 수 있다."""
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, auto_pay=True, party_size=1)
+
+        def fake_pay(session, ctx, *, method):
+            return {"ok": False, "method": method, "pay_url": None,
+                    "pay_expires_at": None, "amount": None,
+                    "error": "카카오페이 결제창이 뜨지 않았습니다"}
+
+        out = booking.try_auto_book(
+            None, w, self._row(), self._seats({4}), mov_nm="오디세이",
+            site_nm="용산", hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"},
+            pay_fn=fake_pay)
+
+        self.assertEqual(out["action"], "held")
+        self.assertIsNone(out["pay_url"])
+        self.assertIn("결제창", out["pay_error"])
+        att = store.booking_attempts(owner_id=uid)[0]
+        self.assertEqual(att["status"], "held")          # held 그대로
+        self.assertIn("결제창", att["pay_error"])
+        self.assertIsNotNone(store.active_hold(w["id"]))  # 중복 선점도 여전히 막힌다
+
+    def test_a_raising_pay_function_is_caught(self):
+        """결제 쪽 예외가 선점 성공까지 실패로 만들면 안 된다."""
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, auto_pay=True, party_size=1)
+
+        def boom(session, ctx, *, method):
+            raise RuntimeError("브라우저가 죽었다")
+
+        out = booking.try_auto_book(
+            None, w, self._row(), self._seats({4}), mov_nm="오디세이",
+            site_nm="용산", hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"},
+            pay_fn=boom)
+        self.assertEqual(out["action"], "held")
+        self.assertIn("브라우저가 죽었다", out["pay_error"])
+
+    def test_pay_is_not_attempted_when_auto_pay_is_off(self):
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=1)
+        called = {"n": 0}
+
+        def fake_pay(session, ctx, *, method):
+            called["n"] += 1
+            return {"ok": True}
+
+        booking.try_auto_book(
+            None, w, self._row(), self._seats({4}), mov_nm="오디세이",
+            site_nm="용산", hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"},
+            pay_fn=fake_pay)
+        self.assertEqual(called["n"], 0)
+        self.assertIsNone(store.booking_attempts(owner_id=uid)[0]["pay_url"])
+
     def test_records_the_seats_the_hold_actually_took(self):
         # hold는 좌석맵에 도착해서 좌석을 다시 고른다. 이력과 알림이 감지 때의
         # **후보**를 그대로 적으면, 사용자가 받은 문구와 실제 잡힌 자리가 어긋난다.

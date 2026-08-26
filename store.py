@@ -712,8 +712,21 @@ def clear_cgv_tokens(owner_id: int) -> None:
 SEAT_WATCH_COLUMNS = """
     id, owner_id, movie_query, site_query, scn_ymd, scn_time,
     scn_time_from, scn_time_to, screen_types, rows,
-    min_consecutive, auto_book, party_size, ticket_spec, enabled, created_at
+    min_consecutive, auto_book, auto_pay, pay_method,
+    party_size, ticket_spec, enabled, created_at
 """
+
+# 지금 지원하는 결제수단. 화면과 API가 같은 값을 쓴다(booking.PAY_METHODS).
+PAY_METHODS = ("kakaopay",)
+DEFAULT_PAY_METHOD = "kakaopay"
+
+
+def normalize_pay_method(value) -> str:
+    """결제수단 코드를 정규화. 비어 있으면 기본값(카카오페이)."""
+    text = (str(value or "").strip() or DEFAULT_PAY_METHOD).lower()
+    if text not in PAY_METHODS:
+        raise ValueError(f"지원하지 않는 결제수단입니다: {value}")
+    return text
 
 # 자정을 넘긴 회차를 24시 이상으로 적는 CGV 표기의 상한. '2530' = 25:30 = 새벽 1:30.
 # 하루치 상영표라 28시(= 새벽 4시)를 넘는 회차는 없다.
@@ -810,7 +823,8 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
                    scn_ymd: str, screen_types=None, rows=None,
                    min_consecutive: int = 0, auto_book: bool = False,
                    party_size: int = 1, ticket_spec=None, scn_time="",
-                   scn_time_from="", scn_time_to="") -> dict:
+                   scn_time_from="", scn_time_to="", auto_pay: bool = False,
+                   pay_method=None) -> dict:
     """좌석 감시를 추가한다. 같은 조합이 있으면 옵션을 갱신해 돌려준다.
 
     회차 지정은 셋 중 하나다:
@@ -840,23 +854,33 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
     except (TypeError, ValueError):
         raise ValueError("인원수는 숫자여야 합니다")
     spec = normalize_ticket_spec(ticket_spec)
+    # 자동 결제는 자동 예매 위에서만 뜻이 있다 — 선점하지 않는 감시에 결제할
+    # 대상이 있을 리 없다. 화면에서도 그렇게 묶여 있지만, API로 바로 들어오는
+    # 값도 있으니 여기서 한 번 더 맞춘다.
+    pay_on = bool(auto_pay) and bool(auto_book)
+    method = normalize_pay_method(pay_method)
     with pool().connection() as conn:
         row = conn.execute(
             f"insert into seat_watches"
             f"   (owner_id, movie_query, site_query, scn_ymd, scn_time,"
             f"    scn_time_from, scn_time_to, screen_types, rows,"
-            f"    min_consecutive, auto_book, party_size, ticket_spec)"
-            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            f"    min_consecutive, auto_book, party_size, ticket_spec,"
+            f"    auto_pay, pay_method)"
+            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
+            f"         %s, %s)"
             f" on conflict (owner_id, movie_query, site_query, scn_ymd, scn_time,"
             f"              scn_time_from, scn_time_to,"
             f"              screen_types, rows) do update set enabled = true,"
             f"              min_consecutive = excluded.min_consecutive,"
             f"              auto_book = excluded.auto_book,"
             f"              party_size = excluded.party_size,"
-            f"              ticket_spec = excluded.ticket_spec"
+            f"              ticket_spec = excluded.ticket_spec,"
+            f"              auto_pay = excluded.auto_pay,"
+            f"              pay_method = excluded.pay_method"
             f" returning {SEAT_WATCH_COLUMNS}",
             (owner_id, movie_query, site_query, scn_ymd, stime, tfrom, tto,
-             types, row_filter, need, bool(auto_book), party, Json(spec)),
+             types, row_filter, need, bool(auto_book), party, Json(spec),
+             pay_on, method),
         ).fetchone()
     return dict(row)
 
@@ -870,6 +894,8 @@ def set_seat_watch(seat_watch_id: int, owner_id: int | None = None,
     allowed = {
         "enabled": lambda v: bool(v),
         "auto_book": lambda v: bool(v),
+        "auto_pay": lambda v: bool(v),
+        "pay_method": normalize_pay_method,
         "min_consecutive": lambda v: max(0, int(v or 0)),
         "party_size": lambda v: max(1, int(v or 1)),
         "ticket_spec": lambda v: Json(normalize_ticket_spec(v)),
@@ -879,6 +905,13 @@ def set_seat_watch(seat_watch_id: int, owner_id: int | None = None,
         if key in fields and fields[key] is not None:
             sets.append(f"{key} = %s")
             params.append(coerce(fields[key]))
+    # 자동 예매를 끄면 자동 결제도 함께 꺼진다 — 선점하지 않는 감시가 결제만
+    # 켜져 있는 상태는 뜻이 없고, 나중에 자동 예매를 다시 켤 때 사용자가
+    # 기억하지 못하는 결제 설정이 되살아나는 게 더 위험하다.
+    if fields.get("auto_book") is not None and not fields["auto_book"] \
+            and "auto_pay" not in fields:
+        sets.append("auto_pay = %s")
+        params.append(False)
     if not sets:
         return seat_watch(seat_watch_id)
     where = "id = %s"
@@ -959,7 +992,8 @@ def normalize_rows(rows) -> list[str]:
 BOOKING_COLUMNS = """
     id, seat_watch_id, owner_id, showtime_key, mov_nm, site_nm, scn_ymd,
     start_hhmm, seat_labels, seat_loc_nos, mov_atkt_no, amount, status,
-    hold_expires_at, last_error, created_at, updated_at
+    hold_expires_at, last_error, created_at, updated_at,
+    pay_method, pay_url, pay_expires_at, pay_error
 """
 
 
@@ -985,20 +1019,28 @@ def finish_booking_attempt(attempt_id: int, status: str, *,
                            amount: int | None = None,
                            hold_expires_at: datetime | None = None,
                            seat_labels: list[str] | None = None,
-                           error: str | None = None) -> None:
+                           error: str | None = None,
+                           pay_method: str | None = None,
+                           pay_url: str | None = None,
+                           pay_expires_at: datetime | None = None,
+                           pay_error: str | None = None) -> None:
     """선점 시도 결과를 확정한다. status: held|failed|expired|cancelled.
 
     seat_labels를 주면 좌석도 덮어쓴다 — 시도를 열 때 적은 건 감지 시점의
     **후보**이고, 실제로 누른 좌석은 좌석맵에 도착해서 다시 고르기 때문이다
     (booking._select_block). 이력이 후보를 그대로 들고 있으면 사용자가 받은
     알림과 어긋난다.
+
+    pay_* 는 자동 결제(auto_pay)를 켠 감시에서만 채워진다. 결제 요청이 실패해도
+    선점은 유효하므로 status는 held 그대로 두고 pay_error에만 사유를 남긴다.
     """
     if status not in ("held", "failed", "expired", "cancelled", "pending"):
         raise ValueError(f"알 수 없는 상태: {status}")
     sets = ["status=%s", "mov_atkt_no=%s", "amount=%s", "hold_expires_at=%s",
-            "last_error=%s", "updated_at=%s"]
+            "last_error=%s", "updated_at=%s",
+            "pay_method=%s", "pay_url=%s", "pay_expires_at=%s", "pay_error=%s"]
     params: list[Any] = [status, mov_atkt_no, amount, hold_expires_at, error,
-                         _now()]
+                         _now(), pay_method, pay_url, pay_expires_at, pay_error]
     if seat_labels is not None:
         sets.append("seat_labels=%s")
         params.append(list(seat_labels))

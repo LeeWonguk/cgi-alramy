@@ -337,3 +337,28 @@ DROP INDEX IF EXISTS seat_watches_uniq_idx;
 -- 감시가 지워져도 이력은 남아야 하므로 SET NULL이다.
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS
     seat_watch_id integer REFERENCES seat_watches(id) ON DELETE SET NULL;
+
+
+-- ── 자동 결제(카카오페이) ────────────────────────────────────────────────────
+-- 선점까지 해 두고 사람이 CGV 앱을 다시 열어 결제수단부터 고르는 게 실제로는
+-- 느렸다. auto_pay를 켜면 선점에 이어 결제 화면에서 **카카오페이를 고르고 약관에
+-- 동의해 결제를 요청**하는 데까지 간다. 돈이 실제로 나가는 마지막 승인(카카오톡
+-- 인증·비밀번호)은 여전히 사람이 자기 기기에서 한다 — 시스템이 대신할 수 없고,
+-- 대신해서도 안 된다. 그래서 알림에 **카카오페이 결제 링크**를 실어 보낸다.
+--
+-- pay_method는 지금 'kakaopay' 하나뿐이지만, 결제수단이 늘 수 있으니 컬럼으로
+-- 둔다(booking.PAY_METHODS).
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    auto_pay   boolean NOT NULL DEFAULT false;
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    pay_method text NOT NULL DEFAULT 'kakaopay';
+
+-- 결제 요청 결과. 링크는 몇 분 만에 죽으므로 만료 시각을 함께 남긴다 —
+-- 이력 화면에서 "이미 지난 링크"를 눌러 보게 두면 안 된다.
+--   pay_url        — 사람이 휴대폰에서 열어 결제를 마칠 카카오페이 주소
+--   pay_expires_at — 그 링크가 만료되는 시각(카카오페이가 알려준 값)
+--   pay_error      — 선점은 됐는데 결제 요청까지 못 간 사유
+ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_method     text;
+ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_url        text;
+ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_expires_at timestamptz;
+ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_error      text;

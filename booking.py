@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""자동 예매(좌석 선점) — Phase 1 auto-book.
+"""자동 예매 — 좌석 선점(auto_book)과 카카오페이 결제 요청(auto_pay).
 
 좌석 감시에서 빈자리(또는 연속 블록)가 감지되고 그 감시의 auto_book이 켜져 있으면,
-인원수만큼 좌석을 골라 CGV에 **임시 선점(seatTempPrmp)** 까지 한다. **결제 확정은
-하지 않는다** — 돈이 움직이는 단계는 사람이 자기 기기에서 마친다(설계 문서 참고).
+인원수만큼 좌석을 골라 CGV에 **임시 선점(seatTempPrmp)** 을 건다. auto_pay까지
+켜져 있으면 이어서 결제 화면에서 **카카오페이를 고르고 약관에 동의해 결제를
+요청**하는 데까지 간다.
 
-두 층으로 나뉜다:
+**마지막 승인은 사람이 한다.** 카카오페이는 카카오톡 인증이나 결제 비밀번호를
+사용자 기기에서 받아야 끝나고, 그건 시스템이 대신할 수 없다. 그래서 결제 요청까지
+가서 **휴대폰으로 열면 바로 결제되는 링크**를 받아 알림에 실어 보낸다 — 사람이
+CGV 앱을 다시 열어 결제수단부터 고르는 대신, 링크 하나만 눌러 인증하면 된다.
+
+세 층으로 나뉜다:
   - try_auto_book(...)  — 순수 오케스트레이션(좌석 선택·중복 방지·이력 기록·감시 비활성).
-    hold_fn을 주입할 수 있어 브라우저 없이 단위 테스트가 된다.
+    hold_fn·pay_fn을 주입할 수 있어 브라우저 없이 단위 테스트가 된다.
   - hold_block(...)     — 실제 CGV 예매 UI를 몰아 선점을 거는 라이브 구동. 사이트의
     자체 JS가 요청 바디(custNo 등)를 채우므로 우리가 재구성하지 않는다. seatTempPrmp
-    응답에서 예매번호·만료시각을 읽고 **결제 버튼 이후로는 진행하지 않는다.**
+    응답에서 예매번호·만료시각을 읽고 **결제 화면 앞에서 멈춘다.**
+  - pay_block(...)      — 그 뒤를 이어 결제 화면을 몰아 카카오페이 결제창을 띄우고
+    결제 링크를 받아 온다. **카카오페이 인증은 건드리지 않는다.**
 
 라이브 구동은 브라우저 워커 스레드에서(세션을 소유한 스레드에서) 실행돼야 한다.
 """
@@ -19,7 +27,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -40,14 +48,22 @@ VISITOR_PAGE_MARK = "/cnm/selectVisitorCnt"
 QUEUE_MARKS = ("대기중입니다", "대기인원", "예상 대기시간")
 QUEUE_WAIT_MS = 90_000
 
-# '결제하기'를 누르는 것이 **선점까지만** 한다는 전제 위에 이 모듈의 안전성이
-# 통째로 서 있다. CGV가 그 버튼의 뜻을 바꾸면 우리는 아무것도 눈치채지 못한 채
-# 돈을 쓰게 된다 — 코드가 스스로 알아챌 수 있는 유일한 지점이 그때 나가는
-# 요청이므로, 결제 확정 계열 경로가 보이면 크게 남기고 실패로 끊는다.
+# 좌석 선택 뒤의 '결제하기'가 **선점까지만** 한다는 전제 위에 선점 단계의 안전성이
+# 서 있다. CGV가 그 버튼의 뜻을 바꾸면 우리는 아무것도 눈치채지 못한 채 돈을 쓰게
+# 된다 — 코드가 스스로 알아챌 수 있는 유일한 지점이 그때 나가는 요청이므로,
+# **승인**(돈이 실제로 빠지는 단계) 계열 경로가 보이면 크게 남기고 실패로 끊는다.
+#
+# 예전에는 여기 '/pay/'가 있었는데, 그건 결제 화면을 **그리기만 하는** 조회
+# (`/api/v1/payment/pay/searchCrdCocdList`, `searchGroupedPaymdList` 등)에도 걸린다.
+# 실측해 보니 그 조회들은 선점 +9초쯤에 나가고 hold_block의 감시 구간은 +5초라,
+# 지금까지 걸리지 않은 건 타이밍 운이었다 — CGV가 화면을 조금만 빨리 그렸으면
+# 성공한 선점이 "결제 계열 요청 감지"로 되돌려졌다. 조회는 빼고, 승인만 남긴다.
 # 선점 응답(seatTempPrmp)은 이 목록과 겹치지 않아야 한다.
 PAYMENT_URL_MARKS = (
-    "/pay/", "payApprov", "payApprv", "atktPay", "movAtktPay",
+    "payApprov", "payApprv", "atktPay", "movAtktPay",
     "settle", "approvePayment", "paymentComplete",
+    # CGV의 PG 게이트웨이. 카카오페이 인증이 끝나면 여기 승인 주소로 돌아온다.
+    "onepg.cjsystems.co.kr",
 )
 
 # CGV가 주는 시각은 전부 한국 시간이고 시간대 표시가 붙어 있지 않다. 서버가
@@ -99,6 +115,46 @@ DATE_ACTIVE_MARK = "itemActive"
 # 없이는 사후에 가릴 수 없다.
 SHOT_DIR = Path(__file__).resolve().parent / "logs" / "booking"
 
+# ── 결제 화면 (auto_pay) ────────────────────────────────────────────────────
+# 2026-08 실측 구조.
+#
+# 좌석을 고르고 나면 '결제 전 확인해 주세요' 바텀시트가 뜨는데, 거기 [결제하기]는
+# **선점만** 건다(seatTempPrmp). 결제 화면으로 넘어가려면 그 버튼을 한 번 더
+# 눌러야 한다 — 이 두 클릭이 같은 이름이라 하나로 착각하기 쉽다.
+#
+# 결제 화면에 닿았는지는 결제수단 목록이 있는지로 판정한다. 주소로는 못 가린다:
+# CGV는 결제 화면에서도 주소를 `/cnm/selectVisitorCnt` 그대로 두다가 뒤늦게
+# `/mpy/main`으로 바꾼다.
+PAY_LIST_SELECTOR = 'ul[class*="basicPaymentList"]'
+# 고른 수단의 <li>에 붙는 클래스 조각. 눌렀는데 안 붙었으면 못 고른 것이다.
+PAY_ACTIVE_MARK = "basicPaymentList_active"
+
+# 결제수단 칸은 대부분 **로고 이미지**라 글자로는 잡히지 않는다 — img[alt]로 가른다.
+# 지금 쓰는 건 카카오페이 하나지만, 늘어날 수 있으니 표로 둔다(seat_watches.pay_method).
+PAY_METHODS = {"kakaopay": "카카오페이"}
+DEFAULT_PAY_METHOD = "kakaopay"
+
+# 약관. 개별 체크(chk1·chckAgreeList)는 '전체 동의' 하나로 함께 켜진다.
+TERMS_ALL_LABEL = 'label[for="chkAll"].chck-icon'
+TERMS_ALL_INPUT = "#chkAll"
+
+# 최종 결제 금액. 화면 아래 '최종결제금액' 블록의 강조 숫자다.
+FINAL_AMOUNT_SELECTOR = '[class*="mpy_lastPayment"] strong'
+
+# 카카오페이 PC 결제창은 **iframe**으로 뜬다(새 창이 아니다).
+KAKAO_BRIDGE_MARK = "online-payment.kakaopay.com"
+# 그 iframe이 부르는 내부 API. 응답에 휴대폰용 결제 주소와 만료 시각이 들어 있다.
+KAKAO_BRIDGE_API_MARK = "/pc/bridge"
+# 휴대폰에서 열면 바로 결제로 이어지는 주소. 브릿지 API를 못 읽었을 때 iframe
+# 주소 끝의 해시로 같은 주소를 만든다 — 화면의 QR이 담고 있는 것과 같다.
+KAKAO_PAY_LINK = "https://online-pay.kakaopay.com/pay/r1/{hash}"
+
+# 결제 화면으로 넘어갈 때까지 '결제하기'를 다시 눌러 보는 횟수와 간격.
+PAY_PAGE_ROUNDS = 6
+PAY_PAGE_ROUND_MS = 2500
+# 결제 요청 뒤 카카오페이 iframe이 뜨기를 기다리는 시간.
+PAY_BRIDGE_WAIT_MS = 25_000
+
 # 좌석 고르기 재시도. 한 바퀴가 [배치도 다시 읽기 → 고르기 → 클릭]이라 1초 안쪽이니
 # 몇 번을 돌아도 싸다. 다만 여기서 오래 끌 이유는 없다 — 이 시각을 넘길 만큼
 # 경쟁이 심하면 어차피 다음 사이클에 다시 본다.
@@ -131,11 +187,13 @@ def _parse_limit_dt(raw: str):
 
 def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
                   *, mov_nm: str = "", site_nm: str = "", site_no: str = "",
-                  mov_no: str = "", hold_fn=None, dry_run: bool = False) -> dict:
-    """감시 하나의 한 회차에서 자동 선점을 시도한다.
+                  mov_no: str = "", hold_fn=None, pay_fn=None,
+                  dry_run: bool = False) -> dict:
+    """감시 하나의 한 회차에서 자동 선점을(auto_pay면 결제 요청까지) 시도한다.
 
-    반환: {"action": skip|held|failed|no_seats, ...}. hold_fn(session, ctx)->result 를
-    주입하면 라이브 구동 대신 그걸 쓴다(테스트용). 기본은 hold_block.
+    반환: {"action": skip|held|failed|no_seats, ...}. hold_fn(session, ctx)->result 와
+    pay_fn(session, ctx, method=...)->result 를 주입하면 라이브 구동 대신 그걸
+    쓴다(테스트용). 기본은 hold_block·pay_block.
 
     여기서 고르는 좌석은 **후보**다. 감지 때 읽은 배치도는 UI를 모는 동안 낡으므로,
     실제로 누를 좌석은 좌석맵에 도착해서 다시 고른다(hold_block → _select_block).
@@ -191,16 +249,25 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
     final = list(result.get("seat_labels") or labels)
 
     if result.get("ok"):
+        # 선점이 됐으면 이어서 결제를 요청한다. **결제가 실패해도 선점은 유효하다**
+        # — 여기서 held를 되돌리면 사람이 손으로 마칠 수 있는 예매까지 잃는다.
+        pay = _try_pay(session, watch, ctx, pay_fn) if watch.get("auto_pay") else {}
         store.finish_booking_attempt(
             attempt_id, "held", mov_atkt_no=result.get("mov_atkt_no"),
-            amount=result.get("amount"), seat_labels=final,
-            hold_expires_at=result.get("hold_expires_at"))
+            amount=pay.get("amount") or result.get("amount"), seat_labels=final,
+            hold_expires_at=result.get("hold_expires_at"),
+            pay_method=pay.get("method"), pay_url=pay.get("pay_url"),
+            pay_expires_at=pay.get("pay_expires_at"),
+            pay_error=pay.get("error") or None)
         # 선점에 성공하면 그 감시는 꺼서 중복 선점을 막는다.
         store.set_seat_watch(watch_id, enabled=False)
         return {"action": "held", "attempt_id": attempt_id, "seats": final,
                 "mov_atkt_no": result.get("mov_atkt_no"),
                 "hold_expires_at": result.get("hold_expires_at"),
-                "amount": result.get("amount")}
+                "amount": pay.get("amount") or result.get("amount"),
+                "pay_url": pay.get("pay_url"),
+                "pay_expires_at": pay.get("pay_expires_at"),
+                "pay_error": pay.get("error") or None}
 
     store.finish_booking_attempt(attempt_id, "failed", seat_labels=final,
                                  error=result.get("error") or "선점 실패")
@@ -208,25 +275,85 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
             "attempt_id": attempt_id, "seats": final}
 
 
+def _try_pay(session, watch: dict, ctx: dict, pay_fn=None) -> dict:
+    """선점 직후 결제를 요청한다. 실패해도 예외를 밖으로 내지 않는다.
+
+    결제 요청이 실패하는 것과 선점이 실패하는 것은 무게가 다르다 — 좌석은 이미
+    잡혀 있으니, 사람이 CGV 앱에서 손으로 마치면 된다. 그래서 여기서는 사유만
+    챙겨 돌려주고 호출자는 held를 유지한다.
+    """
+    fn = pay_fn or pay_block
+    method = (watch.get("pay_method") or DEFAULT_PAY_METHOD).strip()
+    try:
+        out = fn(session, ctx, method=method)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("자동 결제 요청 실패(예외): %s", exc)
+        return {"method": method, "error": str(exc)}
+    if not out.get("ok"):
+        log.warning("자동 결제 요청 실패: %s", out.get("error"))
+    return out
+
+
+def _earliest(*values):
+    """주어진 시각 중 가장 이른 것. 전부 비어 있으면 None.
+
+    비교하려면 시간대가 붙어 있어야 한다 — naive가 섞이면 TypeError가 나므로
+    시간대 없는 값은 KST로 본다(CGV·카카오가 주는 시각은 전부 한국 시간이다).
+    """
+    out = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            out.append(value if value.tzinfo else value.replace(tzinfo=KST))
+        except AttributeError:  # datetime이 아닌 것은 비교하지 않는다
+            continue
+    return min(out) if out else None
+
+
+def _fmt_kst_hhmm(value) -> str:
+    """알림에 적을 시각. 읽는 사람은 한국에 있다 — 서버가 어디서 돌든 KST로."""
+    if value is None:
+        return ""
+    try:
+        return value.astimezone(KST).strftime("%H:%M")
+    except Exception:  # noqa: BLE001
+        return str(value)
+
+
 def build_hold_alert(mov_nm: str, site_nm: str, scn_ymd: str, start_hhmm: str,
-                     seat_labels: list[str], hold_expires_at, amount) -> str:
-    """선점 성공 알림. 사용자가 만료 전에 결제를 마치도록 안내한다."""
+                     seat_labels: list[str], hold_expires_at, amount,
+                     pay_url: str | None = None, pay_expires_at=None,
+                     pay_error: str | None = None) -> str:
+    """선점 성공 알림. 결제 링크가 있으면 그걸 앞세운다.
+
+    자동 결제가 켜져 있으면 카카오페이 결제창까지 띄워 둔 상태이므로, 사람이 할
+    일은 **링크를 눌러 인증하는 것 하나**다. 링크를 못 받았으면(자동 결제가
+    꺼져 있거나 요청이 실패했으면) 예전처럼 CGV에서 직접 결제하도록 안내한다.
+    """
     from watch import BOOKING_URL, fmt_date
 
-    when = ""
-    if hold_expires_at is not None:
-        # 읽는 사람은 극장 앞에 서 있다 — 서버가 어디서 돌든 한국 시각으로 적는다.
-        try:
-            when = hold_expires_at.astimezone(KST).strftime("%H:%M")
-        except Exception:  # noqa: BLE001
-            when = str(hold_expires_at)
+    # 마감은 **이른 쪽**이다. 실측에서 선점은 5분 남짓, 카카오페이 링크는 15분을
+    # 버텼다 — 링크 만료만 적으면 좌석이 이미 풀린 뒤에도 아직 시간이 있는 줄 알고
+    # 결제를 시도하게 된다. 반대로 링크가 먼저 죽는 경우도 있을 수 있으니 둘 중
+    # 이른 것을 하나만 적는다.
+    when = _fmt_kst_hhmm(_earliest(hold_expires_at, pay_expires_at))
     amt = f"\n💳 예상 금액 {amount:,}원" if amount else ""
     limit = f"\n⏰ *{when}까지 결제*해야 좌석이 유지됩니다" if when else ""
-    return (f"🎫 *좌석 선점 완료 — 결제만 남았습니다*\n"
+    head = "🎫 *좌석 선점 완료 — 결제만 남았습니다*"
+
+    if pay_url:
+        head = "🎫 *좌석 선점 완료 — 카카오페이 결제만 누르면 됩니다*"
+        tail = f"\n▶ 휴대폰에서 열어 카카오페이로 결제하세요:\n{pay_url}"
+    else:
+        why = f"\n⚠️ 자동 결제를 마치지 못했습니다: {pay_error}" if pay_error else ""
+        tail = (f"{why}\n▶ CGV 앱/웹에서 예매 진행 중인 건으로 결제를 "
+                f"완료하세요: {BOOKING_URL}")
+
+    return (f"{head}\n"
             f"*{mov_nm}* · CGV {site_nm}\n"
             f"{fmt_date(scn_ymd)} {start_hhmm} · {', '.join(seats_mod.sort_labels(seat_labels))}"
-            f"{amt}{limit}\n"
-            f"▶ CGV 앱/웹에서 예매 진행 중인 건으로 결제를 완료하세요: {BOOKING_URL}")
+            f"{amt}{limit}{tail}")
 
 
 # ── 라이브 구동: CGV 예매 UI를 몰아 선점 (결제 확정 안 함) ────────────────────
@@ -943,3 +1070,271 @@ def hold_block(session, ctx: dict) -> dict:
     detail = f" (화면: {shot})" if shot else ""
     return {"ok": False, "error": f"선점 응답을 확인하지 못했습니다{detail}",
             "seat_labels": chosen}
+
+
+# ── 자동 결제: 카카오페이 결제 요청 ─────────────────────────────────────────
+def parse_amount(text) -> int | None:
+    """'15,000원' → 15000. 숫자가 없으면 None.
+
+    금액은 화면에서 읽는다 — 선점 응답에는 들어 있지 않고, 쿠폰·포인트가 붙으면
+    권종 가격을 우리가 다시 계산해 봐야 어차피 어긋난다.
+    """
+    digits = "".join(ch for ch in str(text or "") if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def kakao_link_from_bridge(body) -> str | None:
+    """카카오페이 브릿지 API 응답에서 **휴대폰용 결제 주소**를 뽑는다.
+
+    응답의 ios_app_url/aos_app_url은 카카오톡을 여는 스킴이고, 그 안의 `url=`
+    파라미터가 브라우저로 열리는 결제 주소다 — 화면의 QR이 담고 있는 것과 같다.
+    카카오톡 스킴(kakaotalk://)을 그대로 보내면 카톡이 깔린 기기에서만 열리고,
+    디스코드에서는 누를 수조차 없다.
+    """
+    if not isinstance(body, dict):
+        return None
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    for key in ("ios_app_url", "aos_app_url"):
+        raw = body.get(key) or ""
+        if not raw:
+            continue
+        query = urlparse(raw.replace("intent://", "https://")).query
+        found = parse_qs(query).get("url")
+        if found and found[0].startswith("http"):
+            # intent:// 형태는 뒤에 '#Intent;...'가 붙어 있다.
+            return unquote(found[0]).split("#Intent")[0]
+    return None
+
+
+def kakao_link_from_frame(url: str) -> str | None:
+    """결제창 iframe 주소에서 결제 주소를 만든다 — 브릿지 API를 못 읽었을 때의 대비.
+
+    iframe 주소는 `.../bridge/pc/reseller/one-time/payment/{hash}` 꼴이고, 그
+    해시가 그대로 휴대폰용 주소에 쓰인다.
+    """
+    text = (url or "").split("?")[0].rstrip("/")
+    if KAKAO_BRIDGE_MARK not in text:
+        return None
+    tail = text.rsplit("/", 1)[-1]
+    # 해시는 64자 hex다. 다른 경로(예: /pc/bridge)를 해시로 착각하면 죽은 링크를
+    # 보내게 되므로 모양을 확인한다.
+    if len(tail) < 32 or not all(c in "0123456789abcdef" for c in tail.lower()):
+        return None
+    return KAKAO_PAY_LINK.format(hash=tail)
+
+
+def bridge_expires_at(body) -> datetime | None:
+    """브릿지 응답의 expired_timestamp → 링크가 죽는 KST 시각. 없으면 None.
+
+    결제 링크는 선점(보통 10분)보다도 짧게(실측 15분) 죽는다. 알림에 만료를 함께
+    적지 않으면 사람이 한참 뒤에 눌러 보고 왜 안 되는지 모른다.
+
+    **epoch처럼 생겼지만 epoch이 아니다.** 카카오페이는 한국 벽시계 시각을 UTC인
+    척 인코딩해서 준다 — 실측에서 15:14:58(KST)에 띄운 결제창의 값이
+    1787758198이었고, 그걸 UTC로 읽으면 15:29:58(= 정확히 15분 뒤)이 나온다.
+    그대로 `fromtimestamp(..., tz=KST)`로 읽으면 9시간 뒤가 되어, 이미 죽은
+    링크를 "아직 유효"로 보여 주게 된다.
+    """
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("expired_timestamp")
+    try:
+        wall = datetime.fromtimestamp(int(raw), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    return wall.replace(tzinfo=KST)
+
+
+def _payment_page_ready(page) -> bool:
+    """결제 화면(결제수단 목록)이 떠 있는지."""
+    try:
+        return page.locator(PAY_LIST_SELECTOR).count() > 0
+    except Exception:  # noqa: BLE001 - 전환 중이면 아직 아닌 것으로 본다
+        return False
+
+
+def _open_payment_page(page) -> bool:
+    """결제 화면까지 밀어 넣는다. 닿으면 True.
+
+    좌석 선택 뒤의 [결제하기]는 선점만 걸고 화면을 그대로 두므로, 결제수단 목록이
+    보일 때까지 같은 버튼을 다시 누른다. 이미 선점된 상태라 다시 눌러도 좌석이
+    이중으로 잡히지 않는다 — 같은 예매 건으로 이어진다.
+    """
+    for _ in range(PAY_PAGE_ROUNDS):
+        if _payment_page_ready(page):
+            return True
+        dismiss_modals(page, rounds=1)
+        buttons = [b for b in page.locator("button", has_text="결제하기").all()
+                   if b.is_visible()]
+        if buttons:
+            try:
+                buttons[-1].click(timeout=4000)
+            except Exception as exc:  # noqa: BLE001 - 다음 바퀴에 다시 본다
+                log.debug("결제 화면으로 넘기는 클릭 실패: %s", exc)
+        page.wait_for_timeout(PAY_PAGE_ROUND_MS)
+    return _payment_page_ready(page)
+
+
+def _choose_pay_method(page, method: str) -> None:
+    """결제수단을 고른다. 못 고르면 RuntimeError.
+
+    **기본값에 기대면 안 된다.** CGV는 그 계정이 **마지막에 쓴 수단**을 미리
+    골라 두므로(searchLastPayknd), 어떤 때는 카카오페이가 이미 켜져 있고 어떤
+    때는 Npay가 켜져 있다 — 실측에서 둘 다 봤다. 안 누르고 넘어가면 엉뚱한
+    수단으로 결제창이 뜬다.
+    """
+    alt = PAY_METHODS.get(method)
+    if not alt:
+        raise RuntimeError(f"모르는 결제수단입니다: {method}")
+    nodes = page.locator(f'{PAY_LIST_SELECTOR} > li:has(img[alt="{alt}"]) button')
+    visible = [n for n in nodes.all() if n.is_visible()]
+    if not visible:
+        raise RuntimeError(f"결제수단에 {alt}가 없습니다 "
+                           f"(이 극장·상품에서 못 쓰는 수단일 수 있습니다)")
+    visible[0].click(timeout=5000)
+    page.wait_for_timeout(1500)
+    if not _pay_method_active(page, alt):
+        raise RuntimeError(f"{alt}를 눌렀지만 선택되지 않았습니다")
+
+
+def _pay_method_active(page, alt: str) -> bool:
+    """그 결제수단이 실제로 골라졌는지 — <li>에 active 표식이 붙었는지 본다."""
+    try:
+        cls = page.evaluate(
+            """(sel) => {
+                 const img = document.querySelector(
+                   sel.list + ' img[alt="' + sel.alt + '"]');
+                 const li = img && img.closest('li');
+                 return li ? li.className : '';
+               }""",
+            {"list": PAY_LIST_SELECTOR, "alt": alt})
+    except Exception:  # noqa: BLE001 - 못 읽으면 확인 못 한 것으로 본다
+        return False
+    return PAY_ACTIVE_MARK in (cls or "")
+
+
+def _agree_terms(page) -> None:
+    """'전체 약관 동의'를 켠다. 안 켜지면 RuntimeError.
+
+    체크박스 자체는 화면에 없고(스타일용으로 숨겨 둔다) 라벨이 눌리는 구조라,
+    input을 직접 누르려 하면 "not visible"로 타임아웃까지 기다렸다 죽는다.
+    """
+    try:
+        page.locator(TERMS_ALL_LABEL).first.click(timeout=4000)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"약관 동의를 누르지 못했습니다: {exc}") from exc
+    page.wait_for_timeout(800)
+    try:
+        checked = page.evaluate(
+            "(sel) => { const el = document.querySelector(sel);"
+            "           return el ? el.checked : null; }", TERMS_ALL_INPUT)
+    except Exception:  # noqa: BLE001
+        checked = None
+    if checked is False:
+        raise RuntimeError("약관 동의가 켜지지 않았습니다")
+
+
+def _read_amount(page) -> int | None:
+    try:
+        text = page.locator(FINAL_AMOUNT_SELECTOR).first.text_content()
+    except Exception:  # noqa: BLE001 - 금액은 있으면 좋은 값이지 필수는 아니다
+        return None
+    return parse_amount(text)
+
+
+def _click_final_pay(page) -> None:
+    """최종 [N원 결제하기]를 누른다.
+
+    이 화면에도 '결제하기'라는 글자가 여럿 있어서, **금액이 함께 적힌** 버튼만
+    고른다 — 그게 PG로 넘기는 버튼이다.
+    """
+    buttons = [b for b in page.locator("button", has_text="결제하기").all()
+               if b.is_visible() and "원" in (b.inner_text() or "")]
+    if not buttons:
+        raise RuntimeError("최종 결제 버튼을 찾지 못했습니다")
+    buttons[0].click(timeout=5000)
+
+
+def _wait_for_bridge(page, timeout_ms: int = PAY_BRIDGE_WAIT_MS):
+    """카카오페이 결제창(iframe)이 뜰 때까지 기다린다. 그 프레임을 돌려준다."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            for frame in page.frames:
+                if KAKAO_BRIDGE_MARK in (frame.url or ""):
+                    return frame
+        except Exception:  # noqa: BLE001 - 프레임 목록이 바뀌는 중일 수 있다
+            pass
+        page.wait_for_timeout(500)
+    return None
+
+
+def pay_block(session, ctx: dict, *, method: str = DEFAULT_PAY_METHOD) -> dict:
+    """선점된 예매 건을 결제 화면까지 몰아 **카카오페이 결제 링크**를 받아 온다.
+
+    hold_block이 끝난 **직후의 같은 페이지**에서 이어서 돈다. 반환:
+      {ok, pay_url, pay_expires_at, amount, method, error}
+
+    카카오페이 인증(카톡 승인·비밀번호)은 하지 않는다 — 할 수도 없고, 그게 이
+    설계의 요점이다. 결제창이 뜨면 거기 담긴 휴대폰용 주소만 챙겨서 나온다.
+    """
+    import json as _json
+
+    page = session.page
+    captured: dict = {}
+
+    def on_resp(r):
+        url = r.url or ""
+        if KAKAO_BRIDGE_MARK not in url and "kakaopay.com" not in url:
+            return
+        if KAKAO_BRIDGE_API_MARK not in url:
+            return
+        try:
+            body = _json.loads(r.text())
+        except Exception:  # noqa: BLE001 - HTML이면 우리가 찾는 응답이 아니다
+            return
+        if isinstance(body, dict) and body.get("tid"):
+            captured.setdefault("bridge", body)
+    page.on("response", on_resp)
+
+    try:
+        if not _open_payment_page(page):
+            raise RuntimeError("결제 화면으로 넘어가지 못했습니다")
+        _choose_pay_method(page, method)
+        amount = _read_amount(page)
+        _agree_terms(page)
+        _click_final_pay(page)
+        frame = _wait_for_bridge(page)
+        if frame is None:
+            raise RuntimeError("카카오페이 결제창이 뜨지 않았습니다")
+        # 브릿지 응답이 프레임보다 늦게 올 수 있다. **리스너를 떼기 전에** 기다려야
+        # 한다 — 떼고 나서 기다리면 그 사이 온 응답을 아무도 받지 않는다.
+        # 못 받아도 프레임 주소로 같은 링크를 만들 수 있으니 오래 끌지는 않는다.
+        for _ in range(10):
+            if captured.get("bridge"):
+                break
+            page.wait_for_timeout(500)
+    except Exception as exc:  # noqa: BLE001 - 결제 요청 실패는 선점을 무르지 않는다
+        shot = _save_screenshot(page, ctx)
+        detail = f" (화면: {shot})" if shot else ""
+        return {"ok": False, "method": method, "pay_url": None,
+                "pay_expires_at": None, "amount": None,
+                "error": f"{exc}{detail}"}
+    finally:
+        try:
+            page.remove_listener("response", on_resp)
+        except Exception:  # noqa: BLE001
+            pass
+
+    body = captured.get("bridge")
+    pay_url = kakao_link_from_bridge(body) or kakao_link_from_frame(frame.url)
+    if not pay_url:
+        shot = _save_screenshot(page, ctx)
+        return {"ok": False, "method": method, "pay_url": None,
+                "pay_expires_at": None, "amount": amount,
+                "error": "결제창은 떴지만 결제 링크를 읽지 못했습니다"
+                         + (f" (화면: {shot})" if shot else "")}
+    return {"ok": True, "method": method, "pay_url": pay_url,
+            "pay_expires_at": bridge_expires_at(body), "amount": amount,
+            "error": ""}

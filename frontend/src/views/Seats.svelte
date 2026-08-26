@@ -32,6 +32,7 @@
   let rowsText = $state('')
   let minConsecutive = $state(0) // 0·1 = 개별 좌석, 2+ = 나란히 붙은 N석
   let autoBook = $state(false) // 좌석 확보 시 자동 선점
+  let autoPay = $state(false) // 선점에 이어 카카오페이 결제까지 요청
   let partySize = $state(1) // 잡을 좌석 수(인원)
   let types = $state(new Set())
   let savingWatch = $state(false)
@@ -179,10 +180,13 @@
         scn_time_to: timeMode === 'range' ? timeTo : '',
         min_consecutive: Number(minConsecutive) || 0,
         auto_book: autoBook,
+        auto_pay: autoBook && autoPay,
         party_size: Number(partySize) || 1,
         ticket_spec: autoBook ? { adult: Number(partySize) || 1 } : {},
       })
-      watchMsg = autoBook ? '좌석 감시를 추가했습니다 (자동 예매 켜짐)' : '좌석 감시를 추가했습니다'
+      watchMsg = autoBook
+        ? `좌석 감시를 추가했습니다 (자동 예매 켜짐${autoPay ? ' · 카카오페이 결제까지' : ''})`
+        : '좌석 감시를 추가했습니다'
       rowsText = ''
       await loadWatches()
     } catch (exc) {
@@ -212,6 +216,20 @@
   function fmtYmd(s) {
     // 20260825 → 2026-08-25
     return s?.length === 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6)}` : s
+  }
+
+  function payLinkAlive(b) {
+    // 카카오페이 결제 링크는 몇 분 만에 죽는다. 죽은 링크를 눌러 보게 두면
+    // 결제가 안 되는 이유를 오해하게 되므로, 만료가 지났으면 링크를 감춘다.
+    //
+    // **선점 만료도 함께 본다.** 실측에서 선점은 5분 남짓, 링크는 15분을 버텼다 —
+    // 링크만 보면 좌석이 풀린 뒤에도 "결제하기"를 내주게 된다.
+    if (!b.pay_url) return false
+    const deadlines = [b.pay_expires_at, b.hold_expires_at]
+      .filter(Boolean)
+      .map((t) => new Date(t).getTime())
+    if (!deadlines.length) return true
+    return Math.min(...deadlines) > Date.now()
   }
 
   const statusBadge = $derived.by(() => {
@@ -422,10 +440,18 @@
             {/each}
           </select>
         </div>
+        <label class="check small">
+          <input id="s-autopay" type="checkbox" bind:checked={autoPay} />
+          선점에 이어 <strong>카카오페이 결제까지 요청</strong>하고 결제 링크를 보냅니다
+        </label>
       {/if}
       <div class="small muted">
         {#if !account.linked}
           먼저 위에서 CGV 계정을 연동하세요.
+        {:else if autoBook && autoPay}
+          ⚠️ 실제로 좌석을 잡고 카카오페이 결제창까지 띄웁니다. <strong>마지막 승인은
+          직접</strong> 하셔야 합니다 — 알림으로 온 링크를 휴대폰에서 열어 카카오페이
+          인증을 마치면 결제가 끝납니다. 링크는 몇 분 뒤 만료됩니다.
         {:else}
           ⚠️ 실제로 좌석을 잡습니다. <strong>결제 확정은 직접</strong> 하셔야 하며,
           선점 후 알림의 안내대로 만료 전에 결제를 완료하세요.
@@ -473,6 +499,7 @@
             <td>
               {#if w.auto_book}
                 <span class="badge accent">성인 {w.party_size}</span>
+                {#if w.auto_pay}<span class="badge">카카오페이</span>{/if}
               {:else}
                 <span class="small muted">끔</span>
               {/if}
@@ -510,6 +537,17 @@
             <td>
               {#if b.status === 'held'}
                 <span class="badge ok">선점됨 — 결제 필요</span>
+                {#if b.pay_url}
+                  {#if payLinkAlive(b)}
+                    <a class="small" href={b.pay_url} target="_blank" rel="noreferrer">
+                      카카오페이로 결제
+                    </a>
+                  {:else}
+                    <span class="small muted">결제 링크 만료됨</span>
+                  {/if}
+                {:else if b.pay_error}
+                  <span class="small muted" title={b.pay_error}>자동 결제 실패</span>
+                {/if}
               {:else if b.status === 'failed'}
                 <span class="badge warn" title={b.last_error}>실패</span>
               {:else if b.status === 'expired'}

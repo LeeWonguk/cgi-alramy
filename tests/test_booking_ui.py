@@ -903,10 +903,26 @@ class TestPaymentTripwire(unittest.TestCase):
         self.assertIsNone(booking.payment_mark(url))
 
     def test_payment_paths_are_flagged(self):
-        for url in ("https://cgv.co.kr/api/v1/pay/ready",
-                    "https://cgv.co.kr/api/v1/booking/movAtktPayApprov",
-                    "https://cgv.co.kr/api/v1/order/approvePayment"):
+        for url in ("https://cgv.co.kr/api/v1/booking/movAtktPayApprov",
+                    "https://cgv.co.kr/api/v1/order/approvePayment",
+                    "https://onepg.cjsystems.co.kr/v2/pay/kakaoPay/"
+                    "authCertType/KKC260826151458419A9/0000"):
             self.assertIsNotNone(booking.payment_mark(url), url)
+
+    def test_drawing_the_payment_screen_is_not_an_approval(self):
+        """결제 화면을 **그리기만 하는** 조회는 걸리면 안 된다.
+
+        예전에는 '/pay/'가 표식에 있어서 `payment/pay/searchCrdCocdList` 같은
+        조회에도 걸렸다. 그 조회들은 선점 +9초쯤에 나가고 감시 구간은 +5초라
+        지금까지 안 걸린 건 타이밍 운이었을 뿐이다 — 걸렸다면 성공한 선점이
+        "결제 계열 요청 감지"로 되돌려졌다.
+        """
+        for url in ("https://cgv.co.kr/api/v1/payment/pay/searchCrdCocdList",
+                    "https://cgv.co.kr/api/v1/payment/pay/searchGroupedPaymdList"
+                    "?siteNo=0013",
+                    "https://cgv.co.kr/api/v1/payment/mpy/searchLastPayknd",
+                    "https://cgv.co.kr/api/v1/payment/pay/commonGetPayId"):
+            self.assertIsNone(booking.payment_mark(url), url)
 
     def test_ordinary_traffic_is_not_flagged(self):
         for url in ("https://cgv.co.kr/api/v1/booking/searchSchByMov",
@@ -926,6 +942,136 @@ class TestScreenshotIsBestEffort(unittest.TestCase):
         self.assertIsNone(
             booking._save_screenshot(self.BrokenPage(),
                                      {"mov_nm": "오디세이", "start_hhmm": "18:00"}))
+
+
+class TestPaymentAmount(unittest.TestCase):
+    def test_reads_the_won_amount(self):
+        self.assertEqual(booking.parse_amount("15,000원"), 15000)
+        self.assertEqual(booking.parse_amount("21,000원"), 21000)
+
+    def test_no_digits_is_none(self):
+        self.assertIsNone(booking.parse_amount(""))
+        self.assertIsNone(booking.parse_amount(None))
+        self.assertIsNone(booking.parse_amount("금액 없음"))
+
+
+class TestKakaoPayLink(unittest.TestCase):
+    """결제창에서 **휴대폰으로 열 링크**를 뽑아내는 부분.
+
+    실측(2026-08)한 브릿지 응답 모양을 그대로 쓴다. 카카오톡 스킴을 그대로
+    보내면 디스코드에서 누를 수조차 없으므로, 그 안의 https 주소를 꺼내야 한다.
+    """
+
+    HASH = "7fa7d5e7ceb4459d68bb44b2d36d90bdf789f2a7d645bacc9ad005c654fb4bd1"
+    LINK = f"https://online-pay.kakaopay.com/pay/r1/{HASH}"
+
+    def _bridge(self, **over):
+        body = {
+            "tid": "ta8e84623dfd7ad169de",
+            "ios_app_url": (
+                "kakaotalk://kakaopay/pg?payweb_talk_min_version=11.3.0"
+                "&payweb_url=https%3A%2F%2Fonline-payment.kakaopay.com%2Fpay"
+                f"&url={self.LINK}"),
+            "aos_app_url": (
+                "intent://kakaopay/pg?payweb_talk_min_version=11.3.0"
+                f"&url={self.LINK}#Intent;scheme=kakaotalk;"
+                "package=com.kakao.talk;end"),
+            "expired_timestamp": 1787758198,
+        }
+        body.update(over)
+        return body
+
+    def test_takes_the_browser_url_out_of_the_app_scheme(self):
+        self.assertEqual(booking.kakao_link_from_bridge(self._bridge()), self.LINK)
+
+    def test_intent_tail_is_stripped(self):
+        body = self._bridge(ios_app_url="")
+        self.assertEqual(booking.kakao_link_from_bridge(body), self.LINK)
+
+    def test_missing_body_is_none(self):
+        self.assertIsNone(booking.kakao_link_from_bridge(None))
+        self.assertIsNone(booking.kakao_link_from_bridge({}))
+
+    def test_builds_the_link_from_the_frame_url_as_a_fallback(self):
+        frame = ("https://online-payment.kakaopay.com/bridge/pc/reseller/"
+                 f"one-time/payment/{self.HASH}")
+        self.assertEqual(booking.kakao_link_from_frame(frame), self.LINK)
+
+    def test_a_path_that_is_not_a_hash_is_refused(self):
+        """해시가 아닌 꼬리를 링크로 만들면 죽은 주소를 사람에게 보내게 된다."""
+        self.assertIsNone(booking.kakao_link_from_frame(
+            "https://online-payment.kakaopay.com/bridge/pc/bridge"))
+        self.assertIsNone(booking.kakao_link_from_frame(
+            "https://cgv.co.kr/mpy/main"))
+        self.assertIsNone(booking.kakao_link_from_frame(""))
+
+    def test_expiry_is_the_korean_wall_clock_kakao_meant(self):
+        """epoch처럼 생겼지만 epoch이 아니다 — 한국 벽시계를 UTC인 척 담아 준다.
+
+        실측: 15:14:58(KST)에 띄운 결제창의 값이 1787758198이었고, 결제창은
+        15분 뒤에 죽는다. 그대로 epoch으로 읽으면 9시간 뒤가 되어 **이미 죽은
+        링크를 아직 유효한 것처럼** 보여 주게 된다.
+        """
+        from datetime import datetime
+
+        got = booking.bridge_expires_at(self._bridge())
+        self.assertIsNotNone(got)
+        self.assertEqual(got.tzinfo.key, "Asia/Seoul")
+        self.assertEqual(got.replace(tzinfo=None),
+                         datetime(2026, 8, 26, 15, 29, 58))
+
+    def test_expiry_missing_or_broken_is_none(self):
+        self.assertIsNone(booking.bridge_expires_at({}))
+        self.assertIsNone(booking.bridge_expires_at({"expired_timestamp": "?"}))
+
+
+class TestHoldAlertWithPayLink(unittest.TestCase):
+    """알림은 사람이 다음에 무엇을 할지 정한다 — 링크가 있으면 그게 전부다."""
+
+    def _msg(self, **kw):
+        return booking.build_hold_alert(
+            "오디세이", "용산아이파크몰", "20260828", "25:30", ["N15"],
+            booking._parse_limit_dt("20260826151316"), 15000, **kw)
+
+    def test_link_is_shown_when_payment_was_requested(self):
+        link = "https://online-pay.kakaopay.com/pay/r1/abc123"
+        msg = self._msg(pay_url=link,
+                        pay_expires_at=booking._parse_limit_dt("20260826152958"))
+        self.assertIn(link, msg)
+        self.assertIn("카카오페이", msg)
+
+    def test_the_deadline_is_whichever_dies_first(self):
+        """실측에서 선점은 5분 남짓, 링크는 15분을 버텼다.
+
+        링크 만료(15:29)만 적으면 좌석이 풀린 뒤(15:13)에도 아직 시간이 있는 줄
+        알고 결제를 시도하게 된다. 마감은 하나만, 이른 쪽으로 적는다.
+        """
+        msg = self._msg(pay_url="https://online-pay.kakaopay.com/pay/r1/abc123",
+                        pay_expires_at=booking._parse_limit_dt("20260826152958"))
+        self.assertIn("15:13까지", msg)      # 선점이 먼저 죽는다
+        self.assertNotIn("15:29", msg)
+
+    def test_a_link_that_dies_first_is_the_deadline_instead(self):
+        msg = booking.build_hold_alert(
+            "오디세이", "용산", "20260828", "25:30", ["N15"],
+            booking._parse_limit_dt("20260826160000"), 15000,
+            pay_url="https://online-pay.kakaopay.com/pay/r1/abc123",
+            pay_expires_at=booking._parse_limit_dt("20260826154500"))
+        self.assertIn("15:45까지", msg)
+        self.assertNotIn("16:00", msg)
+
+    def test_without_a_link_it_still_points_at_cgv(self):
+        from watch import BOOKING_URL
+
+        msg = self._msg()
+        self.assertIn(BOOKING_URL, msg)
+        self.assertNotIn("kakaopay", msg)
+
+    def test_a_failed_payment_says_why(self):
+        msg = self._msg(pay_error="결제 화면으로 넘어가지 못했습니다")
+        self.assertIn("결제 화면으로 넘어가지 못했습니다", msg)
+        # 링크가 없으면 사람이 CGV에서 마쳐야 한다 — 그 안내가 사라지면 안 된다.
+        self.assertIn("CGV", msg)
 
 
 if __name__ == "__main__":

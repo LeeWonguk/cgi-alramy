@@ -607,7 +607,11 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
             if act == "held":
                 alerts.append({"kind": "book_held", "body": booking.build_hold_alert(
                     mov_nm, site_nm, w["scn_ymd"], start_hhmm, outcome["seats"],
-                    outcome.get("hold_expires_at"), outcome.get("amount"))})
+                    outcome.get("hold_expires_at"), outcome.get("amount"),
+                    # 자동 결제를 켠 감시면 카카오페이 결제 링크가 함께 온다.
+                    pay_url=outcome.get("pay_url"),
+                    pay_expires_at=outcome.get("pay_expires_at"),
+                    pay_error=outcome.get("pay_error"))})
                 # 선점 성공 시 이 감시는 비활성화됐다 — 남은 회차는 보지 않는다.
                 break
             elif act == "failed":

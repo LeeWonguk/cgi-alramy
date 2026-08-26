@@ -195,6 +195,8 @@ def seat_watch_view(row: dict) -> dict:
         "rows": row["rows"] or [],
         "min_consecutive": row["min_consecutive"] or 0,
         "auto_book": row["auto_book"],
+        "auto_pay": row["auto_pay"],
+        "pay_method": row["pay_method"] or store.DEFAULT_PAY_METHOD,
         "party_size": row["party_size"] or 1,
         "ticket_spec": row["ticket_spec"] or {},
         "enabled": row["enabled"],
@@ -216,6 +218,12 @@ def booking_view(row: dict) -> dict:
         "hold_expires_at": row["hold_expires_at"],
         "last_error": row["last_error"],
         "created_at": row["created_at"],
+        # 자동 결제를 켠 감시에서만 채워진다. 링크는 몇 분 만에 죽으므로 화면이
+        # 만료를 함께 보여 줘야 한다.
+        "pay_method": row["pay_method"],
+        "pay_url": row["pay_url"],
+        "pay_expires_at": row["pay_expires_at"],
+        "pay_error": row["pay_error"],
     }
 
 
@@ -713,6 +721,8 @@ def register_api(app: Flask) -> None:
         # 자동 예매는 CGV 로그인이 연동돼 있어야 의미가 있다.
         if auto_book and store.cgv_account(me()["id"]) is None:
             return fail("자동 예매를 켜려면 먼저 CGV 계정을 연동하세요")
+        if data.get("auto_pay") and not auto_book:
+            return fail("자동 결제는 자동 예매를 켠 감시에서만 쓸 수 있습니다")
         try:
             row = store.add_seat_watch(
                 me()["id"], movie, site, scn_ymd,
@@ -720,6 +730,8 @@ def register_api(app: Flask) -> None:
                 min_consecutive=data.get("min_consecutive", 0),
                 auto_book=auto_book, party_size=data.get("party_size", 1),
                 ticket_spec=data.get("ticket_spec"),
+                auto_pay=bool(data.get("auto_pay")),
+                pay_method=data.get("pay_method"),
                 scn_time=data.get("scn_time", ""),
                 scn_time_from=data.get("scn_time_from", ""),
                 scn_time_to=data.get("scn_time_to", ""))
@@ -737,9 +749,15 @@ def register_api(app: Flask) -> None:
         data = body()
         if data.get("auto_book") and store.cgv_account(me()["id"]) is None:
             return fail("자동 예매를 켜려면 먼저 CGV 계정을 연동하세요")
+        # 자동 결제만 켜고 자동 예매는 끈 상태는 만들 수 없다. 이 요청에 auto_book이
+        # 없으면 지금 저장된 값을 기준으로 본다.
+        if data.get("auto_pay"):
+            book_on = bool(data.get("auto_book", existing.get("auto_book")))
+            if not book_on:
+                return fail("자동 결제는 자동 예매를 켠 감시에서만 쓸 수 있습니다")
         fields = {k: data[k] for k in
-                  ("enabled", "auto_book", "party_size", "min_consecutive",
-                   "ticket_spec") if k in data}
+                  ("enabled", "auto_book", "auto_pay", "pay_method",
+                   "party_size", "min_consecutive", "ticket_spec") if k in data}
         try:
             row = store.set_seat_watch(watch_id, owner_id=me()["id"], **fields)
         except (TypeError, ValueError) as exc:
