@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,6 +30,7 @@ log = logging.getLogger("cgv-watch.booking")
 
 SEAT_HOLD_URL_MARK = "seatTemp/seatTempPrmp"
 
+BOOKING_PAGE = "https://cgv.co.kr/cnm/movieBook/movie"
 # '결제하기'를 누르는 것이 **선점까지만** 한다는 전제 위에 이 모듈의 안전성이
 # 통째로 서 있다. CGV가 그 버튼의 뜻을 바꾸면 우리는 아무것도 눈치채지 못한 채
 # 돈을 쓰게 된다 — 코드가 스스로 알아챌 수 있는 유일한 지점이 그때 나가는
@@ -79,6 +81,12 @@ DATE_ACTIVE_MARK = "itemActive"
 # 없이는 사후에 가릴 수 없다.
 SHOT_DIR = Path(__file__).resolve().parent / "logs" / "booking"
 
+# 좌석 고르기 재시도. 한 바퀴가 [배치도 다시 읽기 → 고르기 → 클릭]이라 1초 안쪽이니
+# 몇 번을 돌아도 싸다. 다만 여기서 오래 끌 이유는 없다 — 이 시각을 넘길 만큼
+# 경쟁이 심하면 어차피 다음 사이클에 다시 본다.
+SEAT_PICK_ATTEMPTS = 3
+SEAT_PICK_DEADLINE = 10.0  # 초
+
 
 def _fmt_hhmm(scnsrt: str) -> str:
     """'2210' → '22:10'. 이미 콜론이 있으면 그대로."""
@@ -104,12 +112,16 @@ def _parse_limit_dt(raw: str):
 
 
 def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
-                  *, mov_nm: str = "", site_nm: str = "",
+                  *, mov_nm: str = "", site_nm: str = "", site_no: str = "",
                   hold_fn=None, dry_run: bool = False) -> dict:
     """감시 하나의 한 회차에서 자동 선점을 시도한다.
 
     반환: {"action": skip|held|failed|no_seats, ...}. hold_fn(session, ctx)->result 를
     주입하면 라이브 구동 대신 그걸 쓴다(테스트용). 기본은 hold_block.
+
+    여기서 고르는 좌석은 **후보**다. 감지 때 읽은 배치도는 UI를 모는 동안 낡으므로,
+    실제로 누를 좌석은 좌석맵에 도착해서 다시 고른다(hold_block → _select_block).
+    그래서 이력에 남는 좌석도 hold가 실제로 고른 것으로 덮어쓴다.
     """
     if not watch.get("auto_book"):
         return {"action": "skip", "reason": "auto_book off"}
@@ -140,6 +152,8 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
 
     ctx = {"mov_nm": mov_nm, "site_nm": site_nm, "scn_ymd": watch["scn_ymd"],
            "start_hhmm": start_hhmm, "seat_labels": labels, "party": party,
+           # 좌석맵에서 다시 고를 때 쓴다 — 후보와 같은 조건이어야 한다.
+           "rows": watch.get("rows"), "site_no": site_no,
            # 같은 시각의 회차가 여러 상영관에 있을 때 어느 쪽인지 가리는 데 쓴다.
            "scns_nm": row.get("expoScnsNm") or row.get("scnsNm") or "",
            "row": row}
@@ -152,22 +166,26 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
         return {"action": "failed", "error": str(exc), "attempt_id": attempt_id,
                 "seats": labels}
 
+    # hold가 좌석맵에서 다시 골랐으면 그쪽이 실제로 누른 좌석이다. 알림과 이력이
+    # 후보를 그대로 적으면 사용자가 받은 문구와 실제 잡힌 자리가 어긋난다.
+    final = list(result.get("seat_labels") or labels)
+
     if result.get("ok"):
         store.finish_booking_attempt(
             attempt_id, "held", mov_atkt_no=result.get("mov_atkt_no"),
-            amount=result.get("amount"),
+            amount=result.get("amount"), seat_labels=final,
             hold_expires_at=result.get("hold_expires_at"))
         # 선점에 성공하면 그 감시는 꺼서 중복 선점을 막는다.
         store.set_seat_watch(watch_id, enabled=False)
-        return {"action": "held", "attempt_id": attempt_id, "seats": labels,
+        return {"action": "held", "attempt_id": attempt_id, "seats": final,
                 "mov_atkt_no": result.get("mov_atkt_no"),
                 "hold_expires_at": result.get("hold_expires_at"),
                 "amount": result.get("amount")}
 
-    store.finish_booking_attempt(attempt_id, "failed",
+    store.finish_booking_attempt(attempt_id, "failed", seat_labels=final,
                                  error=result.get("error") or "선점 실패")
     return {"action": "failed", "error": result.get("error"),
-            "attempt_id": attempt_id, "seats": labels}
+            "attempt_id": attempt_id, "seats": final}
 
 
 def build_hold_alert(mov_nm: str, site_nm: str, scn_ymd: str, start_hhmm: str,
@@ -347,20 +365,114 @@ def _click_showtime_node(node, start_hhmm: str) -> None:
     node.click(timeout=6000)
 
 
-def _pick_seats(page, seat_labels) -> list[str]:
-    """좌석맵에서 지정한 좌석을 하나씩 누른다. 못 누른 좌석 라벨을 돌려준다.
+def _pick_seats(page, seat_labels) -> tuple[list[str], list[str]]:
+    """좌석맵에서 지정한 좌석을 하나씩 누른다.
 
     한 좌석이 실패해도 나머지는 마저 눌러 본다 — 무엇이 팔렸는지 전부 알아야
     쓸 만한 오류 문구가 나오고, 어차피 여기서는 아직 아무것도 선점되지 않는다.
+    **무엇을 눌렀는지도 함께 돌려준다.** 다시 고를 수 있는지가 여기에 달렸다:
+    하나도 못 눌렀으면 화면에 아무 흔적이 없어 그냥 다시 고르면 되지만, 일부가
+    이미 선택돼 있으면 인원수를 넘겨 엉뚱한 자리를 선점할 수 있다.
     """
-    missed = []
+    clicked, missed = [], []
     for label in seat_labels:
         try:
             page.get_by_text(label, exact=True).last.click(timeout=3000)
         except Exception as exc:  # noqa: BLE001 - 못 누른 좌석은 모아서 보고
             log.warning("좌석 %s 클릭 실패: %s", label, exc)
             missed.append(label)
-    return missed
+        else:
+            clicked.append(label)
+    return clicked, missed
+
+
+def live_seats(session, ctx: dict) -> list[dict]:
+    """이 회차의 좌석 배치도를 **지금** 다시 읽는다.
+
+    같은 오리진 fetch라 0.2~0.3초다. 감지 때 읽은 목록으로 그냥 클릭하면, UI를
+    모는 30초 남짓이 통째로 경쟁 구간이 된다 — auto-book이 "그 사이 팔린 것
+    같습니다"로 끝나던 주된 이유다.
+    """
+    row = ctx["row"]
+    data = session.seat_map(
+        site_no=row.get("siteNo") or ctx.get("site_no") or "",
+        scns_no=row["scnsNo"], ymd=ctx["scn_ymd"], scn_sseq=row["scnSseq"])
+    return seats_mod.parse_seats(data)
+
+
+def _select_block(session, page, ctx: dict, *, seats_fn=None) -> dict:
+    """좌석맵에서 지금 비어 있는 블록을 골라 누른다.
+
+    반환: {"ok": bool, "labels": [...], "error": str}
+
+    한 바퀴는 [좌석맵 다시 읽기 → pick_block → 클릭]이다. 읽고 누르기까지가
+    1초 안쪽이라, 못 누르는 일 자체가 드물어진다. 그래도 밀렸다면 **하나도 못
+    눌렀을 때만** 다시 고른다 — 일부가 이미 선택된 채로 다른 블록을 누르면
+    인원수를 넘겨 엉뚱한 자리를 선점하게 되고, 그건 안 잡느니만 못하다.
+
+    seats_fn을 주입하면 브라우저 없이 이 판단만 시험할 수 있다.
+    """
+    seats_fn = seats_fn or live_seats
+    party = ctx["party"]
+    candidate = list(ctx.get("seat_labels") or [])
+    deadline = time.monotonic() + SEAT_PICK_DEADLINE
+    shot: str | None = None
+    shot_saved = False
+    last_error = "좌석을 고르지 못했습니다"
+
+    for attempt in range(1, SEAT_PICK_ATTEMPTS + 1):
+        blind = False
+        try:
+            live = seats_fn(session, ctx)
+        except Exception as exc:  # noqa: BLE001 - 다시 못 읽어도 시도는 해 본다
+            log.warning("좌석 배치도를 다시 읽지 못했습니다 (%s) — 감지 때 고른 "
+                        "좌석으로 진행합니다", exc)
+            live, blind = None, True
+
+        if blind:
+            labels = candidate
+            if not labels:
+                return {"ok": False, "labels": [],
+                        "error": "좌석 배치도를 읽지 못했습니다"}
+        else:
+            block = seats_mod.pick_block(live, party, ctx.get("rows"))
+            if len(block) < party:
+                # 후보를 고른 뒤 여기 오는 사이에 다 팔린 것이다. 낡은 좌석을
+                # 눌러 보는 것보다 사실대로 끝내는 편이 낫다.
+                return {"ok": False, "labels": [],
+                        "error": f"{party}석 연속 빈자리가 사라졌습니다 "
+                                 f"(좌석맵을 다시 읽었습니다)"}
+            labels = [s["label"] for s in block]
+            if labels != candidate:
+                log.info("좌석을 다시 골랐습니다: %s → %s",
+                         ", ".join(candidate) or "(없음)", ", ".join(labels))
+
+        clicked, missed = _pick_seats(page, labels)
+        if not missed:
+            return {"ok": True, "labels": labels, "error": ""}
+
+        last_error = _partial_seats_error(labels, missed)
+        if not shot_saved:
+            # 셀렉터가 깨진 건지 정말 팔린 건지는 화면 없이 사후에 못 가린다.
+            # 이 경로만 스크린샷을 안 남기고 있어서 원인을 좁힐 수가 없었다.
+            shot = _save_screenshot(page, ctx)
+            shot_saved = True
+
+        if clicked:
+            log.warning("좌석 %s는 골라졌고 %s는 못 골랐습니다 — 되돌릴 수단이 "
+                        "확실하지 않아 다시 고르지 않습니다",
+                        ", ".join(clicked), ", ".join(missed))
+            break
+        if blind or time.monotonic() >= deadline:
+            break
+        log.info("좌석을 다시 골라 재시도합니다 (%d/%d)",
+                 attempt + 1, SEAT_PICK_ATTEMPTS)
+
+    if shot:
+        # 배치도를 방금 읽고 눌렀는데도 실패했다면 정말 밀린 것일 수도, 좌석
+        # 셀렉터가 깨진 것일 수도 있다. 어느 쪽인지는 이 화면을 봐야 안다.
+        last_error += f" (화면: {shot})"
+    return {"ok": False, "labels": [], "error": last_error}
 
 
 def _partial_seats_error(wanted, missed) -> str:
@@ -436,6 +548,8 @@ def hold_block(session, ctx: dict) -> dict:
 
     page = session.page
     captured = {}
+    # 좌석맵에 닿기 전에 죽으면 후보가 곧 '시도한 좌석'이다.
+    chosen = list(ctx.get("seat_labels") or [])
 
     def on_resp(r):
         if SEAT_HOLD_URL_MARK in r.url:
@@ -451,16 +565,15 @@ def hold_block(session, ctx: dict) -> dict:
     page.on("response", on_resp)
 
     try:
-        page.goto("https://cgv.co.kr/cnm/movieBook/movie",
-                  wait_until="domcontentloaded", timeout=40000)
+        page.goto(BOOKING_PAGE, wait_until="domcontentloaded", timeout=40000)
         page.wait_for_timeout(3500)
         page.get_by_text(ctx["mov_nm"], exact=True).first.click(timeout=10000)
         page.wait_for_timeout(2500)
         page.get_by_text(ctx["site_nm"], exact=False).first.click(timeout=6000)
         page.wait_for_timeout(2500)
-        # 날짜를 먼저 고른다. 이 화면은 기본이 **오늘**이라, 건너뛰면 오늘 상영표에서
-        # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한 날짜를
-        # 선점한다.
+        # 날짜를 고른다. 이 화면은 기본이 **오늘**이라, 건너뛰면 오늘 상영표에서
+        # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한
+        # 날짜를 선점한다.
         _click_date(page, ctx["scn_ymd"])
         _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""))
         page.wait_for_timeout(5000)
@@ -479,10 +592,13 @@ def hold_block(session, ctx: dict) -> dict:
         except Exception:  # noqa: BLE001
             pass
         page.wait_for_timeout(1500)
-        missed = _pick_seats(page, ctx["seat_labels"])
-        if missed:
-            return {"ok": False, "error": _partial_seats_error(
-                ctx["seat_labels"], missed)}
+        # 좌석은 **여기 도착해서** 다시 고른다. 감지 때 읽은 배치도는 위의 화면
+        # 전환을 지나오는 30초 남짓 동안 낡는다.
+        picked = _select_block(session, page, ctx)
+        if not picked["ok"]:
+            return {"ok": False, "error": picked["error"],
+                    "seat_labels": picked["labels"]}
+        chosen = picked["labels"]
         page.get_by_role("button", name="선택완료").first.click(timeout=4000)
         page.wait_for_timeout(2500)
         # 결제하기 클릭 = 선점 트리거 (여기까지만! 결제 확정/푸시는 안 한다)
@@ -499,7 +615,8 @@ def hold_block(session, ctx: dict) -> dict:
                       "— CGV 예매 내역을 확인하세요 (요청: %s)",
                       captured["payment_url"])
             detail += " · 결제 계열 요청이 감지됐습니다 — CGV 예매 내역을 확인하세요"
-        return {"ok": False, "error": f"UI 구동 실패: {exc}{detail}"}
+        return {"ok": False, "error": f"UI 구동 실패: {exc}{detail}",
+                "seat_labels": chosen}
     finally:
         try:
             page.remove_listener("response", on_resp)
@@ -518,17 +635,19 @@ def hold_block(session, ctx: dict) -> dict:
         return {"ok": False, "error":
                 "결제 계열 요청이 감지돼 중단했습니다 — CGV 예매 내역을 직접 "
                 "확인하세요. 화면 구성이 바뀐 것일 수 있으니 자동 예매를 "
-                "잠시 꺼 두는 편이 안전합니다."}
+                "잠시 꺼 두는 편이 안전합니다.", "seat_labels": chosen}
 
     body = captured.get("body") or {}
     data = (body.get("data") or {}) if isinstance(body, dict) else {}
     if data.get("resultCode") in ("0", 0):
         return {
             "ok": True,
+            "seat_labels": chosen,
             "mov_atkt_no": data.get("movAtktNo"),
             "hold_expires_at": _parse_limit_dt(data.get("seatTempPrmpLimitDt")),
             "amount": None,  # 금액은 후속 단계에서 searchMovAtktSeatPrcList로 채운다
         }
     shot = _save_screenshot(page, ctx)
     detail = f" (화면: {shot})" if shot else ""
-    return {"ok": False, "error": f"선점 응답을 확인하지 못했습니다{detail}"}
+    return {"ok": False, "error": f"선점 응답을 확인하지 못했습니다{detail}",
+            "seat_labels": chosen}

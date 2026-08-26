@@ -984,17 +984,28 @@ def finish_booking_attempt(attempt_id: int, status: str, *,
                            mov_atkt_no: str | None = None,
                            amount: int | None = None,
                            hold_expires_at: datetime | None = None,
+                           seat_labels: list[str] | None = None,
                            error: str | None = None) -> None:
-    """선점 시도 결과를 확정한다. status: held|failed|expired|cancelled."""
+    """선점 시도 결과를 확정한다. status: held|failed|expired|cancelled.
+
+    seat_labels를 주면 좌석도 덮어쓴다 — 시도를 열 때 적은 건 감지 시점의
+    **후보**이고, 실제로 누른 좌석은 좌석맵에 도착해서 다시 고르기 때문이다
+    (booking._select_block). 이력이 후보를 그대로 들고 있으면 사용자가 받은
+    알림과 어긋난다.
+    """
     if status not in ("held", "failed", "expired", "cancelled", "pending"):
         raise ValueError(f"알 수 없는 상태: {status}")
+    sets = ["status=%s", "mov_atkt_no=%s", "amount=%s", "hold_expires_at=%s",
+            "last_error=%s", "updated_at=%s"]
+    params: list[Any] = [status, mov_atkt_no, amount, hold_expires_at, error,
+                         _now()]
+    if seat_labels is not None:
+        sets.append("seat_labels=%s")
+        params.append(list(seat_labels))
+    params.append(attempt_id)
     with pool().connection() as conn:
         conn.execute(
-            "update booking_attempts set status=%s, mov_atkt_no=%s, amount=%s,"
-            "  hold_expires_at=%s, last_error=%s, updated_at=%s where id=%s",
-            (status, mov_atkt_no, amount, hold_expires_at, error, _now(),
-             attempt_id),
-        )
+            f"update booking_attempts set {', '.join(sets)} where id=%s", params)
 
 
 def booking_attempts(*, owner_id: int | None = None, limit: int = 20) -> list[dict]:

@@ -597,7 +597,10 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         if booking_on:
             import booking
             outcome = booking.try_auto_book(
-                session, w, row, seats, mov_nm=mov_nm, site_nm=site_nm)
+                session, w, row, seats, mov_nm=mov_nm, site_nm=site_nm,
+                # 좌석맵을 다시 읽으려면 회차에 siteNo가 없을 때의 폴백이 필요하다
+                # — 위 _seat_map 호출과 같은 값을 쓴다.
+                site_no=site_no)
             act = outcome.get("action")
             if act == "held":
                 alerts.append({"kind": "book_held", "body": booking.build_hold_alert(

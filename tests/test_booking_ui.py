@@ -328,14 +328,22 @@ class TestPickSeats(unittest.TestCase):
 
     def test_all_seats_clicked_reports_nothing_missed(self):
         page = self.SeatPage(["J22", "J23"])
-        self.assertEqual(booking._pick_seats(page, ["J22", "J23"]), [])
+        self.assertEqual(booking._pick_seats(page, ["J22", "J23"]),
+                         (["J22", "J23"], []))
         self.assertEqual(page.clicked, ["J22", "J23"])
 
     def test_reports_every_seat_it_could_not_click(self):
         # 하나가 실패해도 나머지를 마저 눌러 봐야 무엇이 팔렸는지 다 알 수 있다.
         page = self.SeatPage(["J22"])
         self.assertEqual(booking._pick_seats(page, ["J22", "J23", "J24"]),
-                         ["J23", "J24"])
+                         (["J22"], ["J23", "J24"]))
+
+    def test_reports_what_it_managed_to_click(self):
+        # 다시 고를 수 있는지가 여기에 달렸다 — 이미 골라 둔 게 있으면 못 고친다.
+        page = self.SeatPage(["J23"])
+        clicked, missed = booking._pick_seats(page, ["J22", "J23"])
+        self.assertEqual(clicked, ["J23"])
+        self.assertEqual(missed, ["J22"])
 
     def test_error_message_names_the_missing_seats(self):
         msg = booking._partial_seats_error(["J22", "J23"], ["J23"])
@@ -344,11 +352,154 @@ class TestPickSeats(unittest.TestCase):
 
     def test_no_seat_clicked_at_all_is_reported_the_same_way(self):
         page = self.SeatPage([])
-        missed = booking._pick_seats(page, ["J22", "J23"])
+        clicked, missed = booking._pick_seats(page, ["J22", "J23"])
         self.assertEqual(missed, ["J22", "J23"])
+        self.assertEqual(clicked, [])
         self.assertEqual(page.clicked, [])
         self.assertIn("2석 중 2석",
                       booking._partial_seats_error(["J22", "J23"], missed))
+
+
+def seat_row(label: str, x: int, available: bool) -> dict:
+    """pick_block이 읽는 모양의 좌석 한 자리."""
+    i = 0
+    while i < len(label) and not label[i].isdigit():
+        i += 1
+    return {"row": label[:i], "no": label[i:], "label": label,
+            "available": available, "kind": "", "zone": "",
+            "x_start": x, "x_end": x + 2,
+            "left_pway": False, "right_pway": False,
+            "seat_loc_no": f"LOC{label}", "sbord_no": "001",
+            "seat_area_no": "001", "szone_no": "01001", "stknd_cd": "27",
+            "szone_kind_cd": "01", "seat_salfrm_cd": "01"}
+
+
+def seat_map(available) -> list[dict]:
+    """K1~K6 한 줄. available에 든 라벨만 비어 있다."""
+    free = set(available)
+    return [seat_row(f"K{i}", i * 2, f"K{i}" in free) for i in range(1, 7)]
+
+
+class TestSelectBlockRepicksAtTheSeatMap(unittest.TestCase):
+    """감지 때 고른 좌석은 좌석맵에 닿을 무렵이면 낡아 있다.
+
+    UI를 모는 데 30초 남짓이 걸리는데 그동안 취소표는 팔린다. 그래서 좌석맵에
+    도착해서 배치도를 다시 읽고 그 자리에서 고른다.
+    """
+
+    def setUp(self) -> None:
+        # 스크린샷은 부가 기능이라 여기서는 저장 여부만 세고 디스크는 건드리지 않는다.
+        self.shots: list[dict] = []
+        self._real_shot = booking._save_screenshot
+        booking._save_screenshot = lambda page, ctx: (
+            self.shots.append(ctx) or "/tmp/fake.png")
+        self.addCleanup(setattr, booking, "_save_screenshot", self._real_shot)
+
+    def ctx(self, candidate, party=2):
+        return {"mov_nm": "오디세이", "site_nm": "용산", "scn_ymd": "20260831",
+                "start_hhmm": "18:00", "seat_labels": list(candidate),
+                "party": party, "rows": ["K"], "site_no": "0013",
+                "row": {"scnsNo": "S1", "scnSseq": "3"}}
+
+    def test_uses_the_live_map_not_the_candidate(self):
+        # 감지 때는 K1·K2였지만 그 사이 팔리고 K5·K6이 났다.
+        page = TestPickSeats.SeatPage(["K5", "K6"])
+        out = booking._select_block(
+            None, page, self.ctx(["K1", "K2"]),
+            seats_fn=lambda s, c: seat_map(["K5", "K6"]))
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["labels"], ["K5", "K6"])
+        self.assertEqual(page.clicked, ["K5", "K6"],
+                         "낡은 후보를 눌렀다")
+
+    def test_retries_with_a_fresh_block_when_nothing_was_clicked(self):
+        # 첫 바퀴의 K1·K2는 화면에서 이미 사라졌고, 두 바퀴째엔 K5·K6이 보인다.
+        page = TestPickSeats.SeatPage(["K5", "K6"])
+        maps = iter([seat_map(["K1", "K2"]), seat_map(["K5", "K6"])])
+        out = booking._select_block(None, page, self.ctx(["K1", "K2"]),
+                                    seats_fn=lambda s, c: next(maps))
+
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["labels"], ["K5", "K6"])
+        self.assertEqual(len(self.shots), 1, "첫 실패의 화면은 남겨야 한다")
+
+    def test_stops_when_some_seats_are_already_selected(self):
+        # K5는 골라졌고 K6은 밀렸다. 여기서 다른 블록을 누르면 인원수를 넘겨
+        # 엉뚱한 자리를 선점하게 되므로 다시 고르지 않는다.
+        page = TestPickSeats.SeatPage(["K5"])
+        calls = {"n": 0}
+
+        def maps(s, c):
+            calls["n"] += 1
+            return seat_map(["K5", "K6"])
+
+        out = booking._select_block(None, page, self.ctx(["K5", "K6"]),
+                                    seats_fn=maps)
+
+        self.assertFalse(out["ok"])
+        self.assertEqual(calls["n"], 1, "이미 고른 좌석이 있는데 다시 골랐다")
+        self.assertEqual(page.clicked, ["K5"])
+        self.assertIn("K6", out["error"])
+
+    def test_gives_up_when_the_block_is_gone(self):
+        page = TestPickSeats.SeatPage([])
+        out = booking._select_block(None, page, self.ctx(["K1", "K2"]),
+                                    seats_fn=lambda s, c: seat_map(["K1"]))
+
+        self.assertFalse(out["ok"])
+        self.assertIn("사라졌습니다", out["error"])
+        self.assertEqual(page.clicked, [], "잡을 수 없는데 눌러 봤다")
+
+    def test_falls_back_to_the_candidate_when_the_map_cannot_be_read(self):
+        # 배치도를 다시 못 읽어도 후보로 시도는 해 본다 — 낡았을 수 있지만
+        # 아무것도 안 하는 것보다 낫다.
+        page = TestPickSeats.SeatPage(["K1", "K2"])
+
+        def boom(s, c):
+            raise RuntimeError("좌석 배치도 조회 실패")
+
+        out = booking._select_block(None, page, self.ctx(["K1", "K2"]),
+                                    seats_fn=boom)
+        self.assertTrue(out["ok"])
+        self.assertEqual(page.clicked, ["K1", "K2"])
+
+    def test_blind_attempt_is_not_retried(self):
+        # 다시 읽지도 못하는데 같은 좌석을 세 번 눌러 봐야 답은 같다.
+        page = TestPickSeats.SeatPage([])
+        calls = {"n": 0}
+
+        def boom(s, c):
+            calls["n"] += 1
+            raise RuntimeError("좌석 배치도 조회 실패")
+
+        out = booking._select_block(None, page, self.ctx(["K1", "K2"]),
+                                    seats_fn=boom)
+        self.assertFalse(out["ok"])
+        self.assertEqual(calls["n"], 1)
+
+    def test_seat_click_failure_saves_a_screenshot(self):
+        # 이 경로만 화면을 안 남기고 있어서, 셀렉터가 깨진 건지 정말 팔린 건지
+        # 사후에 가릴 수가 없었다.
+        page = TestPickSeats.SeatPage([])
+        booking._select_block(None, page, self.ctx(["K1", "K2"]),
+                              seats_fn=lambda s, c: seat_map(["K1", "K2"]))
+        self.assertEqual(len(self.shots), 1)
+        self.assertEqual(self.shots[0]["start_hhmm"], "18:00")
+
+    def test_retry_count_is_bounded(self):
+        page = TestPickSeats.SeatPage([])          # 무엇을 골라도 못 누른다
+        calls = {"n": 0}
+
+        def maps(s, c):
+            calls["n"] += 1
+            return seat_map(["K1", "K2", "K3", "K4", "K5", "K6"])
+
+        out = booking._select_block(None, page, self.ctx(["K1", "K2"]),
+                                    seats_fn=maps)
+        self.assertFalse(out["ok"])
+        self.assertEqual(calls["n"], booking.SEAT_PICK_ATTEMPTS)
+        self.assertEqual(len(self.shots), 1, "화면은 첫 실패에 한 번만")
 
 
 class TestSelectorsAreNotPinnedToHashes(unittest.TestCase):
