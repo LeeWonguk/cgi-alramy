@@ -1170,52 +1170,48 @@ class TestPaymentAmount(unittest.TestCase):
 class TestKakaoPayLink(unittest.TestCase):
     """결제창에서 **휴대폰으로 열 링크**를 뽑아내는 부분.
 
-    실측(2026-08)한 브릿지 응답 모양을 그대로 쓴다. 카카오톡 스킴을 그대로
-    보내면 디스코드에서 누를 수조차 없으므로, 그 안의 https 주소를 꺼내야 한다.
+    실측(2026-08)한 브릿지 응답 모양을 그대로 쓴다. 링크 형태는 화면의 QR을
+    디코드해서 확인했다 — 응답의 `hash` 필드로 mobile-pc 브릿지 주소를 만든다.
     """
 
-    HASH = "7fa7d5e7ceb4459d68bb44b2d36d90bdf789f2a7d645bacc9ad005c654fb4bd1"
-    LINK = f"https://online-pay.kakaopay.com/pay/r1/{HASH}"
+    # 응답의 hash는 65자이고, ios_app_url 안의 url= 과 iframe 주소에 들어 있는
+    # 해시는 그보다 **한 글자 짧다**. 눈으로는 같아 보여서 실제로 그 짧은 쪽으로
+    # 링크를 만들어 보냈고, 사용자가 열었을 때 "인증정보를 찾을 수 없습니다"가 떴다.
+    HASH = "08b5ad0b442356f97a511e973a767f8cb9683b0fa0a7bc5050e05dc1e6d2c0bc3"
+    SHORT = HASH[:-1]
+    LINK = ("https://online-payment.kakaopay.com"
+            f"/bridge/mobile-pc/reseller/one-time/payment/{HASH}")
 
     def _bridge(self, **over):
         body = {
             "tid": "ta8e84623dfd7ad169de",
+            "hash": self.HASH,
             "ios_app_url": (
                 "kakaotalk://kakaopay/pg?payweb_talk_min_version=11.3.0"
-                "&payweb_url=https%3A%2F%2Fonline-payment.kakaopay.com%2Fpay"
-                f"&url={self.LINK}"),
-            "aos_app_url": (
-                "intent://kakaopay/pg?payweb_talk_min_version=11.3.0"
-                f"&url={self.LINK}#Intent;scheme=kakaotalk;"
-                "package=com.kakao.talk;end"),
+                f"&url=https://online-pay.kakaopay.com/pay/r1/{self.SHORT}"),
             "expired_timestamp": 1787758198,
         }
         body.update(over)
         return body
 
-    def test_takes_the_browser_url_out_of_the_app_scheme(self):
+    def test_builds_the_link_from_the_hash_field(self):
         self.assertEqual(booking.kakao_link_from_bridge(self._bridge()), self.LINK)
 
-    def test_intent_tail_is_stripped(self):
-        body = self._bridge(ios_app_url="")
-        self.assertEqual(booking.kakao_link_from_bridge(body), self.LINK)
+    def test_the_app_scheme_url_is_not_used(self):
+        """ios_app_url 안의 주소는 다른 주소다 — 열면 인증정보를 찾을 수 없다."""
+        got = booking.kakao_link_from_bridge(self._bridge())
+        self.assertNotIn("online-pay.kakaopay.com/pay/r1", got)
+        self.assertTrue(got.endswith(self.HASH),
+                        "해시가 한 글자라도 잘리면 죽은 링크가 된다")
 
     def test_missing_body_is_none(self):
         self.assertIsNone(booking.kakao_link_from_bridge(None))
         self.assertIsNone(booking.kakao_link_from_bridge({}))
 
-    def test_builds_the_link_from_the_frame_url_as_a_fallback(self):
-        frame = ("https://online-payment.kakaopay.com/bridge/pc/reseller/"
-                 f"one-time/payment/{self.HASH}")
-        self.assertEqual(booking.kakao_link_from_frame(frame), self.LINK)
-
-    def test_a_path_that_is_not_a_hash_is_refused(self):
-        """해시가 아닌 꼬리를 링크로 만들면 죽은 주소를 사람에게 보내게 된다."""
-        self.assertIsNone(booking.kakao_link_from_frame(
-            "https://online-payment.kakaopay.com/bridge/pc/bridge"))
-        self.assertIsNone(booking.kakao_link_from_frame(
-            "https://cgv.co.kr/mpy/main"))
-        self.assertIsNone(booking.kakao_link_from_frame(""))
+    def test_a_hash_that_is_not_hex_is_refused(self):
+        """엉뚱한 값으로 링크를 만들면 죽은 주소를 사람에게 보내게 된다."""
+        self.assertIsNone(booking.kakao_link_from_bridge({"hash": "없음"}))
+        self.assertIsNone(booking.kakao_link_from_bridge({"hash": "abc"}))
 
     def test_expiry_is_the_korean_wall_clock_kakao_meant(self):
         """epoch처럼 생겼지만 epoch이 아니다 — 한국 벽시계를 UTC인 척 담아 준다.

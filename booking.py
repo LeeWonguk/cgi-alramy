@@ -148,9 +148,15 @@ FINAL_AMOUNT_SELECTOR = '[class*="mpy_lastPayment"] strong'
 KAKAO_BRIDGE_MARK = "online-payment.kakaopay.com"
 # 그 iframe이 부르는 내부 API. 응답에 휴대폰용 결제 주소와 만료 시각이 들어 있다.
 KAKAO_BRIDGE_API_MARK = "/pc/bridge"
-# 휴대폰에서 열면 바로 결제로 이어지는 주소. 브릿지 API를 못 읽었을 때 iframe
-# 주소 끝의 해시로 같은 주소를 만든다 — 화면의 QR이 담고 있는 것과 같다.
-KAKAO_PAY_LINK = "https://online-pay.kakaopay.com/pay/r1/{hash}"
+# 휴대폰에서 열면 바로 결제로 이어지는 주소 — **화면의 QR에 담긴 것과 같은 주소**다.
+#
+# 이 형태는 QR을 직접 디코드해서 확인했다. 예전에는 브릿지 응답의
+# ios_app_url 안에 있는 `url=` 파라미터를 썼는데, 그건 다른 주소이고
+# (online-pay.kakaopay.com/pay/r1/...) 열면 "인증정보를 찾을 수 없습니다"가 뜬다.
+# 게다가 그 주소의 해시는 응답의 `hash` 필드보다 **한 글자 짧다** — 만료 문제로
+# 착각하기 딱 좋아서, 갓 만든 링크를 4초 만에 열어 보고서야 형태 문제임을 알았다.
+KAKAO_PAY_LINK = ("https://online-payment.kakaopay.com"
+                  "/bridge/mobile-pc/reseller/one-time/payment/{hash}")
 
 # 결제 화면으로 넘어갈 때까지 '결제하기'를 다시 눌러 보는 횟수와 간격.
 PAY_PAGE_ROUNDS = 6
@@ -1359,44 +1365,25 @@ def parse_amount(text) -> int | None:
 
 
 def kakao_link_from_bridge(body) -> str | None:
-    """카카오페이 브릿지 API 응답에서 **휴대폰용 결제 주소**를 뽑는다.
+    """카카오페이 브릿지 API 응답에서 **휴대폰용 결제 주소**를 만든다.
 
-    응답의 ios_app_url/aos_app_url은 카카오톡을 여는 스킴이고, 그 안의 `url=`
-    파라미터가 브라우저로 열리는 결제 주소다 — 화면의 QR이 담고 있는 것과 같다.
-    카카오톡 스킴(kakaotalk://)을 그대로 보내면 카톡이 깔린 기기에서만 열리고,
-    디스코드에서는 누를 수조차 없다.
+    쓸 값은 응답의 `hash` 필드다. QR을 디코드해 확인한 결과 화면의 QR도 이
+    해시로 같은 주소를 담고 있었다.
+
+    **`ios_app_url` 안의 `url=`을 쓰면 안 된다.** 그건 다른 주소이고 열면
+    "인증정보를 찾을 수 없습니다"가 뜬다. 해시도 한 글자 짧아서, 눈으로는 같은
+    값처럼 보인다 — 실제로 그렇게 만든 링크를 사용자가 받았고 열리지 않았다.
+
+    iframe 주소 끝의 해시도 마찬가지로 한 글자 짧으므로 대신 쓸 수 없다.
+    응답을 못 받았으면 링크가 없다고 하는 편이 죽은 링크를 보내는 것보다 낫다.
     """
     if not isinstance(body, dict):
         return None
-    from urllib.parse import parse_qs, unquote, urlparse
-
-    for key in ("ios_app_url", "aos_app_url"):
-        raw = body.get(key) or ""
-        if not raw:
-            continue
-        query = urlparse(raw.replace("intent://", "https://")).query
-        found = parse_qs(query).get("url")
-        if found and found[0].startswith("http"):
-            # intent:// 형태는 뒤에 '#Intent;...'가 붙어 있다.
-            return unquote(found[0]).split("#Intent")[0]
-    return None
-
-
-def kakao_link_from_frame(url: str) -> str | None:
-    """결제창 iframe 주소에서 결제 주소를 만든다 — 브릿지 API를 못 읽었을 때의 대비.
-
-    iframe 주소는 `.../bridge/pc/reseller/one-time/payment/{hash}` 꼴이고, 그
-    해시가 그대로 휴대폰용 주소에 쓰인다.
-    """
-    text = (url or "").split("?")[0].rstrip("/")
-    if KAKAO_BRIDGE_MARK not in text:
+    value = str(body.get("hash") or "").strip()
+    # 해시는 hex 문자열이다. 엉뚱한 값으로 링크를 만들면 죽은 주소를 보내게 된다.
+    if len(value) < 32 or not all(c in "0123456789abcdef" for c in value.lower()):
         return None
-    tail = text.rsplit("/", 1)[-1]
-    # 해시는 64자 hex다. 다른 경로(예: /pc/bridge)를 해시로 착각하면 죽은 링크를
-    # 보내게 되므로 모양을 확인한다.
-    if len(tail) < 32 or not all(c in "0123456789abcdef" for c in tail.lower()):
-        return None
-    return KAKAO_PAY_LINK.format(hash=tail)
+    return KAKAO_PAY_LINK.format(hash=value)
 
 
 def bridge_expires_at(body) -> datetime | None:
@@ -1604,7 +1591,7 @@ def pay_block(session, ctx: dict, *, method: str = DEFAULT_PAY_METHOD) -> dict:
             pass
 
     body = captured.get("bridge")
-    pay_url = kakao_link_from_bridge(body) or kakao_link_from_frame(frame.url)
+    pay_url = kakao_link_from_bridge(body)
     if not pay_url:
         shot = _save_screenshot(page, ctx)
         return {"ok": False, "method": method, "pay_url": None,
