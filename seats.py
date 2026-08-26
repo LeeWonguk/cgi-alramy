@@ -526,6 +526,19 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         scn_time_to=w.get("scn_time_to") or "")
     rows = w["rows"]
     need = int(w.get("min_consecutive") or 0)   # 0·1 = 개별 좌석, 2+ = 연속 좌석
+
+    # 자동 예매를 켠 감시라면 예매 화면을 **미리 띄워 둔다.** 좌석이 난 순간
+    # 화면을 새로 여는 데만 6.2초가 드는데(회차 목록이 그려질 때까지), 그 6.2초가
+    # 곧 "그 사이 팔린 것 같습니다"가 된다. 화면은 감시 조합마다 탭 하나로
+    # 유지되므로 이미 떠 있으면 아무 일도 하지 않는다.
+    #
+    # 좌석 확인은 이 탭이 아니라 기본 페이지에서 fetch로 하니(session.get_json),
+    # 띄워 둬도 감시 자체에는 영향이 없다.
+    if w.get("auto_book") and not dry_run:
+        import booking
+        booking.prewarm(session, {"mov_no": mov_no, "site_no": site_no,
+                                  "site_nm": site_nm, "scn_ymd": w["scn_ymd"]})
+
     prev = store.prev_seat_state(w["id"])
     fresh_state: dict[str, list[str]] = {}
     alerts: list[dict] = []

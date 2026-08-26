@@ -953,6 +953,128 @@ class TestScreenshotIsBestEffort(unittest.TestCase):
                                      {"mov_nm": "오디세이", "start_hhmm": "18:00"}))
 
 
+class TestModalsWeMustNotClose(unittest.TestCase):
+    """예매 흐름 자체가 모달로 되어 있다 — 좌석맵도, 결제 바텀시트도.
+
+    그것들도 role=dialog에 자기 ✕를 달고 있어서, 광고 팝업과 같이 취급하면
+    우리가 눌러야 할 버튼을 스스로 치워 버린다. 실제로 결제 바텀시트를 닫았다
+    뜨기를 반복하다 결제 화면에 닿지 못했다.
+    """
+
+    class Modal:
+        def __init__(self, text):
+            self._text = text
+
+        def text_content(self):
+            return self._text
+
+    def test_the_payment_sheet_is_ours(self):
+        modal = self.Modal("결제 전 확인해 주세요 … 취소/환불 불가 안내 … 결제하기")
+        self.assertTrue(booking._modal_is_ours(modal))
+
+    def test_the_seatmap_sheet_is_ours(self):
+        self.assertTrue(booking._modal_is_ours(self.Modal("좌석 선택 … 선택완료")))
+
+    def test_an_ad_popup_is_not_ours(self):
+        modal = self.Modal("세계 최초 4면 상영관, 용산 SCREENX관은 … 확인")
+        self.assertFalse(booking._modal_is_ours(modal))
+
+    def test_unreadable_modal_is_not_protected(self):
+        class Broken:
+            def text_content(self):
+                raise RuntimeError("사라지는 중")
+
+        self.assertFalse(booking._modal_is_ours(Broken()))
+
+
+class TestPrewarm(unittest.TestCase):
+    """예매 화면을 미리 띄워 두는 부분.
+
+    딥링크로 화면을 **새로 여는 데만 6.2초**가 든다(실측). 좌석이 난 순간 그
+    6.2초를 쓰면 이미 늦으므로, 자동 예매를 켠 감시의 화면은 탭 하나로 띄워 두고
+    선점할 때 그대로 쓴다(실측 0초).
+    """
+
+    CTX = {"mov_no": "30001323", "site_no": "0013", "scn_ymd": "20260828"}
+
+    def test_key_splits_by_movie_site_and_date(self):
+        other_date = dict(self.CTX, scn_ymd="20260901")
+        other_site = dict(self.CTX, site_no="0001")
+        self.assertNotEqual(booking.warm_key(self.CTX),
+                            booking.warm_key(other_date))
+        self.assertNotEqual(booking.warm_key(self.CTX),
+                            booking.warm_key(other_site))
+        self.assertEqual(booking.warm_key(self.CTX), booking.warm_key(dict(self.CTX)))
+
+    class Session:
+        """탭을 내주는 세션. give=False면 못 내주는 세션을 흉내낸다."""
+
+        def __init__(self, tab, give=True):
+            self.tab = tab
+            self.page = "기본페이지"
+            self.give = give
+            self.asked = []
+
+        def booking_page(self, key):
+            self.asked.append(key)
+            if not self.give:
+                raise RuntimeError("탭을 열 수 없습니다")
+            return self.tab
+
+    def test_uses_the_tab_the_session_gives(self):
+        session = self.Session(tab="예매탭")
+        self.assertEqual(booking.booking_page(session, self.CTX), "예매탭")
+        self.assertEqual(session.asked, [booking.warm_key(self.CTX)])
+
+    def test_falls_back_to_the_main_page_when_no_tab(self):
+        """탭을 못 열어도 선점을 포기하지는 않는다 — 예전처럼 한 장으로 간다."""
+        session = self.Session(tab=None, give=False)
+        self.assertEqual(booking.booking_page(session, self.CTX), "기본페이지")
+
+    def test_a_ready_screen_is_left_alone(self):
+        """이미 그 날짜가 떠 있으면 다시 열지 않는다 — 그게 이 최적화의 전부다."""
+        session = self.Session(tab="예매탭")
+        opened = []
+        real_ready, real_open = booking._already_on_booking, booking._open_booking_direct
+        booking._already_on_booking = lambda page, ctx: True
+        booking._open_booking_direct = lambda page, ctx: opened.append(ctx) or True
+        try:
+            self.assertTrue(booking.prewarm(session, self.CTX))
+        finally:
+            booking._already_on_booking = real_ready
+            booking._open_booking_direct = real_open
+        self.assertEqual(opened, [], "이미 준비된 화면을 다시 열면 안 된다")
+
+    def test_an_empty_screen_is_opened(self):
+        session = self.Session(tab="예매탭")
+        opened = []
+        real_ready, real_open = booking._already_on_booking, booking._open_booking_direct
+        booking._already_on_booking = lambda page, ctx: False
+        booking._open_booking_direct = lambda page, ctx: (opened.append(page), True)[1]
+        try:
+            self.assertTrue(booking.prewarm(session, self.CTX))
+        finally:
+            booking._already_on_booking = real_ready
+            booking._open_booking_direct = real_open
+        self.assertEqual(opened, ["예매탭"])
+
+    def test_without_a_movie_number_there_is_nothing_to_open(self):
+        session = self.Session(tab="예매탭")
+        self.assertFalse(booking.prewarm(session, {"scn_ymd": "20260828"}))
+        self.assertEqual(session.asked, [])
+
+    def test_failure_is_swallowed(self):
+        """미리 여는 일이 실패해도 감시가 멈추면 안 된다 — 선점 때 다시 연다."""
+        session = self.Session(tab=None, give=False)
+        real = booking._already_on_booking
+        booking._already_on_booking = lambda page, ctx: (_ for _ in ()).throw(
+            RuntimeError("화면이 이상하다"))
+        try:
+            self.assertFalse(booking.prewarm(session, self.CTX))
+        finally:
+            booking._already_on_booking = real
+
+
 class TestClickThroughModals(unittest.TestCase):
     """안내 팝업은 **우리가 팝업을 닫고 지나간 뒤에** 뜨기도 한다.
 

@@ -195,6 +195,12 @@ MODAL_CLOSE_SELECTORS = (
     'button:has-text("닫기")',
     'button.btn-close',
 )
+# **닫으면 안 되는 모달.** 예매 흐름 자체가 모달로 되어 있다 — 좌석맵도,
+# '결제 전 확인해 주세요' 바텀시트도 role=dialog에 자기 닫기 버튼(✕)을 달고 있다.
+# 그걸 광고 팝업과 같이 취급해 닫으면 우리가 눌러야 할 버튼을 스스로 치워 버린다.
+# 실제로 결제 바텀시트를 닫았다 뜨기를 반복하다 결제 화면에 닿지 못했다.
+# 이 문구가 보이는 모달은 통과해야 할 화면이므로 건드리지 않는다.
+MODAL_KEEP_TEXTS = ("결제하기", "선택완료")
 
 # 좌석 고르기 재시도. 한 바퀴가 [배치도 다시 읽기 → 고르기 → 클릭]이라 1초 안쪽이니
 # 몇 번을 돌아도 싸다. 다만 여기서 오래 끌 이유는 없다 — 이 시각을 넘길 만큼
@@ -526,6 +532,60 @@ def _date_is_selected(page, wanted: list[str]) -> bool | None:
                 return True
         return False
     return None
+
+
+def warm_key(ctx: dict) -> str:
+    """예매 화면 탭을 가르는 키 — 영화·극장·날짜가 같으면 같은 화면이다."""
+    return "|".join((str(ctx.get("mov_no") or ""), str(ctx.get("site_no") or ""),
+                     str(ctx.get("scn_ymd") or "")))
+
+
+def booking_page(session, ctx: dict):
+    """이 ctx의 예매 화면을 담당할 탭. 세션이 탭을 못 주면 기본 페이지를 쓴다."""
+    try:
+        return session.booking_page(warm_key(ctx))
+    except Exception as exc:  # noqa: BLE001 - 탭을 못 열면 예전처럼 한 장으로 간다
+        log.debug("예매 탭을 얻지 못했습니다 (%s) — 기본 페이지를 씁니다", exc)
+        return session.page
+
+
+def prewarm(session, ctx: dict) -> bool:
+    """예매 화면을 미리 띄워 둔다. 쓸 준비가 됐으면 True.
+
+    딥링크로 예매 화면을 **새로 여는 데만 6.2초**가 든다(회차 목록이 그려질
+    때까지). 좌석이 난 순간 그 6.2초를 쓰면 이미 늦는다 — 그래서 자동 예매를 켠
+    감시의 화면을 미리 열어 두고, 선점할 때는 그 탭을 그대로 쓴다(실측 0초).
+
+    이미 그 날짜가 열려 있으면 아무것도 하지 않는다. 조용히 실패해도 되는 일이라
+    (선점할 때 어차피 다시 확인하고 필요하면 그때 연다) 예외를 밖으로 내지 않는다.
+    """
+    if not ctx.get("mov_no"):
+        return False
+    try:
+        page = booking_page(session, ctx)
+        if _already_on_booking(page, ctx):
+            return True
+        return _open_booking_direct(page, ctx)
+    except Exception as exc:  # noqa: BLE001 - 미리 여는 일이 실패해도 선점은 시도한다
+        log.debug("예매 화면 프리워밍 실패: %s", exc)
+        return False
+
+
+def _already_on_booking(page, ctx: dict) -> bool:
+    """그 탭이 이미 이 조합의 예매 화면을 띄우고 있는지.
+
+    주소만 보면 안 된다 — 날짜는 화면 상태이지 주소가 아니고, 우리가 띄워 둔 뒤
+    CGV가 화면을 되돌렸을 수도 있다. 회차 목록이 떠 있고 날짜가 그 날짜로 골라져
+    있을 때만 '준비됐다'고 본다.
+    """
+    try:
+        if BOOKING_PAGE not in (page.url or ""):
+            return False
+        if page.locator(", ".join(SHOWTIME_SELECTORS)).count() == 0:
+            return False
+        return _date_is_selected(page, date_labels(ctx["scn_ymd"])) is True
+    except Exception:  # noqa: BLE001 - 못 읽으면 준비 안 된 것으로 본다
+        return False
 
 
 def _open_booking_direct(page, ctx: dict) -> bool:
@@ -926,6 +986,8 @@ def dismiss_modals(page, rounds: int = 3) -> int:
 
         hit = False
         for modal in modals:
+            if _modal_is_ours(modal):
+                continue
             for selector in MODAL_CLOSE_SELECTORS:
                 try:
                     buttons = [b for b in modal.locator(selector).all()
@@ -947,6 +1009,15 @@ def dismiss_modals(page, rounds: int = 3) -> int:
         if not hit:
             break
     return closed
+
+
+def _modal_is_ours(modal) -> bool:
+    """그 모달이 **우리가 통과해야 할 화면**인지 (닫으면 안 되는 것인지)."""
+    try:
+        text = modal.text_content() or ""
+    except Exception:  # noqa: BLE001 - 못 읽으면 판단 근거가 없다
+        return False
+    return any(keep in text for keep in MODAL_KEEP_TEXTS)
 
 
 def _ancestor_text(node, cls: str) -> str:
@@ -1127,7 +1198,10 @@ def hold_block(session, ctx: dict) -> dict:
     """
     import json as _json
 
-    page = session.page
+    # 미리 띄워 둔 탭이 있으면 그걸 쓴다 — 예매 화면을 새로 여는 6.2초를 아낀다.
+    page = booking_page(session, ctx)
+    # 결제 단계가 같은 화면에서 이어져야 한다.
+    ctx["_page"] = page
     captured = {}
     steps = _Steps()
     # 좌석맵에 닿기 전에 죽으면 후보가 곧 '시도한 좌석'이다.
@@ -1150,7 +1224,9 @@ def hold_block(session, ctx: dict) -> dict:
         # 영화 → 극장 → 날짜를 주소 하나로 건너뛴다. 그 세 클릭이 자동 예매가 가장
         # 자주 죽던 구간이다 — 스와이퍼·바텀시트가 만든 **숨겨진 사본**을 눌러
         # 타임아웃이 났다(`.first`는 보이는 것을 고른다는 보장이 없다).
-        if not _open_booking_direct(page, ctx):
+        if _already_on_booking(page, ctx):
+            log.info("미리 띄워 둔 예매 화면을 그대로 씁니다 (%s)", ctx["scn_ymd"])
+        elif not _open_booking_direct(page, ctx):
             page.goto(BOOKING_PAGE, wait_until="domcontentloaded", timeout=40000)
             page.wait_for_timeout(3500)
             _click_visible(page, ctx["mov_nm"], exact=True, what="영화",
@@ -1480,7 +1556,8 @@ def pay_block(session, ctx: dict, *, method: str = DEFAULT_PAY_METHOD) -> dict:
     """
     import json as _json
 
-    page = session.page
+    # 선점을 건 바로 그 화면에서 이어서 돈다.
+    page = ctx.get("_page") or session.page
     captured: dict = {}
 
     def on_resp(r):

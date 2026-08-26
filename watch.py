@@ -14,6 +14,7 @@ CGV는 Cloudflare가 TLS 지문 단위로 봇을 막기 때문에 requests/curl�
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import argparse
 import fcntl
 import json
@@ -98,6 +99,10 @@ LOCK_PATH = ROOT / ".watch.lock"
 LOG_PATH = ROOT / "logs" / "watch.log"
 
 FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 웹훅 경고
+
+# 예매 화면을 미리 띄워 둘 탭의 최대 개수. 자동 예매를 켠 감시가 날짜별로 여럿이어도
+# 몇 개면 충분하고, 탭마다 CGV 화면 하나가 통째로 살아 있으므로 무한정 늘리지 않는다.
+BOOKING_PAGE_LIMIT = 4
 WEEKDAYS = "월화수목금토일"
 
 log = logging.getLogger("cgv-watch")
@@ -197,6 +202,9 @@ class CgvSession:
         # A 계정으로 나간다. 쿠키의 '존재'가 아니라 '주인'을 봐야 한다.
         # 값을 넣는 곳은 cgv_login 하나뿐이다(mark_logged_in).
         self.logged_in_owner: int | None = None
+        # 예매 화면을 미리 띄워 둔 탭들 (키: 영화·극장·날짜). 오래된 것부터
+        # 닫으려고 순서를 지키는 dict를 쓴다.
+        self._booking_pages: "OrderedDict[str, object]" = OrderedDict()
 
     def __enter__(self) -> "CgvSession":
         from playwright.sync_api import sync_playwright
@@ -242,6 +250,7 @@ class CgvSession:
                 closer.close() if closer is self._browser else closer.stop()
             except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
                 pass
+        self._booking_pages.clear()
         self._browser = self._pw = self._page = None
 
     @property
@@ -250,6 +259,52 @@ class CgvSession:
         if self._page is None:
             raise RuntimeError("세션이 열려 있지 않습니다")
         return self._page
+
+    # ── 예매 화면을 미리 띄워 두는 탭 ────────────────────────────────────────
+    def booking_page(self, key: str):
+        """그 조합(영화·극장·날짜)의 예매 화면 전용 탭. 없으면 새로 연다.
+
+        예매 화면을 딥링크로 **새로 여는 데만 6.2초**가 든다(회차 목록이 그려질
+        때까지). 좌석이 난 순간 그 6.2초를 쓰면 경쟁에서 밀리므로, 자동 예매를 켠
+        감시의 화면을 미리 띄워 두고 그 탭을 계속 쓴다 — 이미 그 화면이면 0초다.
+
+        좌석 확인은 이 탭이 아니라 기본 페이지에서 fetch로 하므로(get_json), 탭을
+        띄워 둬도 감시에는 영향이 없다.
+        """
+        if self._browser is None or self._page is None:
+            raise RuntimeError("세션이 열려 있지 않습니다")
+        page = self._booking_pages.get(key)
+        if page is not None:
+            try:
+                page.evaluate("() => 1")           # 살아 있는지 확인
+                self._booking_pages.move_to_end(key)
+                return page
+            except Exception:  # noqa: BLE001 - 닫혔으면 새로 연다
+                self._booking_pages.pop(key, None)
+        # 탭이 무한정 늘지 않게 오래된 것부터 닫는다. 자동 예매를 켠 감시가
+        # 날짜별로 여럿이어도 몇 개면 충분하다.
+        while len(self._booking_pages) >= BOOKING_PAGE_LIMIT:
+            _, old = self._booking_pages.popitem(last=False)
+            try:
+                old.close()
+            except Exception:  # noqa: BLE001 - 이미 닫혔을 수 있다
+                pass
+        page = self._page.context.new_page()
+        self._booking_pages[key] = page
+        return page
+
+    def close_booking_pages(self) -> None:
+        """미리 띄워 둔 예매 탭을 모두 닫는다.
+
+        **로그인 주인이 바뀔 때 반드시 부른다.** 그 탭들은 앞사람의 화면이라,
+        그대로 두면 남의 계정으로 선점하게 된다.
+        """
+        for page in self._booking_pages.values():
+            try:
+                page.close()
+            except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
+                pass
+        self._booking_pages.clear()
 
     def is_alive(self) -> bool:
         """페이지가 아직 살아 있는지. 브라우저 상주 중 크래시를 감지하는 데 쓴다."""
@@ -353,7 +408,13 @@ class CgvSession:
         return self.logged_in_owner == owner_id and self.logged_in()
 
     def mark_logged_in(self, owner_id: int) -> None:
-        """지금 얹힌 로그인 쿠키의 주인을 기록한다 (cgv_login 전용)."""
+        """지금 얹힌 로그인 쿠키의 주인을 기록한다 (cgv_login 전용).
+
+        주인이 바뀌면 **미리 띄워 둔 예매 탭을 모두 닫는다.** 그 탭들은 앞사람의
+        화면이라, 그대로 두면 남의 계정으로 선점하게 된다.
+        """
+        if self.logged_in_owner is not None and self.logged_in_owner != owner_id:
+            self.close_booking_pages()
         self.logged_in_owner = owner_id
 
     def session_tokens(self) -> dict[str, str]:
