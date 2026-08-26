@@ -191,6 +191,12 @@ class CgvSession:
         self._page = None
         self.requests = 0  # 사이클당 CGV 요청 수 — 대시보드에서 부하를 본다
         self.opened_at: datetime | None = None
+        # 지금 이 브라우저가 **누구의** CGV 계정으로 로그인돼 있는지.
+        # 쿠키는 컨텍스트 하나에 얹히고 세션은 수십 분을 상주하는데, 사용자가
+        # 여럿이면 A의 쿠키가 남은 채로 B의 좌석을 보게 된다 — 자동 예매까지
+        # A 계정으로 나간다. 쿠키의 '존재'가 아니라 '주인'을 봐야 한다.
+        # 값을 넣는 곳은 cgv_login 하나뿐이다(mark_logged_in).
+        self.logged_in_owner: int | None = None
 
     def __enter__(self) -> "CgvSession":
         from playwright.sync_api import sync_playwright
@@ -334,9 +340,21 @@ class CgvSession:
 
     # ── 계정 로그인 / 세션 ──
     def logged_in(self) -> bool:
-        """accessToken 쿠키가 있으면 로그인된 것으로 본다."""
+        """accessToken 쿠키가 있으면 로그인된 것으로 본다.
+
+        **누구로** 로그인됐는지는 알려주지 않는다. 사용자가 여럿인 경로에서는
+        이 값만 보고 통과시키면 안 되고 `logged_in_as`를 써야 한다.
+        """
         return any(c["name"] == "accessToken" and c.get("value")
                    for c in self._page.context.cookies())
+
+    def logged_in_as(self, owner_id: int) -> bool:
+        """이 세션이 **그 소유자의** 계정으로 로그인돼 있는지."""
+        return self.logged_in_owner == owner_id and self.logged_in()
+
+    def mark_logged_in(self, owner_id: int) -> None:
+        """지금 얹힌 로그인 쿠키의 주인을 기록한다 (cgv_login 전용)."""
+        self.logged_in_owner = owner_id
 
     def session_tokens(self) -> dict[str, str]:
         """현재 세션 쿠키 중 저장해 둘 값들(accessToken·refresh_token 등)."""
@@ -356,11 +374,26 @@ class CgvSession:
         """브라우저의 로그인 쿠키를 버린다.
 
         만료된 accessToken이 남아 있으면 `logged_in()`이 계속 True를 내서 재로그인
-        경로로 못 간다. 되살리기 전에 반드시 비워야 한다.
+        경로로 못 간다. 계정을 바꿔 다는 경로도 여기를 지나야 한다 — 앞사람의
+        쿠키가 남아 있으면 로그인 페이지가 그대로 되돌아가 버린다.
+
+        **로그인 쿠키만** 골라 지운다. 통째로 지우면 Cloudflare 봇 차단을 통과한
+        흔적까지 날아가 다음 요청이 403을 맞을 수 있다 — 좌석과 무관한 날짜
+        확인까지 같이 멎는다. 이름 지정 삭제를 못 받는 버전에서만 통째로 지운다.
         """
+        self.logged_in_owner = None
+        try:
+            for name in SESSION_COOKIES:
+                self._page.context.clear_cookies(name=name)
+            return
+        except TypeError:
+            pass  # 이름 인자를 못 받는 구버전 — 아래에서 통째로 지운다
+        except Exception as exc:  # noqa: BLE001 - 못 지워도 재로그인은 시도한다
+            log.warning("세션 쿠키를 지우지 못했습니다: %s", exc)
+            return
         try:
             self._page.context.clear_cookies()
-        except Exception as exc:  # noqa: BLE001 - 못 지워도 재로그인은 시도한다
+        except Exception as exc:  # noqa: BLE001
             log.warning("세션 쿠키를 지우지 못했습니다: %s", exc)
 
     def refresh_session(self) -> bool:
