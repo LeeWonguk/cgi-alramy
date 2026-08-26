@@ -288,6 +288,62 @@ class TestClickShowtime(unittest.TestCase):
             booking._click_showtime(page, "18:00")
         self.assertIn("18:00", str(caught.exception))
 
+    def test_disambiguates_screens_nested_in_one_outer_container(self):
+        """실제 화면 회귀: 두 상영관이 바깥 컨테이너 하나를 공유한다.
+
+        2026-08-28 용산 10:25에 '17관[PREMIUM] (Laser)'(12석)와
+        '17관 (Laser)'(156석)가 함께 있었다. 바깥 컨테이너는 둘을 모두 품어서
+        어느 후보로 물어도 이름이 걸린다 — 그 층에서 판단하면 아무것도 못 가리고,
+        안전장치가 "가리지 못했습니다"로 멈춰 잡을 수 있는 좌석을 놓친다.
+        """
+        premium = showtime("10:25", "-12:26")
+        regular = showtime("10:25", "-12:26")
+        page = FakePage([
+            FakeNode("div", "screenInfoStore_container__XZ7Dy", children=[
+                FakeNode("div", "screenInfo_contentWrap__95SyT", children=[
+                    FakeNode("strong", "screenInfo_screenName",
+                             "17관[PREMIUM] (Laser)"),
+                    premium]),
+                FakeNode("div", "screenInfo_contentWrap__95SyT", children=[
+                    FakeNode("strong", "screenInfo_screenName", "17관 (Laser)"),
+                    regular]),
+            ])])
+
+        booking._click_showtime(page, "10:25", "17관 (Laser)")
+        self.assertIs(page.clicked[0], regular,
+                      "PREMIUM관을 잡았다 — 좌석 수가 전혀 다른 관이다")
+
+    def test_premium_screen_is_reachable_too(self):
+        premium = showtime("10:25", "-12:26")
+        regular = showtime("10:25", "-12:26")
+        page = FakePage([
+            FakeNode("div", "screenInfoStore_container__XZ7Dy", children=[
+                FakeNode("div", "screenInfo_contentWrap__95SyT", children=[
+                    FakeNode("strong", "screenInfo_screenName",
+                             "17관[PREMIUM] (Laser)"),
+                    premium]),
+                FakeNode("div", "screenInfo_contentWrap__95SyT", children=[
+                    FakeNode("strong", "screenInfo_screenName", "17관 (Laser)"),
+                    regular]),
+            ])])
+
+        booking._click_showtime(page, "10:25", "17관[PREMIUM] (Laser)")
+        self.assertIs(page.clicked[0], premium)
+
+    def test_screen_name_matching_ignores_spacing(self):
+        # text_content()가 조각을 이어 붙이면 공백이 어긋난다.
+        a = showtime("21:00", "-23:30")
+        b = showtime("21:00", "-23:30")
+        page = FakePage([
+            FakeNode("div", "screenInfoStore_container__XZ7Dy", children=[
+                FakeNode("div", "screenInfo_contentWrap__95SyT", children=[
+                    FakeNode("strong", "screenInfo_screenName", "1관(Laser)"), a]),
+                FakeNode("div", "screenInfo_contentWrap__95SyT", children=[
+                    FakeNode("strong", "screenInfo_screenName", "2관(Laser)"), b]),
+            ])])
+        booking._click_showtime(page, "21:00", "2관 (Laser)")
+        self.assertIs(page.clicked[0], b)
+
     def test_hidden_showtimes_are_ignored(self):
         hidden = showtime("18:00", "-21:02")
         hidden.visible = False
@@ -329,19 +385,19 @@ class TestPickSeats(unittest.TestCase):
     def test_all_seats_clicked_reports_nothing_missed(self):
         page = self.SeatPage(["J22", "J23"])
         self.assertEqual(booking._pick_seats(page, ["J22", "J23"]),
-                         (["J22", "J23"], []))
+                         (["J22", "J23"], [], ""))
         self.assertEqual(page.clicked, ["J22", "J23"])
 
     def test_reports_every_seat_it_could_not_click(self):
         # 하나가 실패해도 나머지를 마저 눌러 봐야 무엇이 팔렸는지 다 알 수 있다.
         page = self.SeatPage(["J22"])
         self.assertEqual(booking._pick_seats(page, ["J22", "J23", "J24"]),
-                         (["J22"], ["J23", "J24"]))
+                         (["J22"], ["J23", "J24"], ""))
 
     def test_reports_what_it_managed_to_click(self):
         # 다시 고를 수 있는지가 여기에 달렸다 — 이미 골라 둔 게 있으면 못 고친다.
         page = self.SeatPage(["J23"])
-        clicked, missed = booking._pick_seats(page, ["J22", "J23"])
+        clicked, missed, _ = booking._pick_seats(page, ["J22", "J23"])
         self.assertEqual(clicked, ["J23"])
         self.assertEqual(missed, ["J22"])
 
@@ -352,7 +408,7 @@ class TestPickSeats(unittest.TestCase):
 
     def test_no_seat_clicked_at_all_is_reported_the_same_way(self):
         page = self.SeatPage([])
-        clicked, missed = booking._pick_seats(page, ["J22", "J23"])
+        clicked, missed, _ = booking._pick_seats(page, ["J22", "J23"])
         self.assertEqual(missed, ["J22", "J23"])
         self.assertEqual(clicked, [])
         self.assertEqual(page.clicked, [])
@@ -502,6 +558,130 @@ class TestSelectBlockRepicksAtTheSeatMap(unittest.TestCase):
         self.assertEqual(len(self.shots), 1, "화면은 첫 실패에 한 번만")
 
 
+class TestBookingUrl(unittest.TestCase):
+    """예매 화면 딥링크 — 영화·극장·날짜를 주소로 넘긴다."""
+
+    def url(self):
+        return booking.booking_url("30001323", "0013", "용산아이파크몰", "20260831")
+
+    def test_carries_every_parameter_the_page_reads(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        q = parse_qs(urlsplit(self.url()).query)
+        self.assertEqual(q["movNo"], ["30001323"])
+        self.assertEqual(q["siteNo"], ["0013"])
+        self.assertEqual(q["scnYmd"], ["20260831"])
+
+    def test_includes_the_theater_name(self):
+        # siteNo만으로는 화면이 극장을 고르지 못한다 — 실측으로 확인한 조건이라
+        # 누가 '코드만 있으면 되겠지' 하고 지우지 않게 고정해 둔다.
+        from urllib.parse import parse_qs, urlsplit
+
+        self.assertEqual(
+            parse_qs(urlsplit(self.url()).query)["siteNm"], ["용산아이파크몰"])
+
+    def test_theater_name_is_percent_encoded(self):
+        self.assertNotIn("용산", self.url())
+        self.assertIn("%EC%9A%A9%EC%82%B0", self.url())
+
+    def test_points_at_the_booking_page(self):
+        self.assertTrue(self.url().startswith(booking.BOOKING_PAGE + "?"))
+
+
+class TestDirectOpenFallsBackWhenUnsure(unittest.TestCase):
+    """딥링크가 먹었는지 확인되지 않으면 예전 클릭 경로로 돌아간다.
+
+    잘못된 날짜를 선점하는 것보다 10초 더 쓰는 편이 훨씬 낫다.
+    """
+
+    class DatePage:
+        """날짜 스트립만 흉내낸다. active에 든 날이 선택된 상태."""
+
+        def __init__(self, days, active, goto_fails=False):
+            self.days, self.active = days, set(active)
+            self.goto_fails = goto_fails
+            self.visited = []
+
+        def goto(self, url, **kw):
+            if self.goto_fails:
+                raise RuntimeError("접속 실패")
+            self.visited.append(url)
+
+        def wait_for_selector(self, selector, **kw):
+            if "dayScroll" not in selector:
+                raise RuntimeError("없음")
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def locator(self, selector):
+            page = self
+
+            class Btn:
+                def __init__(self, day):
+                    self.day = day
+
+                def is_visible(self):
+                    return True
+
+                def get_attribute(self, name):
+                    return ("dayScroll_scrollItem itemActive"
+                            if self.day in page.active else "dayScroll_scrollItem")
+
+                def locator(self, sel):
+                    day = self.day
+
+                    class N:
+                        @property
+                        def first(self):
+                            return self
+
+                        def text_content(self):
+                            return day
+                    return N()
+
+            class Loc:
+                def all(self):
+                    return ([Btn(d) for d in page.days]
+                            if "dayScroll" in selector else [])
+            return Loc()
+
+    def ctx(self, ymd="20260831"):
+        return {"mov_no": "30001323", "site_no": "0013",
+                "site_nm": "용산아이파크몰", "scn_ymd": ymd}
+
+    def test_uses_the_link_when_the_date_is_confirmed(self):
+        page = self.DatePage(["30", "31", "9.1"], active=["31"])
+        self.assertTrue(booking._open_booking_direct(page, self.ctx()))
+        self.assertIn("movNo=30001323", page.visited[0])
+
+    def test_falls_back_when_another_date_is_selected(self):
+        # 링크는 8/31인데 화면은 30일에 머물러 있다 — 그대로 가면 엉뚱한 날짜다.
+        page = self.DatePage(["30", "31"], active=["30"])
+        self.assertFalse(booking._open_booking_direct(page, self.ctx()))
+
+    def test_falls_back_when_no_date_looks_selected(self):
+        # 활성 표시를 못 찾으면 '맞다'고 볼 근거가 없다.
+        page = self.DatePage(["30", "31"], active=[])
+        self.assertFalse(booking._open_booking_direct(page, self.ctx()))
+
+    def test_falls_back_when_navigation_fails(self):
+        page = self.DatePage(["31"], active=["31"], goto_fails=True)
+        self.assertFalse(booking._open_booking_direct(page, self.ctx()))
+
+    def test_falls_back_without_a_movie_code(self):
+        # 코드가 없으면 주소를 만들 수 없다 (이름으로만 건 감시 등).
+        page = self.DatePage(["31"], active=["31"])
+        ctx = self.ctx()
+        ctx["mov_no"] = ""
+        self.assertFalse(booking._open_booking_direct(page, ctx))
+        self.assertEqual(page.visited, [], "주소도 못 만드는데 접속했다")
+
+    def test_month_crossing_date_is_matched(self):
+        page = self.DatePage(["31", "9.1"], active=["9.1"])
+        self.assertTrue(booking._open_booking_direct(page, self.ctx("20260901")))
+
+
 class TestClickVisibleSkipsHiddenTwins(unittest.TestCase):
     """8/25 실패 재현: `.first`가 숨겨진 사본을 잡아 타임아웃까지 기다렸다.
 
@@ -558,6 +738,114 @@ class TestClickVisibleSkipsHiddenTwins(unittest.TestCase):
         self.assertIn("영화", msg)
         self.assertIn("숨겨진 것 2개", msg)
         self.assertEqual(page.clicked, [])
+
+
+class TestSeatNoticeIsReportedHonestly(unittest.TestCase):
+    """좌석 종류가 요구하는 인원 단위가 안 맞으면 그렇다고 말해야 한다.
+
+    실제로 씨네드쉐프에서 3석을 잡으려다 '패밀리 리클라이너는 4인 단위로 인원을
+    선택해주세요'가 떴다. 이걸 안 읽으면 "그 사이 팔린 것 같습니다"라고 보고하는데,
+    좌석은 멀쩡히 비어 있으므로 사용자가 할 일이 전혀 다르다.
+    """
+
+    class NoticePage(TestPickSeats.SeatPage):
+        """첫 좌석을 누르면 안내 팝업이 떠 나머지를 못 누르는 화면."""
+
+        def __init__(self, available, notice):
+            super().__init__(available)
+            self.notice = notice
+            self.shown = False
+
+        def get_by_text(self, label, exact=False):
+            if self.shown:                      # 팝업이 덮고 있으면 못 누른다
+                page = self
+
+                class Blocked:
+                    @property
+                    def last(self):
+                        return self
+
+                    def click(self, timeout=None):
+                        raise RuntimeError("팝업이 가림")
+                return Blocked()
+            loc = super().get_by_text(label, exact=exact)
+            page = self
+            inner = loc.last
+
+            class Wrap:
+                @property
+                def last(self):
+                    return self
+
+                def click(self, timeout=None):
+                    inner.click(timeout=timeout)
+                    page.shown = True
+            return Wrap()
+
+        def evaluate(self, script):
+            return [self.notice] if self.shown else []
+
+        def locator(self, selector):
+            page = self
+
+            class Loc:
+                def all(self):
+                    return []
+            return Loc()
+
+        def get_by_role(self, role, name=None, exact=False):
+            page = self
+
+            class Btn:
+                def is_visible(self):
+                    return page.shown
+
+                def click(self, timeout=None):
+                    page.shown = False
+
+            class Loc:
+                def all(self):
+                    return [Btn()] if page.shown else []
+            return Loc()
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    NOTICE = "선택하신 패밀리 리클라이너는 4인 단위로 인원을 선택해주세요. H1,H2,H3,H4"
+
+    def test_notice_is_returned_instead_of_a_sold_out_guess(self):
+        page = self.NoticePage(["H1", "H2", "H3"], self.NOTICE)
+        clicked, missed, notice = booking._pick_seats(page, ["H1", "H2", "H3"])
+        self.assertEqual(clicked, ["H1"])
+        self.assertEqual(missed, ["H2", "H3"])
+        self.assertIn("4인 단위", notice)
+
+    def test_remaining_seats_are_not_hammered_after_a_notice(self):
+        # 팝업이 화면을 덮은 뒤 남은 좌석을 계속 눌러 봐야 좌석당 3초씩 버릴 뿐이다.
+        page = self.NoticePage(["H1", "H2", "H3"], self.NOTICE)
+        booking._pick_seats(page, ["H1", "H2", "H3"])
+        self.assertEqual(page.clicked, ["H1"], "팝업이 뜬 뒤에도 계속 눌렀다")
+
+    def test_select_block_reports_the_notice(self):
+        page = self.NoticePage(["H1", "H2", "H3"], self.NOTICE)
+        booking._save_screenshot = lambda p, c: None
+        out = booking._select_block(
+            None, page, {"party": 3, "rows": None, "seat_labels": ["H1", "H2", "H3"],
+                         "mov_nm": "오디세이", "start_hhmm": "22:20"},
+            seats_fn=lambda s, c: [
+                seat_row("H1", 1, True), seat_row("H2", 3, True),
+                seat_row("H3", 5, True)])
+        self.assertFalse(out["ok"])
+        self.assertIn("4인 단위", out["error"])
+        self.assertNotIn("팔린 것", out["error"])
+
+    def test_seat_map_itself_is_not_mistaken_for_a_notice(self):
+        # 좌석맵도 큰 모달로 뜬다 — 좌석 라벨이 잔뜩 든 건 안내가 아니다.
+        class MapPage:
+            def evaluate(self, script):
+                return ["씨네드쉐프 용산 닫기 " + " ".join(
+                    f"{r}{n}" for r in "ABCDEFGH" for n in range(1, 9))]
+        self.assertEqual(booking.seat_notice(MapPage()), "")
 
 
 class TestSelectorsAreNotPinnedToHashes(unittest.TestCase):

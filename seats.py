@@ -600,7 +600,9 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                 session, w, row, seats, mov_nm=mov_nm, site_nm=site_nm,
                 # 좌석맵을 다시 읽으려면 회차에 siteNo가 없을 때의 폴백이 필요하다
                 # — 위 _seat_map 호출과 같은 값을 쓴다.
-                site_no=site_no)
+                site_no=site_no,
+                # 예매 화면을 딥링크로 바로 열 때 쓴다 (booking.booking_url).
+                mov_no=mov_no)
             act = outcome.get("action")
             if act == "held":
                 alerts.append({"kind": "book_held", "body": booking.build_hold_alert(

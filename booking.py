@@ -31,6 +31,15 @@ log = logging.getLogger("cgv-watch.booking")
 SEAT_HOLD_URL_MARK = "seatTemp/seatTempPrmp"
 
 BOOKING_PAGE = "https://cgv.co.kr/cnm/movieBook/movie"
+# 회차를 고르면 넘어가는 인원 선택 화면. 여기 닿았는지로 진행을 판정한다.
+VISITOR_PAGE_MARK = "/cnm/selectVisitorCnt"
+
+# CGV는 접속이 몰리면 가상 대기열을 세운다("대기인원 67명 · 예상 대기시간 3초").
+# 그동안 화면은 예매 목록 그대로라, 고정 대기로 넘겨짚으면 다음 단계가 통째로
+# 실패한다 — 인원 선택 버튼을 못 찾는 모양으로 나타난다.
+QUEUE_MARKS = ("대기중입니다", "대기인원", "예상 대기시간")
+QUEUE_WAIT_MS = 90_000
+
 # '결제하기'를 누르는 것이 **선점까지만** 한다는 전제 위에 이 모듈의 안전성이
 # 통째로 서 있다. CGV가 그 버튼의 뜻을 바꾸면 우리는 아무것도 눈치채지 못한 채
 # 돈을 쓰게 된다 — 코드가 스스로 알아챌 수 있는 유일한 지점이 그때 나가는
@@ -64,9 +73,18 @@ SHOWTIME_SELECTORS = (
 )
 
 # 상영관 블록의 클래스 조각. 같은 시각의 회차가 여러 상영관에 있을 때 어느 쪽인지
-# 가리는 데 쓴다. 이 컨테이너의 텍스트는 "IMAX관 | IMAX LASER 2D | 07:30-10:32 | …"
-# 처럼 상영관 이름으로 시작한다.
-SCREEN_CONTAINER_CLASSES = ("screenInfoStore_container", "screenInfo_contentWrap")
+# 가리는 데 쓴다.
+#
+# **안쪽부터 적는다.** 바깥 컨테이너(screenInfoStore_container)는 그 날의 상영관을
+# 전부 품고 있어서 어느 후보로 물어도 이름이 걸린다 — 그걸 먼저 보면 아무것도
+# 가려지지 않는다. 실제로 '17관[PREMIUM] (Laser)'(12석)와 '17관 (Laser)'(156석)가
+# 같은 10:25에 있을 때 둘 다 통과해 버려서, 안전장치가 "가리지 못했습니다"로
+# 멈추는 바람에 정작 잡을 수 있는 좌석을 놓쳤다.
+SCREEN_CONTAINER_CLASSES = (
+    "screenInfo_timeItem",        # 회차 하나 — 이 층에 상영관 이름이 붙는 배치도 있다
+    "screenInfo_contentWrap",     # 상영관 하나
+    "screenInfoStore_container",  # 그 날 전체 (마지막 수단)
+)
 
 # 날짜 스트립. 버튼 하나가 하루이고, 안의 number 스팬이 '31' 또는 '9.1'을 담는다.
 # 스와이퍼가 같은 버튼을 숨김 사본으로 한 벌 더 만들어 두므로 **보이는 것만** 쓴다.
@@ -113,7 +131,7 @@ def _parse_limit_dt(raw: str):
 
 def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
                   *, mov_nm: str = "", site_nm: str = "", site_no: str = "",
-                  hold_fn=None, dry_run: bool = False) -> dict:
+                  mov_no: str = "", hold_fn=None, dry_run: bool = False) -> dict:
     """감시 하나의 한 회차에서 자동 선점을 시도한다.
 
     반환: {"action": skip|held|failed|no_seats, ...}. hold_fn(session, ctx)->result 를
@@ -154,6 +172,8 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
            "start_hhmm": start_hhmm, "seat_labels": labels, "party": party,
            # 좌석맵에서 다시 고를 때 쓴다 — 후보와 같은 조건이어야 한다.
            "rows": watch.get("rows"), "site_no": site_no,
+           # 예매 화면을 딥링크로 바로 열 때 쓴다 (booking_url).
+           "mov_no": mov_no,
            # 같은 시각의 회차가 여러 상영관에 있을 때 어느 쪽인지 가리는 데 쓴다.
            "scns_nm": row.get("expoScnsNm") or row.get("scnsNm") or "",
            "row": row}
@@ -286,6 +306,78 @@ def _click_role(page, name: str, *, what: str, exact: bool = False,
     buttons[0].click(timeout=timeout)
 
 
+def booking_url(mov_no: str, site_no: str, site_nm: str, scn_ymd: str) -> str:
+    """영화·극장·날짜가 이미 골라진 예매 화면 주소.
+
+    예매 페이지가 movNo·siteNo·siteNm·scnYmd를 주소에서 읽는다. 이 주소로 바로
+    들어가면 영화 → 극장 → 날짜 클릭 세 단계를 통째로 건너뛴다. 그 구간이
+    자동 예매가 가장 자주 죽던 곳이다(숨겨진 요소를 눌러 타임아웃).
+
+    **극장 이름(siteNm)이 빠지면 동작하지 않는다.** siteNo만으로는 화면이 극장을
+    고르지 못한다 — 실측으로 확인했다.
+    """
+    from urllib.parse import urlencode
+
+    return BOOKING_PAGE + "?" + urlencode({
+        "movNo": mov_no, "siteNo": site_no, "siteNm": site_nm, "scnYmd": scn_ymd})
+
+
+def _date_is_selected(page, wanted: list[str]) -> bool | None:
+    """날짜 스트립에서 원하는 날이 활성인지. 확인할 수 없으면 None.
+
+    `_assert_date_selected`와 달리 예외를 내지 않는다 — 딥링크가 먹었는지 보고
+    아니면 예전 클릭 경로로 되돌아가야 하므로, 판정만 돌려준다.
+    """
+    for selector in DATE_BUTTON_SELECTORS:
+        try:
+            actives = [b for b in _visible(page.locator(selector).all())
+                       if DATE_ACTIVE_MARK in (b.get_attribute("class") or "")]
+        except Exception:  # noqa: BLE001 - 다음 후보 셀렉터로
+            continue
+        if not actives:
+            continue
+        for button in actives:
+            try:
+                text = (button.locator(DATE_NUMBER_SELECTOR).first
+                        .text_content() or "").strip()
+            except Exception:  # noqa: BLE001
+                continue
+            if text in wanted:
+                return True
+        return False
+    return None
+
+
+def _open_booking_direct(page, ctx: dict) -> bool:
+    """딥링크로 그 날짜의 상영표까지 바로 연다. 확인되면 True.
+
+    날짜가 맞다고 **확인될 때만** True다. 확인 못 하면 False를 내 호출자가 예전
+    클릭 경로로 돌아가게 한다 — 그쪽도 자기 검증을 한다. 잘못된 날짜를 선점하는
+    것보다 10초 더 쓰는 편이 훨씬 낫다.
+    """
+    if not ctx.get("mov_no"):
+        return False
+    url = booking_url(ctx["mov_no"], ctx.get("site_no") or "",
+                      ctx.get("site_nm") or "", ctx["scn_ymd"])
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=40000)
+    except Exception as exc:  # noqa: BLE001 - 클릭 경로로 폴백한다
+        log.warning("예매 화면 딥링크 접속 실패 (%s) — 클릭으로 진행합니다", exc)
+        return False
+
+    # 고정 대기 대신 날짜 스트립이 그려질 때까지 기다린다.
+    _wait_for_any(page, DATE_BUTTON_SELECTORS)
+    verdict = _date_is_selected(page, date_labels(ctx["scn_ymd"]))
+    if verdict:
+        log.info("예매 화면을 %s로 바로 열었습니다 (클릭 3단계 생략)",
+                 ctx["scn_ymd"])
+        return True
+    log.warning("딥링크가 %s를 열지 못했습니다(%s) — 클릭으로 진행합니다",
+                ctx["scn_ymd"],
+                "다른 날짜" if verdict is False else "날짜 확인 불가")
+    return False
+
+
 def _click_date(page, scn_ymd: str) -> None:
     """상영 날짜를 고른다.
 
@@ -372,10 +464,7 @@ def _click_showtime(page, start_hhmm: str, screen_name: str = "") -> None:
         if not nodes:
             continue
 
-        if len(nodes) > 1 and screen_name:
-            narrowed = [n for n in nodes if _in_screen(n, screen_name)]
-            if narrowed:
-                nodes = narrowed
+        nodes = _narrow_by_screen(nodes, screen_name)
         if len(nodes) > 1:
             raise RuntimeError(
                 f"{start_hhmm} 회차가 {len(nodes)}곳에 있어 어느 상영관인지 "
@@ -405,17 +494,44 @@ def _click_showtime_node(node, start_hhmm: str) -> None:
     node.click(timeout=6000)
 
 
-def _pick_seats(page, seat_labels) -> tuple[list[str], list[str]]:
+def seat_notice(page) -> str:
+    """좌석을 누른 뒤 뜬 안내 팝업의 문구. 없으면 ''.
+
+    좌석 종류마다 규칙이 다르다 — 실제로 '선택하신 패밀리 리클라이너는 4인 단위로
+    인원을 선택해주세요'가 떠서 나머지 좌석을 누를 수 없었다. 이 문구를 읽지 않으면
+    "그 사이 팔린 것 같습니다"라고 **틀리게** 보고하게 된다. 팔린 게 아니라 인원이
+    맞지 않는 것이라, 사용자가 할 일이 전혀 다르다.
+    """
+    try:
+        texts = page.evaluate("""() => [...document.querySelectorAll(
+              '.cgv-modal, [role="dialog"]')]
+            .filter(d => d.offsetWidth || d.offsetHeight)
+            .map(d => (d.innerText || '').replace(/\\s+/g, ' ').trim())""")
+    except Exception:  # noqa: BLE001 - 못 읽으면 안내가 없는 것으로 본다
+        return ""
+    for text in texts or []:
+        # 좌석맵 자체가 큰 모달로 떠 있다 — 좌석 라벨이 잔뜩 든 건 안내가 아니다.
+        if 8 <= len(text) <= 200 and "닫기" not in text[:6]:
+            return text
+    return ""
+
+
+def _pick_seats(page, seat_labels) -> tuple[list[str], list[str], str]:
     """좌석맵에서 지정한 좌석을 하나씩 누른다.
+
+    반환: (누른 것, 못 누른 것, 안내 문구). 안내 문구가 있으면 그게 실패 사유다.
 
     한 좌석이 실패해도 나머지는 마저 눌러 본다 — 무엇이 팔렸는지 전부 알아야
     쓸 만한 오류 문구가 나오고, 어차피 여기서는 아직 아무것도 선점되지 않는다.
+    다만 **안내 팝업이 뜨면 거기서 멈춘다**: 팝업이 화면을 덮고 있어 나머지 클릭은
+    어차피 타임아웃까지 기다렸다 실패할 뿐이다(좌석 하나에 3초씩 버린다).
+
     **무엇을 눌렀는지도 함께 돌려준다.** 다시 고를 수 있는지가 여기에 달렸다:
     하나도 못 눌렀으면 화면에 아무 흔적이 없어 그냥 다시 고르면 되지만, 일부가
     이미 선택돼 있으면 인원수를 넘겨 엉뚱한 자리를 선점할 수 있다.
     """
     clicked, missed = [], []
-    for label in seat_labels:
+    for i, label in enumerate(seat_labels):
         try:
             page.get_by_text(label, exact=True).last.click(timeout=3000)
         except Exception as exc:  # noqa: BLE001 - 못 누른 좌석은 모아서 보고
@@ -423,7 +539,14 @@ def _pick_seats(page, seat_labels) -> tuple[list[str], list[str]]:
             missed.append(label)
         else:
             clicked.append(label)
-    return clicked, missed
+
+        notice = seat_notice(page)
+        if notice:
+            log.warning("좌석 안내 팝업: %s", notice)
+            dismiss_modals(page)
+            missed.extend(seat_labels[i + 1:])
+            return clicked, missed, notice
+    return clicked, missed, ""
 
 
 def live_seats(session, ctx: dict) -> list[dict]:
@@ -487,9 +610,17 @@ def _select_block(session, page, ctx: dict, *, seats_fn=None) -> dict:
                 log.info("좌석을 다시 골랐습니다: %s → %s",
                          ", ".join(candidate) or "(없음)", ", ".join(labels))
 
-        clicked, missed = _pick_seats(page, labels)
+        clicked, missed, notice = _pick_seats(page, labels)
         if not missed:
             return {"ok": True, "labels": labels, "error": ""}
+
+        # 안내 팝업이 있으면 그게 진짜 사유다. 좌석 종류가 요구하는 인원 단위가
+        # 안 맞는 것 같은 경우라, 다시 고른다고 풀리지 않는다 — 바로 끝낸다.
+        if notice:
+            shot = _save_screenshot(page, ctx) if not shot_saved else shot
+            return {"ok": False, "labels": [],
+                    "error": f"{notice}"
+                             + (f" (화면: {shot})" if shot else "")}
 
         last_error = _partial_seats_error(labels, missed)
         if not shot_saved:
@@ -542,17 +673,122 @@ def payment_mark(url: str) -> str | None:
     return next((m for m in PAYMENT_URL_MARKS if m.lower() in lowered), None)
 
 
-def _in_screen(node, screen_name: str) -> bool:
-    """이 회차가 지정한 상영관 블록 안에 있는지."""
-    for cls in SCREEN_CONTAINER_CLASSES:
+def page_text(page) -> str:
+    try:
+        return page.evaluate("() => document.body.innerText || ''")
+    except Exception:  # noqa: BLE001 - 못 읽으면 판단 근거가 없는 것으로 본다
+        return ""
+
+
+def in_queue(text: str) -> bool:
+    """가상 대기열 화면인지."""
+    return any(mark in text for mark in QUEUE_MARKS)
+
+
+def wait_past_queue(page, timeout_ms: int = QUEUE_WAIT_MS) -> bool:
+    """회차를 고른 뒤 인원 선택 화면에 닿을 때까지 기다린다. 닿으면 True.
+
+    CGV는 접속이 몰리면 가상 대기열을 세운다. 그동안 주소도 화면도 예매 목록
+    그대로라, 고정 시간만 자고 넘어가면 인원 선택 버튼을 못 찾고 통째로 실패한다.
+    대기열은 몇 초에서 몇 분까지 가므로 **화면이 바뀔 때까지** 기다려야 한다.
+
+    좌석 경쟁 중이라도 여기서 기다리는 건 손해가 아니다 — 줄을 안 서면 아예
+    예매 화면에 못 들어간다.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    announced = False
+    while time.monotonic() < deadline:
         try:
-            container = node.locator(
-                f"xpath=ancestor::*[contains(@class, '{cls}')][1]")
-            if container.count():
-                return screen_name in (container.first.text_content() or "")
-        except Exception:  # noqa: BLE001 - 다음 컨테이너 후보로
-            continue
+            if VISITOR_PAGE_MARK in page.url:
+                if announced:
+                    log.info("대기열을 통과했습니다")
+                return True
+        except Exception:  # noqa: BLE001 - 페이지가 전환 중일 수 있다
+            pass
+        text = page_text(page)
+        if in_queue(text):
+            if not announced:
+                announced = True
+                log.info("CGV 대기열에 들어갔습니다 — 통과할 때까지 기다립니다")
+        page.wait_for_timeout(1000)
     return False
+
+
+def dismiss_modals(page, rounds: int = 3) -> int:
+    """화면을 덮은 팝업을 닫는다. 닫은 개수를 돌려준다.
+
+    예매 화면은 이벤트·안내 팝업을 띄우는데, 이게 떠 있으면 그 아래 버튼을 누를 수
+    없다 — Playwright가 "modal-bg intercepts pointer events"로 타임아웃까지 기다렸다
+    죽는다. 실제로 인원 선택에서 이 모양으로 막혔다.
+
+    닫기 버튼도 **보이는 것만** 누른다. 팝업은 숨은 사본을 흔히 남긴다.
+    여러 개가 겹쳐 뜰 수 있어 몇 바퀴 돈다.
+    """
+    closed = 0
+    for _ in range(rounds):
+        try:
+            open_now = page.locator(
+                '.cgv-modal.active, [role="dialog"][aria-modal="true"]')
+            if not any(m.is_visible() for m in open_now.all()):
+                return closed
+        except Exception:  # noqa: BLE001 - 못 세면 그냥 닫기를 시도한다
+            pass
+
+        hit = False
+        for name in ("닫기", "확인"):
+            try:
+                buttons = [b for b in page.get_by_role("button", name=name).all()
+                           if b.is_visible()]
+            except Exception:  # noqa: BLE001 - 다음 이름으로
+                continue
+            if not buttons:
+                continue
+            try:
+                buttons[0].click(timeout=2500)
+            except Exception:  # noqa: BLE001 - 닫히는 중이었을 수 있다
+                continue
+            closed += 1
+            hit = True
+            page.wait_for_timeout(600)
+            break
+        if not hit:
+            break
+    return closed
+
+
+def _ancestor_text(node, cls: str) -> str:
+    """그 클래스 조각을 가진 가장 가까운 조상의 텍스트. 없으면 빈 문자열."""
+    try:
+        container = node.locator(
+            f"xpath=ancestor::*[contains(@class, '{cls}')][1]")
+        return (container.first.text_content() or "") if container.count() else ""
+    except Exception:  # noqa: BLE001 - 못 읽으면 이 층은 판단 근거가 없다
+        return ""
+
+
+def _narrow_by_screen(nodes: list, screen_name: str) -> list:
+    """같은 시각 후보들을 상영관 이름으로 좁힌다. 하나로 갈릴 때만 좁혀서 돌려준다.
+
+    화면은 상영관 블록을 겹쳐 놓는다. 바깥 컨테이너는 그 날 상영관을 전부 품고
+    있어서 **어느 후보로 물어도 이름이 걸린다** — 그 층에서 판단하면 아무것도
+    못 가린다. 그래서 안쪽 층부터 훑으며 후보가 딱 하나로 갈리는 층을 찾는다.
+
+    예: '17관[PREMIUM] (Laser)'와 '17관 (Laser)'가 같은 10:25에 있을 때, 회차
+    층에서는 후자에만 이름이 붙어 하나로 갈린다.
+
+    끝내 못 가리면 원래 목록을 그대로 돌려준다 — 호출자가 "가리지 못했습니다"로
+    멈춘다. 찍어서 엉뚱한 상영관을 선점하느니 멈추는 게 낫다.
+    """
+    if not screen_name or len(nodes) < 2:
+        return nodes
+    from watch import normalize
+
+    want = normalize(screen_name)
+    for cls in SCREEN_CONTAINER_CLASSES:
+        hits = [n for n in nodes if want in normalize(_ancestor_text(n, cls))]
+        if len(hits) == 1:
+            return hits
+    return nodes
 
 
 def _save_screenshot(page, ctx: dict) -> str | None:
@@ -605,24 +841,32 @@ def hold_block(session, ctx: dict) -> dict:
     page.on("response", on_resp)
 
     try:
-        page.goto(BOOKING_PAGE, wait_until="domcontentloaded", timeout=40000)
-        page.wait_for_timeout(3500)
-        _click_visible(page, ctx["mov_nm"], exact=True, what="영화", timeout=10000)
-        page.wait_for_timeout(2500)
-        _click_visible(page, ctx["site_nm"], exact=False, what="극장", timeout=6000)
-        page.wait_for_timeout(2500)
-        # 날짜를 고른다. 이 화면은 기본이 **오늘**이라, 건너뛰면 오늘 상영표에서
-        # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한
-        # 날짜를 선점한다.
-        _click_date(page, ctx["scn_ymd"])
+        # 영화 → 극장 → 날짜를 주소 하나로 건너뛴다. 그 세 클릭이 자동 예매가 가장
+        # 자주 죽던 구간이다 — 스와이퍼·바텀시트가 만든 **숨겨진 사본**을 눌러
+        # 타임아웃이 났다(`.first`는 보이는 것을 고른다는 보장이 없다).
+        if not _open_booking_direct(page, ctx):
+            page.goto(BOOKING_PAGE, wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_timeout(3500)
+            _click_visible(page, ctx["mov_nm"], exact=True, what="영화",
+                           timeout=10000)
+            page.wait_for_timeout(2500)
+            _click_visible(page, ctx["site_nm"], exact=False, what="극장",
+                           timeout=6000)
+            page.wait_for_timeout(2500)
+            # 날짜를 고른다. 이 화면은 기본이 **오늘**이라, 건너뛰면 오늘 상영표에서
+            # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한
+            # 날짜를 선점한다.
+            _click_date(page, ctx["scn_ymd"])
         _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""))
-        page.wait_for_timeout(5000)
-        for t in ("확인", "닫기"):
-            try:
-                page.get_by_role("button", name=t).first.click(timeout=2500)
-                break
-            except Exception:  # noqa: BLE001
-                pass
+        # 인원 선택 화면에 닿을 때까지 기다린다. 고정 시간으로 넘겨짚으면 안 된다 —
+        # 접속이 몰리면 CGV가 가상 대기열을 세우고, 그동안 화면은 그대로다.
+        if not wait_past_queue(page):
+            raise RuntimeError(
+                "인원 선택 화면으로 넘어가지 못했습니다"
+                + (" (대기열이 길어 시간 안에 통과하지 못했습니다)"
+                   if in_queue(page_text(page)) else ""))
+        # 이벤트·안내 팝업이 떠 있으면 아래 버튼을 누를 수 없다.
+        dismiss_modals(page)
         # 관람인원: party명 (일반 기준). 권종 세분화는 후속 단계.
         # 버튼 이름은 접근성 이름으로만 잡힌다 — 안의 숫자와 '선택'이 서로 다른
         # 요소라 텍스트로 찾으면 걸리지 않는다.
