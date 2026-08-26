@@ -47,6 +47,9 @@ VISITOR_PAGE_MARK = "/cnm/selectVisitorCnt"
 # 실패한다 — 인원 선택 버튼을 못 찾는 모양으로 나타난다.
 QUEUE_MARKS = ("대기중입니다", "대기인원", "예상 대기시간")
 QUEUE_WAIT_MS = 90_000
+# 대기열이 아닐 때(= 그냥 화면이 넘어가는 중일 때) 얼마나 촘촘히 볼지. 1초씩
+# 자면 이미 넘어간 화면을 최대 1초 늦게 알아채고, 그만큼 좌석 경쟁에서 밀린다.
+QUEUE_POLL_MS = 200
 
 # 좌석 선택 뒤의 '결제하기'가 **선점까지만** 한다는 전제 위에 선점 단계의 안전성이
 # 서 있다. CGV가 그 버튼의 뜻을 바꾸면 우리는 아무것도 눈치채지 못한 채 돈을 쓰게
@@ -154,6 +157,28 @@ PAY_PAGE_ROUNDS = 6
 PAY_PAGE_ROUND_MS = 2500
 # 결제 요청 뒤 카카오페이 iframe이 뜨기를 기다리는 시간.
 PAY_BRIDGE_WAIT_MS = 25_000
+
+# ── 화면 전환 기다리기 ───────────────────────────────────────────────────────
+# 예전에는 단계마다 고정 시간을 잤다(인원 1.5초 · 좌석맵 1.5초 · 선택완료 2.5초 ·
+# 결제하기 5초). 딥링크가 성공하는 정상 경로에서 그 합이 **10.5초**로, 선점 전체
+# (실측 18초)의 절반을 넘었다. 좌석 경쟁은 초 단위라 이 시간이 곧 "그 사이 팔린 것
+# 같습니다"가 된다 — 화면이 준비되면 **바로** 넘어가도록 짧게 폴링한다.
+STEP_POLL_MS = 100
+SEATMAP_READY_MS = 5000      # 좌석맵 모달이 열려 좌석이 눌릴 수 있게 될 때까지
+PAY_BUTTON_READY_MS = 6000   # 좌석 선택완료 → '결제하기'가 뜰 때까지
+HOLD_RESPONSE_MS = 12000     # '결제하기' → seatTempPrmp 응답이 올 때까지
+
+# 좌석맵에 좌석이 그려졌는지 보는 표식.
+#
+# **미니맵과 헷갈리면 안 된다.** 화면 아래쪽 작은 좌석 그림(`seatMainMap_seatNumber`)은
+# 좌석맵을 열기 **전부터** 좌석 수만큼(실측 115개) 깔려 있고 aria-hidden이다. 그걸
+# 보고 "좌석맵이 떴다"고 판정하는 바람에 '선택' 버튼을 아예 누르지 않아, 열리지도
+# 않은 좌석맵에 대고 좌석을 누르다 3초씩 타임아웃을 냈다(실측 12.3초 손해).
+# 실제로 누를 수 있는 좌석은 모달 안의 `seatMap_seatNumber`다 — 이름이 한 글자
+# 차이라 더 조심해야 한다('seatMainMap_'에는 'seatMap_'이 들어 있지 않다).
+SEAT_MAP_SELECTOR = '[class*="seatMap_seatNumber"]'
+# 좌석맵 모달을 여는 '선택' 버튼. 이미 열려 있으면 없으므로 오래 기다리지 않는다.
+SEATMAP_OPEN_MS = 2500
 
 # 좌석 고르기 재시도. 한 바퀴가 [배치도 다시 읽기 → 고르기 → 클릭]이라 1초 안쪽이니
 # 몇 번을 돌아도 싸다. 다만 여기서 오래 끌 이유는 없다 — 이 시각을 넘길 만큼
@@ -383,14 +408,18 @@ def _wait_for_any(page, selectors, timeout: int = 9000) -> None:
 
     끝내 안 나타나도 여기서 예외를 내지는 않는다. 판정은 호출자가 해야 더 쓸모
     있는 문구(어떤 날짜를, 어떤 시각을 찾고 있었는지)를 낼 수 있다.
+
+    **한꺼번에 기다린다.** 예전에는 시간을 셀렉터 수로 쪼개 하나씩 시도했는데,
+    그러면 맞는 셀렉터가 제 몫(3초)보다 조금 늦게 뜨기만 해도 포기하고 다음
+    후보로 넘어가 처음부터 다시 기다린다. 회차 목록이 딱 그랬다 — 실측 5.3초 중
+    3초가 '첫 셀렉터를 기다리다 버린 시간'이었고, 정작 화면에는 그 첫 셀렉터가
+    쓰이고 있었다. 콤마로 묶으면 어느 것이든 먼저 뜨는 순간 돌아온다.
     """
-    share = max(1500, int(timeout / max(1, len(selectors))))
-    for selector in selectors:
-        try:
-            page.wait_for_selector(selector, timeout=share, state="visible")
-            return
-        except Exception:  # noqa: BLE001 - 다음 후보 셀렉터로
-            continue
+    joined = ", ".join(selectors)
+    try:
+        page.wait_for_selector(joined, timeout=timeout, state="visible")
+    except Exception:  # noqa: BLE001 - 판정은 호출자가 한다
+        pass
 
 
 def _click_visible(page, text: str, *, exact: bool, what: str,
@@ -418,19 +447,27 @@ def _click_visible(page, text: str, *, exact: bool, what: str,
 
 def _click_role(page, name: str, *, what: str, exact: bool = False,
                 timeout: int = 5000) -> None:
-    """그 이름을 가진 **보이는** 버튼을 누른다.
+    """그 이름을 가진 **보이는** 버튼이 나타나면 누른다.
 
     `_click_visible`과 달리 접근성 이름으로 찾는다. 관람인원 버튼은 숫자와 '선택'이
     서로 다른 요소라 텍스트 매칭으로는 걸리지 않는다.
+
+    **나타날 때까지 기다린다.** `.all()`은 지금 이 순간의 DOM을 그대로 찍어 올 뿐
+    Playwright의 자동 대기가 걸리지 않아서, 화면이 아직 그려지는 중이면 "버튼이
+    화면에 없습니다"로 즉시 실패한다. 단계 사이의 고정 대기를 걷어내자마자 관람인원
+    단계가 이 모양으로 죽었다 — 고정 대기가 우연히 그 시간을 벌어 주고 있었던 것이다.
     """
-    try:
-        buttons = [b for b in page.get_by_role("button", name=name, exact=exact).all()
-                   if b.is_visible()]
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"{what} 버튼을 찾지 못했습니다: {exc}") from exc
-    if not buttons:
+    found: list = []
+
+    def ready() -> bool:
+        found[:] = [b for b in
+                    page.get_by_role("button", name=name, exact=exact).all()
+                    if b.is_visible()]
+        return bool(found)
+
+    if not _wait_until(page, ready, timeout):
         raise RuntimeError(f"{what} '{name}' 버튼이 화면에 없습니다")
-    buttons[0].click(timeout=timeout)
+    found[0].click(timeout=timeout)
 
 
 def booking_url(mov_no: str, site_no: str, site_nm: str, scn_ymd: str) -> str:
@@ -837,7 +874,11 @@ def wait_past_queue(page, timeout_ms: int = QUEUE_WAIT_MS) -> bool:
             if not announced:
                 announced = True
                 log.info("CGV 대기열에 들어갔습니다 — 통과할 때까지 기다립니다")
-        page.wait_for_timeout(1000)
+            # 줄을 섰으면 급할 것 없다. 화면 전문을 읽는 비용이 있으니 1초씩 본다.
+            page.wait_for_timeout(1000)
+        else:
+            # 줄이 없으면 전환이 곧 끝난다 — 촘촘히 봐야 그만큼 빨리 넘어간다.
+            page.wait_for_timeout(QUEUE_POLL_MS)
     return False
 
 
@@ -918,6 +959,80 @@ def _narrow_by_screen(nodes: list, screen_name: str) -> list:
     return nodes
 
 
+def _wait_until(page, check, timeout_ms: int, poll_ms: int = STEP_POLL_MS) -> bool:
+    """check()가 참이 될 때까지 짧게 폴링한다. 됐으면 True, 시간이 다하면 False.
+
+    고정 대기(`wait_for_timeout`) 대신 쓴다. 화면이 0.3초 만에 준비돼도 1.5초를
+    자던 자리들이 선점 시간의 절반을 먹고 있었다.
+
+    검사 도중 나는 예외는 '아직 아님'으로 본다 — 화면이 갈아 끼워지는 중이면
+    locator가 잠깐 터진다.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        try:
+            if check():
+                return True
+        except Exception:  # noqa: BLE001 - 전환 중이면 다음 바퀴에 다시 본다
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        page.wait_for_timeout(poll_ms)
+
+
+class _Steps:
+    """단계별 소요를 재서 한 줄로 남긴다.
+
+    "느린 것 같다"는 인상만으로는 어디를 고쳐야 할지 알 수 없다. 선점이 실패했을
+    때도 어느 단계에서 시간을 썼는지가 로그에 남아야 다음에 판단할 수 있다.
+    """
+
+    def __init__(self) -> None:
+        self._t0 = time.monotonic()
+        self._last = self._t0
+        self._marks: list[tuple[str, float]] = []
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self._marks.append((name, now - self._last))
+        self._last = now
+
+    def summary(self) -> str:
+        total = time.monotonic() - self._t0
+        parts = " · ".join(f"{n} {d:.1f}s" for n, d in self._marks)
+        return f"합계 {total:.1f}s ({parts})" if parts else f"합계 {total:.1f}s"
+
+
+def _seatmap_ready(page) -> bool:
+    """좌석맵 모달이 열려 **누를 수 있는** 좌석이 화면에 있는지.
+
+    개수만 세면 안 된다 — 좌석 요소는 모달이 닫혀 있을 때도 DOM에 들어 있다.
+    실제로 보이는지까지 봐야 '열렸다'는 뜻이 된다.
+    """
+    nodes = page.locator(SEAT_MAP_SELECTOR)
+    if nodes.count() == 0:
+        return False
+    # 좌석맵은 반응형으로 두 벌이 렌더된다(그래서 좌석 클릭도 `.last`를 쓴다).
+    # 어느 쪽이 보이는지 모르므로 양끝을 본다 — 전부 훑으면 수백 번 왕복이다.
+    for node in (nodes.last, nodes.first):
+        try:
+            if node.is_visible():
+                return True
+        except Exception:  # noqa: BLE001 - 갈아 끼우는 중이면 다음 바퀴에
+            continue
+    return False
+
+
+def _visible_pay_buttons(page) -> list:
+    """지금 화면에 보이는 '결제하기' 버튼들.
+
+    숨겨진 사본이 함께 있어서 `.first`로 잡으면 "element is not visible"로
+    타임아웃까지 기다렸다 죽는다 — 선점이 한 번도 성공하지 못한 이유였다.
+    """
+    return [b for b in page.locator("button", has_text="결제하기").all()
+            if b.is_visible()]
+
+
 def _save_screenshot(page, ctx: dict) -> str | None:
     """실패 순간의 화면을 남긴다. 실패해도 조용히 넘어간다(부가 기능이다)."""
     try:
@@ -951,6 +1066,7 @@ def hold_block(session, ctx: dict) -> dict:
 
     page = session.page
     captured = {}
+    steps = _Steps()
     # 좌석맵에 닿기 전에 죽으면 후보가 곧 '시도한 좌석'이다.
     chosen = list(ctx.get("seat_labels") or [])
 
@@ -984,7 +1100,9 @@ def hold_block(session, ctx: dict) -> dict:
             # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한
             # 날짜를 선점한다.
             _click_date(page, ctx["scn_ymd"])
+        steps.mark("화면진입")
         _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""))
+        steps.mark("회차")
         # 인원 선택 화면에 닿을 때까지 기다린다. 고정 시간으로 넘겨짚으면 안 된다 —
         # 접속이 몰리면 CGV가 가상 대기열을 세우고, 그동안 화면은 그대로다.
         if not wait_past_queue(page):
@@ -992,38 +1110,49 @@ def hold_block(session, ctx: dict) -> dict:
                 "인원 선택 화면으로 넘어가지 못했습니다"
                 + (" (대기열이 길어 시간 안에 통과하지 못했습니다)"
                    if in_queue(page_text(page)) else ""))
+        steps.mark("대기열")
         # 이벤트·안내 팝업이 떠 있으면 아래 버튼을 누를 수 없다.
         dismiss_modals(page)
         # 관람인원: party명 (일반 기준). 권종 세분화는 후속 단계.
         # 버튼 이름은 접근성 이름으로만 잡힌다 — 안의 숫자와 '선택'이 서로 다른
         # 요소라 텍스트로 찾으면 걸리지 않는다.
         _click_role(page, f"{ctx['party']} 선택", what="관람인원", timeout=5000)
-        page.wait_for_timeout(1500)
-        # 좌석맵 열기 — 이미 열려 있으면 이 버튼이 없다.
-        try:
-            _click_role(page, "선택", what="좌석 선택", exact=True, timeout=3000)
-        except Exception:  # noqa: BLE001 - 없으면 이미 좌석맵이다
-            pass
-        page.wait_for_timeout(1500)
+        steps.mark("인원")
+        # 좌석맵 열기 — 좌석은 이 모달 안에서만 누를 수 있다. 이미 열려 있으면
+        # 버튼이 없으므로 짧게만 기다리고 넘어간다.
+        if not _seatmap_ready(page):
+            try:
+                _click_role(page, "선택", what="좌석 선택", exact=True,
+                            timeout=SEATMAP_OPEN_MS)
+            except Exception:  # noqa: BLE001 - 없으면 이미 좌석맵이다
+                pass
+        # 좌석이 눌릴 수 있게 될 때까지만 기다린다. 못 봐도 멈추지는 않는다 —
+        # 클래스명이 바뀌었을 수 있고, 그때는 _select_block의 재시도가 받아 준다.
+        if not _wait_until(page, lambda: _seatmap_ready(page), SEATMAP_READY_MS):
+            log.warning("좌석맵이 열린 것을 확인하지 못했습니다 — 그대로 골라 봅니다")
+        steps.mark("좌석맵")
         # 좌석은 **여기 도착해서** 다시 고른다. 감지 때 읽은 배치도는 위의 화면
-        # 전환을 지나오는 30초 남짓 동안 낡는다.
+        # 전환을 지나오는 동안 낡는다.
         picked = _select_block(session, page, ctx)
         if not picked["ok"]:
+            steps.mark("좌석고르기")
             return {"ok": False, "error": picked["error"],
                     "seat_labels": picked["labels"]}
         chosen = picked["labels"]
+        steps.mark("좌석고르기")
         _click_role(page, "선택완료", what="좌석 선택완료", timeout=4000)
-        page.wait_for_timeout(2500)
         # 결제하기 클릭 = 선점 트리거 (여기까지만! 결제 확정/푸시는 안 한다)
-        # 이 버튼도 숨겨진 사본이 있다 — `.first`로 잡으면 "element is not visible"로
-        # 타임아웃까지 기다렸다 죽는다. 선점이 한 번도 성공하지 못한 이유였다.
-        pay = [b for b in page.locator("button", has_text="결제하기").all()
-               if b.is_visible()]
-        if not pay:
+        if not _wait_until(page, lambda: bool(_visible_pay_buttons(page)),
+                           PAY_BUTTON_READY_MS):
             raise RuntimeError("결제하기 버튼이 화면에 없습니다 "
                                "(좌석 선택이 끝나지 않았을 수 있습니다)")
-        pay[0].click(timeout=5000)
-        page.wait_for_timeout(5000)
+        _visible_pay_buttons(page)[0].click(timeout=5000)
+        # 선점 응답이 오면 바로 나간다. 예전에는 무조건 5초를 잤는데, 응답은 보통
+        # 1초 안쪽에 오고 그 차이가 다음 회차를 잡을 수 있느냐를 가른다.
+        if not _wait_until(page, lambda: "body" in captured, HOLD_RESPONSE_MS):
+            log.warning("선점 응답을 %d초 안에 받지 못했습니다",
+                        HOLD_RESPONSE_MS // 1000)
+        steps.mark("선점")
     except Exception as exc:  # noqa: BLE001
         shot = _save_screenshot(page, ctx)
         detail = f" (화면: {shot})" if shot else ""
@@ -1041,6 +1170,9 @@ def hold_block(session, ctx: dict) -> dict:
             page.remove_listener("response", on_resp)
         except Exception:  # noqa: BLE001
             pass
+        # 성공이든 실패든 어디에 시간을 썼는지 남긴다 — "느린 것 같다"는 인상만
+        # 가지고는 어느 단계를 고쳐야 할지 알 수 없다.
+        log.info("자동 예매 소요 — %s", steps.summary())
 
     # 결제 확정 요청이 나갔다면 우리가 알고 있던 화면 흐름이 아니다. 선점이
     # 됐는지와 무관하게 사람이 즉시 확인해야 하므로, 성공으로 넘기지 않고

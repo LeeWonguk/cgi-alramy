@@ -127,7 +127,16 @@ class FakePage(FakeNode):
 
 
 def _select(nodes, selector):
-    """`tag[class*="frag"]`과 `A B` 자손 결합자만 지원하는 아주 작은 매처."""
+    """`tag[class*="frag"]`, `A B` 자손 결합자, `A, B` 묶음만 지원하는 매처."""
+    if "," in selector:
+        # 여러 셀렉터를 한꺼번에 기다리는 경로(booking._wait_for_any). 순서를
+        # 지키며 중복만 걸러 낸다.
+        out = []
+        for part in selector.split(","):
+            for node in _select(nodes, part.strip()):
+                if node not in out:
+                    out.append(node)
+        return out
     parts = selector.split()
     if len(parts) == 2:
         parents = _select(nodes, parts[0])
