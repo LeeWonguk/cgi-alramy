@@ -274,6 +274,10 @@ def register_auth(app: Flask) -> None:
             return None                 # SPA 껍데기는 누구나 (데이터는 API로만)
         if path.startswith("/api/auth/"):
             return None                 # 로그인 흐름 자체
+        if path == "/api/health":
+            # 헬스체크는 로그인할 수 없는 쪽(compose·프록시·모니터링)이 부른다.
+            # 대신 내보내는 내용을 권한에 따라 줄인다 — health() 참고.
+            return None
 
         if g.user is None:
             return fail("로그인이 필요합니다", 401)
@@ -400,7 +404,13 @@ def register_api(app: Flask) -> None:
         if isinstance(exc, HTTPException):
             return exc
         log.exception("API 처리 중 오류")
-        return jsonify({"error": str(exc)}), 500
+        # 예외 문구에는 DSN·경로·내부 구조가 섞여 나온다. 진단에는 그게 필요하니
+        # 소유자에게만 그대로 주고, 나머지에게는 로그를 보라고만 한다.
+        user = me()
+        if user and user.get("is_owner"):
+            return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": "서버에서 오류가 발생했습니다 "
+                                 "(자세한 내용은 서버 로그에 있습니다)"}), 500
 
     def owner_only():
         """소유자 전용 동작 앞에 둔다. 통과하면 None."""
@@ -408,13 +418,24 @@ def register_api(app: Flask) -> None:
 
     @app.get("/api/health")
     def health():
+        """살아 있는지. **로그인 없이도** 열린다 — 헬스체크가 그래야 쓸모 있다.
+
+        그래서 내용은 권한에 따라 자른다. 익명에게는 뜨고/안 뜨고만 알려주고,
+        접속 문자열·워커 내부 상태·서버 버전은 소유자에게만 보낸다.
+        """
         info = parts(app)
+        ok = info["db_error"] is None
+        user = me()
+        if not (user and user["is_owner"]):
+            return jsonify({"ok": ok}), (200 if ok else 503)
+
         payload = {
+            "ok": ok,
             "db_error": info["db_error"],
             "worker": info["worker"].snapshot(),
             "poller": info["poller"].snapshot(),
         }
-        if info["db_error"]:
+        if not ok:
             payload["db"] = {"ok": False, "dsn": store.safe_dsn()}
             return jsonify(payload), 503
         payload["db"] = store.health()

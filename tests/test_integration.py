@@ -715,5 +715,42 @@ class TestAlertDedupeIsPerSeatWatch(DbCase):
         self.assertIsNone(rows[0]["seat_watch_id"])
 
 
+class TestHealthIsReachableWithoutLogin(DbCase):
+    """헬스체크는 로그인할 수 없는 쪽이 부른다 — 대신 내용을 권한에 따라 자른다."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import web.app
+        cls.app = web.app.create_app(start_background=False)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = self.app.test_client()
+
+    def test_anonymous_gets_a_bare_ok(self):
+        resp = self.client.get("/api/health")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertIs(payload["ok"], True)
+        # 접속 문자열·워커 내부는 익명에게 나가면 안 된다.
+        self.assertEqual(set(payload), {"ok"})
+
+    def test_owner_gets_the_detail(self):
+        owner = self.make_user("owner")
+        with self.client.session_transaction() as sess:
+            sess["user_id"] = owner["id"]
+        payload = self.client.get("/api/health").get_json()
+        self.assertIn("worker", payload)
+        self.assertIn("db", payload)
+
+    def test_member_gets_the_bare_form(self):
+        self.make_user("owner")
+        member = self.make_user("member")
+        store.set_user_status(member["id"], "approved")
+        with self.client.session_transaction() as sess:
+            sess["user_id"] = member["id"]
+        self.assertEqual(set(self.client.get("/api/health").get_json()), {"ok"})
+
+
 if __name__ == "__main__":
     unittest.main()
