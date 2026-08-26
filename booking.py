@@ -180,6 +180,22 @@ SEAT_MAP_SELECTOR = '[class*="seatMap_seatNumber"]'
 # 좌석맵 모달을 여는 '선택' 버튼. 이미 열려 있으면 없으므로 오래 기다리지 않는다.
 SEATMAP_OPEN_MS = 2500
 
+# 화면 전체를 덮는 로딩 가림막. 이게 떠 있는 동안은 아무것도 누를 수 없고,
+# **사라지면서 안내 팝업이 뜬다** — 그래서 로딩이 끝나기를 기다렸다가 팝업을
+# 닫아야 한다. 로딩 중에 팝업을 닫으러 가면 아직 없어서 헛걸음한다.
+LOADING_SELECTOR = '[class*="loading_page"]'
+LOADING_WAIT_MS = 6000
+
+# 화면을 덮은 팝업과, 그 안에서 찾을 닫기 수단(앞에 오는 것부터 시도).
+# '확인'을 먼저 본다 — 안내 팝업은 대개 그 버튼 하나로 닫히고, 그게 사람이
+# 누르는 것과 같은 길이다. 아이콘만 있는 팝업은 btn-close로 닫는다.
+MODAL_SELECTOR = '.cgv-modal.active, [role="dialog"][aria-modal="true"]'
+MODAL_CLOSE_SELECTORS = (
+    'button:has-text("확인")',
+    'button:has-text("닫기")',
+    'button.btn-close',
+)
+
 # 좌석 고르기 재시도. 한 바퀴가 [배치도 다시 읽기 → 고르기 → 클릭]이라 1초 안쪽이니
 # 몇 번을 돌아도 싸다. 다만 여기서 오래 끌 이유는 없다 — 이 시각을 넘길 만큼
 # 경쟁이 심하면 어차피 다음 사이클에 다시 본다.
@@ -467,7 +483,7 @@ def _click_role(page, name: str, *, what: str, exact: bool = False,
 
     if not _wait_until(page, ready, timeout):
         raise RuntimeError(f"{what} '{name}' 버튼이 화면에 없습니다")
-    found[0].click(timeout=timeout)
+    _click_through_modals(page, found[0], what=what, timeout=timeout)
 
 
 def booking_url(mov_no: str, site_no: str, site_nm: str, scn_ymd: str) -> str:
@@ -891,34 +907,43 @@ def dismiss_modals(page, rounds: int = 3) -> int:
 
     닫기 버튼도 **보이는 것만** 누른다. 팝업은 숨은 사본을 흔히 남긴다.
     여러 개가 겹쳐 뜰 수 있어 몇 바퀴 돈다.
+
+    **닫기 버튼은 그 팝업 안에서 찾는다.** 예전에는 화면 전체에서 '닫기'·'확인'
+    이름의 버튼을 찾아 눌렀는데, 이 화면에는 접힌 안내(우대·경로 권종 등)가 자기
+    닫기 버튼을 여럿 달고 숨어 있다. 그래서 엉뚱한 것을 누르고 "닫았다"고 세는
+    바람에, 정작 화면을 덮은 SCREENX관 안내는 그대로 남아 인원 선택 클릭을
+    5초 내내 가로막았다.
     """
     closed = 0
     for _ in range(rounds):
         try:
-            open_now = page.locator(
-                '.cgv-modal.active, [role="dialog"][aria-modal="true"]')
-            if not any(m.is_visible() for m in open_now.all()):
-                return closed
-        except Exception:  # noqa: BLE001 - 못 세면 그냥 닫기를 시도한다
-            pass
+            modals = [m for m in page.locator(MODAL_SELECTOR).all()
+                      if m.is_visible()]
+        except Exception:  # noqa: BLE001 - 못 세면 이번 바퀴는 넘어간다
+            break
+        if not modals:
+            return closed
 
         hit = False
-        for name in ("닫기", "확인"):
-            try:
-                buttons = [b for b in page.get_by_role("button", name=name).all()
-                           if b.is_visible()]
-            except Exception:  # noqa: BLE001 - 다음 이름으로
-                continue
-            if not buttons:
-                continue
-            try:
-                buttons[0].click(timeout=2500)
-            except Exception:  # noqa: BLE001 - 닫히는 중이었을 수 있다
-                continue
-            closed += 1
-            hit = True
-            page.wait_for_timeout(600)
-            break
+        for modal in modals:
+            for selector in MODAL_CLOSE_SELECTORS:
+                try:
+                    buttons = [b for b in modal.locator(selector).all()
+                               if b.is_visible()]
+                except Exception:  # noqa: BLE001 - 다음 후보로
+                    continue
+                if not buttons:
+                    continue
+                try:
+                    buttons[0].click(timeout=2500)
+                except Exception:  # noqa: BLE001 - 닫히는 중이었을 수 있다
+                    continue
+                closed += 1
+                hit = True
+                page.wait_for_timeout(400)
+                break
+            if hit:
+                break
         if not hit:
             break
     return closed
@@ -1001,6 +1026,44 @@ class _Steps:
         total = time.monotonic() - self._t0
         parts = " · ".join(f"{n} {d:.1f}s" for n, d in self._marks)
         return f"합계 {total:.1f}s ({parts})" if parts else f"합계 {total:.1f}s"
+
+
+def _wait_for_loading(page, timeout_ms: int = LOADING_WAIT_MS) -> bool:
+    """화면을 덮은 로딩 가림막이 걷힐 때까지 기다린다. 걷혔으면 True."""
+    def gone() -> bool:
+        nodes = page.locator(LOADING_SELECTOR)
+        return nodes.count() == 0 or not nodes.first.is_visible()
+
+    return _wait_until(page, gone, timeout_ms)
+
+
+def _blocked_by_modal(exc: Exception) -> bool:
+    """그 클릭 실패가 '팝업이 가로막아서'인지.
+
+    Playwright는 이런 경우 "<div ...> intercepts pointer events"라고 적어 준다.
+    그 밖의 실패(요소가 없다·안 보인다)는 팝업을 닫아도 풀리지 않으므로 구분한다.
+    """
+    return "intercepts pointer events" in str(exc)
+
+
+def _click_through_modals(page, node, *, what: str, timeout: int,
+                          retries: int = 2) -> None:
+    """팝업이 클릭을 가로채면 닫고 다시 누른다.
+
+    안내 팝업은 **우리가 팝업을 닫고 지나간 뒤에** 뜨기도 한다. 실제로 SCREENX관
+    안내가 로딩이 걷히는 순간 떠서 인원 선택을 가로막았다 — 미리 한 번 닫아 두는
+    것만으로는 막을 수 없는 경합이라, 막히면 그 자리에서 닫고 다시 누른다.
+    """
+    for attempt in range(retries + 1):
+        try:
+            node.click(timeout=timeout)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt >= retries or not _blocked_by_modal(exc):
+                raise
+            log.info("%s 클릭이 팝업에 막혔습니다 — 닫고 다시 누릅니다 (%d/%d)",
+                     what, attempt + 1, retries)
+            dismiss_modals(page)
 
 
 def _seatmap_ready(page) -> bool:
@@ -1111,7 +1174,10 @@ def hold_block(session, ctx: dict) -> dict:
                 + (" (대기열이 길어 시간 안에 통과하지 못했습니다)"
                    if in_queue(page_text(page)) else ""))
         steps.mark("대기열")
-        # 이벤트·안내 팝업이 떠 있으면 아래 버튼을 누를 수 없다.
+        # 이벤트·안내 팝업이 떠 있으면 아래 버튼을 누를 수 없다. 로딩 가림막이
+        # 걷히면서 팝업이 뜨므로 **걷히기를 기다렸다가** 닫는다 — 로딩 중에
+        # 닫으러 가면 아직 없어서 헛걸음하고, 그 팝업은 바로 다음 클릭을 막는다.
+        _wait_for_loading(page)
         dismiss_modals(page)
         # 관람인원: party명 (일반 기준). 권종 세분화는 후속 단계.
         # 버튼 이름은 접근성 이름으로만 잡힌다 — 안의 숫자와 '선택'이 서로 다른
@@ -1146,7 +1212,8 @@ def hold_block(session, ctx: dict) -> dict:
                            PAY_BUTTON_READY_MS):
             raise RuntimeError("결제하기 버튼이 화면에 없습니다 "
                                "(좌석 선택이 끝나지 않았을 수 있습니다)")
-        _visible_pay_buttons(page)[0].click(timeout=5000)
+        _click_through_modals(page, _visible_pay_buttons(page)[0],
+                              what="결제하기", timeout=5000)
         # 선점 응답이 오면 바로 나간다. 예전에는 무조건 5초를 잤는데, 응답은 보통
         # 1초 안쪽에 오고 그 차이가 다음 회차를 잡을 수 있느냐를 가른다.
         if not _wait_until(page, lambda: "body" in captured, HOLD_RESPONSE_MS):

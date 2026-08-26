@@ -953,6 +953,87 @@ class TestScreenshotIsBestEffort(unittest.TestCase):
                                      {"mov_nm": "오디세이", "start_hhmm": "18:00"}))
 
 
+class TestClickThroughModals(unittest.TestCase):
+    """안내 팝업은 **우리가 팝업을 닫고 지나간 뒤에** 뜨기도 한다.
+
+    실제로 SCREENX관 안내가 로딩이 걷히는 순간 떠서 인원 선택 클릭을 5초 내내
+    가로막았다("intercepts pointer events"). 미리 한 번 닫아 두는 것으로는 막을
+    수 없는 경합이라, 막히면 그 자리에서 닫고 다시 눌러야 한다.
+    """
+
+    class Blocking:
+        """N번째 클릭까지는 팝업에 막히고, 그 뒤로는 눌리는 버튼."""
+
+        def __init__(self, page, block_times: int, error: str):
+            self.page = page
+            self.left = block_times
+            self.error = error
+            self.clicks = 0
+
+        def click(self, timeout=None):
+            if self.left > 0:
+                self.left -= 1
+                raise RuntimeError(self.error)
+            self.clicks += 1
+
+    class Page:
+        def __init__(self):
+            self.dismissed = 0
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    def _page(self):
+        page = self.Page()
+        # dismiss_modals를 부르면 팝업이 닫혔다고 치고 세기만 한다.
+        booking.dismiss_modals = lambda p, rounds=3: (
+            setattr(p, "dismissed", p.dismissed + 1), 1)[1]
+        return page
+
+    def setUp(self):
+        self._real_dismiss = booking.dismiss_modals
+
+    def tearDown(self):
+        booking.dismiss_modals = self._real_dismiss
+
+    INTERCEPT = ('Locator.click: Timeout 5000ms exceeded.\n'
+                 '  - <div class="modal-bg"></div> from <div role="dialog" '
+                 'aria-modal="true" class="cgv-modal modal-alert active">…</div> '
+                 'subtree intercepts pointer events')
+
+    def test_closes_the_popup_and_clicks_again(self):
+        page = self._page()
+        node = self.Blocking(page, 1, self.INTERCEPT)
+        booking._click_through_modals(page, node, what="관람인원", timeout=5000)
+        self.assertEqual(node.clicks, 1)
+        self.assertEqual(page.dismissed, 1, "팝업을 닫고 다시 눌러야 한다")
+
+    def test_gives_up_after_the_retries(self):
+        page = self._page()
+        node = self.Blocking(page, 9, self.INTERCEPT)
+        with self.assertRaises(RuntimeError):
+            booking._click_through_modals(page, node, what="관람인원",
+                                          timeout=5000, retries=2)
+        self.assertEqual(node.clicks, 0)
+        self.assertEqual(page.dismissed, 2)
+
+    def test_other_failures_are_not_retried(self):
+        """팝업 때문이 아니면 닫아 봐야 소용없다 — 바로 올려 보낸다."""
+        page = self._page()
+        node = self.Blocking(page, 9, "element is not visible")
+        with self.assertRaises(RuntimeError):
+            booking._click_through_modals(page, node, what="관람인원",
+                                          timeout=5000)
+        self.assertEqual(page.dismissed, 0)
+
+    def test_a_clean_click_does_not_touch_modals(self):
+        page = self._page()
+        node = self.Blocking(page, 0, self.INTERCEPT)
+        booking._click_through_modals(page, node, what="관람인원", timeout=5000)
+        self.assertEqual(node.clicks, 1)
+        self.assertEqual(page.dismissed, 0)
+
+
 class TestPaymentAmount(unittest.TestCase):
     def test_reads_the_won_amount(self):
         self.assertEqual(booking.parse_amount("15,000원"), 15000)
