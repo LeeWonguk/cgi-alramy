@@ -517,6 +517,57 @@ class TestAutoBookOrchestration(DbCase):
         self.assertEqual(out["action"], "skip")
         self.assertEqual(called["n"], 1)
 
+    def test_records_the_seats_the_hold_actually_took(self):
+        # hold는 좌석맵에 도착해서 좌석을 다시 고른다. 이력과 알림이 감지 때의
+        # **후보**를 그대로 적으면, 사용자가 받은 문구와 실제 잡힌 자리가 어긋난다.
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2)
+
+        def fake_hold(session, ctx):
+            self.assertEqual(ctx["seat_labels"], ["A4", "A5"])   # 후보
+            return {"ok": True, "mov_atkt_no": "P013X",
+                    "seat_labels": ["A7", "A8"]}                 # 실제로 고른 것
+
+        out = booking.try_auto_book(None, w, self._row(),
+                                    self._seats(set(range(1, 9))),
+                                    mov_nm="오디세이", site_nm="용산",
+                                    hold_fn=fake_hold)
+        self.assertEqual(out["seats"], ["A7", "A8"])
+        self.assertEqual(store.booking_attempts(owner_id=uid)[0]["seat_labels"],
+                         ["A7", "A8"])
+
+    def test_failed_hold_records_what_it_tried(self):
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2)
+
+        def fake_hold(session, ctx):
+            return {"ok": False, "error": "그 사이 팔렸습니다",
+                    "seat_labels": ["A7", "A8"]}
+
+        out = booking.try_auto_book(None, w, self._row(),
+                                    self._seats(set(range(1, 9))),
+                                    mov_nm="오디세이", site_nm="용산",
+                                    hold_fn=fake_hold)
+        self.assertEqual(out["seats"], ["A7", "A8"])
+        self.assertEqual(store.booking_attempts(owner_id=uid)[0]["seat_labels"],
+                         ["A7", "A8"])
+
+    def test_hold_without_seat_labels_keeps_the_candidate(self):
+        # 좌석맵에 닿기도 전에 죽으면 후보가 곧 '시도한 좌석'이다.
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2)
+        out = booking.try_auto_book(None, w, self._row(),
+                                    self._seats(set(range(1, 9))),
+                                    mov_nm="오디세이", site_nm="용산",
+                                    hold_fn=lambda s, c: {"ok": False,
+                                                          "error": "UI 구동 실패"})
+        self.assertEqual(out["seats"], ["A4", "A5"])
+        self.assertEqual(store.booking_attempts(owner_id=uid)[0]["seat_labels"],
+                         ["A4", "A5"])
+
     def test_off_when_auto_book_disabled(self):
         import booking
         uid = self.make_user("owner")["id"]
