@@ -15,16 +15,23 @@ RUN cd frontend && npm run build
 # requirements.txt의 조합을 실제로 확인한 인터프리터가 3.13이다 — 맞춰 둔다.
 FROM python:3.13-slim-bookworm AS runtime
 
+# TZ: 컨테이너 기본은 UTC다. 로그·알림 시각·`_now()`가 전부 한국 시각으로
+# 읽혀야 화면의 "N초 전"과 사람이 보는 시계가 어긋나지 않는다. (선점 만료처럼
+# 틀리면 동작이 바뀌는 값은 booking.KST로 따로 못박아 두었으니, 이건 표시용
+# 안전장치다.)
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    TZ=Asia/Seoul
 
 # tini: waitress가 SIGTERM에 깨끗이 내려가도록 PID 1을 대신 잡는다.
+# tzdata: TZ가 실제로 먹으려면 /usr/share/zoneinfo가 있어야 한다.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
         curl \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

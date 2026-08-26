@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import seats as seats_mod
 import store
@@ -27,6 +28,23 @@ import store
 log = logging.getLogger("cgv-watch.booking")
 
 SEAT_HOLD_URL_MARK = "seatTemp/seatTempPrmp"
+
+# '결제하기'를 누르는 것이 **선점까지만** 한다는 전제 위에 이 모듈의 안전성이
+# 통째로 서 있다. CGV가 그 버튼의 뜻을 바꾸면 우리는 아무것도 눈치채지 못한 채
+# 돈을 쓰게 된다 — 코드가 스스로 알아챌 수 있는 유일한 지점이 그때 나가는
+# 요청이므로, 결제 확정 계열 경로가 보이면 크게 남기고 실패로 끊는다.
+# 선점 응답(seatTempPrmp)은 이 목록과 겹치지 않아야 한다.
+PAYMENT_URL_MARKS = (
+    "/pay/", "payApprov", "payApprv", "atktPay", "movAtktPay",
+    "settle", "approvePayment", "paymentComplete",
+)
+
+# CGV가 주는 시각은 전부 한국 시간이고 시간대 표시가 붙어 있지 않다. 서버가
+# 어디서 돌든 같은 뜻이어야 하므로 여기 한 곳에 못박는다 — 컨테이너는 보통
+# UTC라, 로컬 시간대로 해석하면 선점 만료가 9시간 뒤로 기록된다. 그러면
+# store.active_hold()가 이미 끝난 선점을 유효하다고 보고 그 감시는 영영
+# 다시 잡지 않는다.
+KST = ZoneInfo("Asia/Seoul")
 
 # 회차(상영 시작 시각) 버튼을 찾는 방법을 확실한 순서로 늘어놓는다.
 #
@@ -71,12 +89,16 @@ def _fmt_hhmm(scnsrt: str) -> str:
 
 
 def _parse_limit_dt(raw: str):
-    """'20260825160018' → datetime(aware). 실패하면 None."""
+    """'20260825160018' → datetime(KST, aware). 실패하면 None.
+
+    `.astimezone()`으로 붙이면 안 된다 — 그건 **실행 환경의** 시간대로 읽는
+    것이라 UTC 컨테이너에서는 같은 숫자가 9시간 다른 순간을 가리킨다.
+    """
     if not raw or len(raw) < 12:
         return None
     try:
         naive = datetime.strptime(raw[:14].ljust(14, "0"), "%Y%m%d%H%M%S")
-        return naive.astimezone()
+        return naive.replace(tzinfo=KST)
     except ValueError:
         return None
 
@@ -155,8 +177,9 @@ def build_hold_alert(mov_nm: str, site_nm: str, scn_ymd: str, start_hhmm: str,
 
     when = ""
     if hold_expires_at is not None:
+        # 읽는 사람은 극장 앞에 서 있다 — 서버가 어디서 돌든 한국 시각으로 적는다.
         try:
-            when = hold_expires_at.strftime("%H:%M")
+            when = hold_expires_at.astimezone(KST).strftime("%H:%M")
         except Exception:  # noqa: BLE001
             when = str(hold_expires_at)
     amt = f"\n💳 예상 금액 {amount:,}원" if amount else ""
@@ -355,6 +378,18 @@ def _partial_seats_error(wanted, missed) -> str:
             f"같습니다. 일부만 선점하지 않고 멈춥니다.")
 
 
+def payment_mark(url: str) -> str | None:
+    """결제 확정 계열로 보이는 경로면 걸린 표식을 돌려준다. 아니면 None.
+
+    선점 응답(seatTempPrmp)은 절대 걸리면 안 되므로 먼저 걸러낸다.
+    """
+    text = url or ""
+    if SEAT_HOLD_URL_MARK in text:
+        return None
+    lowered = text.lower()
+    return next((m for m in PAYMENT_URL_MARKS if m.lower() in lowered), None)
+
+
 def _in_screen(node, screen_name: str) -> bool:
     """이 회차가 지정한 상영관 블록 안에 있는지."""
     for cls in SCREEN_CONTAINER_CLASSES:
@@ -408,6 +443,11 @@ def hold_block(session, ctx: dict) -> dict:
                 captured["body"] = _json.loads(r.text())
             except Exception:  # noqa: BLE001
                 captured["body"] = None
+            return
+        if payment_mark(r.url):
+            # 여기 걸리면 우리가 '선점'으로 알고 누른 버튼이 결제를 진행시킨
+            # 것이다. 첫 번째 것만 남긴다 — 뒤따르는 요청은 같은 사건이다.
+            captured.setdefault("payment_url", r.url)
     page.on("response", on_resp)
 
     try:
@@ -452,12 +492,33 @@ def hold_block(session, ctx: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         shot = _save_screenshot(page, ctx)
         detail = f" (화면: {shot})" if shot else ""
+        # 도중에 죽었어도 결제 요청이 이미 나갔을 수 있다 — 그 사실이 예외 문구에
+        # 묻히면 안 된다.
+        if captured.get("payment_url"):
+            log.error("자동 예매가 실패했지만 결제 계열 요청이 먼저 나갔습니다 "
+                      "— CGV 예매 내역을 확인하세요 (요청: %s)",
+                      captured["payment_url"])
+            detail += " · 결제 계열 요청이 감지됐습니다 — CGV 예매 내역을 확인하세요"
         return {"ok": False, "error": f"UI 구동 실패: {exc}{detail}"}
     finally:
         try:
             page.remove_listener("response", on_resp)
         except Exception:  # noqa: BLE001
             pass
+
+    # 결제 확정 요청이 나갔다면 우리가 알고 있던 화면 흐름이 아니다. 선점이
+    # 됐는지와 무관하게 사람이 즉시 확인해야 하므로, 성공으로 넘기지 않고
+    # 무슨 일이 있었는지 그대로 올린다.
+    if captured.get("payment_url"):
+        shot = _save_screenshot(page, ctx)
+        log.error("자동 예매 중 결제 계열 요청이 나갔습니다 — '결제하기'가 더는 "
+                  "선점 단계가 아닐 수 있습니다. 자동 예매를 멈추고 CGV 예매 "
+                  "내역을 확인하세요. (요청: %s, 화면: %s)",
+                  captured["payment_url"], shot or "저장 실패")
+        return {"ok": False, "error":
+                "결제 계열 요청이 감지돼 중단했습니다 — CGV 예매 내역을 직접 "
+                "확인하세요. 화면 구성이 바뀐 것일 수 있으니 자동 예매를 "
+                "잠시 꺼 두는 편이 안전합니다."}
 
     body = captured.get("body") or {}
     data = (body.get("data") or {}) if isinstance(body, dict) else {}

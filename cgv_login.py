@@ -9,6 +9,11 @@
     2. accessToken이 만료됐으면 refresh_token으로 갱신한다 — 캡차 없음.
     3. refresh까지 만료됐으면 저장된 아이디·비밀번호로 다시 로그인한다 — 캡차.
 
+**세션은 소유자 하나에만 매인다.** 브라우저 컨텍스트는 하나뿐인데 수십 분을
+상주하므로, 쿠키가 있다는 것만 보고 통과시키면 A의 로그인으로 B의 좌석을 보고
+B의 자동 예매를 A 계정으로 걸어 버린다. 그래서 여기 있는 함수는 모두
+`session.logged_in_owner`를 확인하고, 주인이 다르면 쿠키부터 비운다.
+
 캡차가 필요한 3번은 브라우저를 실제로 몰아야 하므로, 이 함수들은 모두
 browser_worker 스레드에서(세션을 소유한 스레드에서) 실행돼야 한다:
 
@@ -25,15 +30,33 @@ from watch import CgvSession, LoginError
 log = logging.getLogger("cgv-watch.cgv-login")
 
 
+def _detach(session: CgvSession, owner_id: int) -> None:
+    """다른 계정의 로그인 쿠키가 얹혀 있으면 비운다.
+
+    `logged_in()`은 쿠키가 **있는지**만 보므로, 앞 사용자의 쿠키가 남아 있으면
+    이 소유자의 로그인 절차가 통째로 건너뛰어진다. 좌석은 남의 계정으로 조회되고
+    자동 예매도 남의 계정으로 걸린다 — 그 고리를 여기서 끊는다.
+    """
+    if session.logged_in_owner == owner_id:
+        return                      # 같은 사람 — 만료됐어도 되살리면 그만이다
+    if session.logged_in_owner is None and not session.logged_in():
+        return                      # 아무도 안 붙은 깨끗한 세션
+    log.info("CGV 세션을 owner %s → %s 로 바꿉니다",
+             session.logged_in_owner, owner_id)
+    session.clear_session_cookies()
+
+
 def ensure_logged_in(owner_id: int, session: CgvSession) -> bool:
     """세션이 이 소유자의 CGV 계정으로 로그인된 상태가 되도록 보장한다.
 
     저장된 세션→refresh→재로그인 순으로 시도하고, 성공하면 갱신된 세션 쿠키를
     저장한 뒤 True를 돌려준다. 저장된 계정이 없거나 끝내 실패하면 False.
-    이미 로그인돼 있으면 아무것도 하지 않는다.
+    **이 소유자로** 이미 로그인돼 있으면 아무것도 하지 않고, 다른 소유자로
+    로그인돼 있으면 그 쿠키를 비운 뒤 처음부터 진행한다.
     """
-    if session.logged_in():
+    if session.logged_in_as(owner_id):
         return True
+    _detach(session, owner_id)
 
     account = store.cgv_account(owner_id)
     if account is None:
@@ -48,10 +71,12 @@ def ensure_logged_in(owner_id: int, session: CgvSession) -> bool:
             # 되살린 accessToken이 실제로 유효한지는 여기서 확정하지 않는다 —
             # 확인하려면 요청을 한 번 더 써야 한다. 만료됐다면 좌석 조회가 401을
             # 내고, 그때 recover_session()이 refresh→재로그인으로 되살린다.
+            session.mark_logged_in(owner_id)
             return True
 
     # 2) refresh로 accessToken 갱신 (refresh_token 쿠키가 살아 있으면 성공)
     if tokens and session.refresh_session():
+        session.mark_logged_in(owner_id)
         store.set_cgv_tokens(owner_id, session.session_tokens())
         return True
 
@@ -69,6 +94,7 @@ def ensure_logged_in(owner_id: int, session: CgvSession) -> bool:
         store.set_cgv_account_status(owner_id, "error", error=str(exc))
         return False
 
+    session.mark_logged_in(owner_id)
     store.set_cgv_tokens(owner_id, fresh)
     return True
 
@@ -86,14 +112,23 @@ def recover_session(owner_id: int, session: CgvSession) -> bool:
 
     브라우저 쿠키를 반드시 먼저 비운다. 만료된 accessToken이 남아 있으면
     `logged_in()`이 계속 True를 내서 다음 사이클도 같은 자리에서 막힌다.
+
+    **얹혀 있는 쿠키의 주인부터 확인한다.** 다른 사람의 세션을 refresh해서
+    그 토큰을 이 소유자의 행에 저장해 버리면, 두 계정이 DB에서 뒤엉켜 되돌리기
+    어려워진다 — 그럴 땐 refresh를 건너뛰고 처음부터 로그인한다.
     """
+    if session.logged_in_owner not in (None, owner_id):
+        log.info("owner %s: 다른 계정(owner %s)의 세션이라 refresh 없이 "
+                 "다시 로그인합니다", owner_id, session.logged_in_owner)
+        return login_now(owner_id, session)
+
     if session.refresh_session():
+        session.mark_logged_in(owner_id)
         store.set_cgv_tokens(owner_id, session.session_tokens())
         log.info("owner %s: refresh로 CGV 세션을 되살렸습니다", owner_id)
         return True
 
     log.info("owner %s: refresh가 만료돼 다시 로그인합니다", owner_id)
-    session.clear_session_cookies()
     store.clear_cgv_tokens(owner_id)
     return login_now(owner_id, session)
 
@@ -103,16 +138,22 @@ def login_now(owner_id: int, session: CgvSession) -> bool:
 
     사용자가 '지금 로그인'을 눌렀을 때처럼, 자격증명이 여전히 유효한지 즉시
     확인하고 싶을 때 쓴다. 성공하면 세션을 저장하고 True.
+
+    먼저 얹혀 있는 로그인 쿠키를 비운다. 남의(또는 만료된) 세션이 살아 있으면
+    로그인 페이지가 바로 되돌아가 입력칸을 찾지 못한다 — 두 번째 사용자가
+    계정을 연동조차 못 하던 원인이다.
     """
     account = store.cgv_account(owner_id)
     password = store.cgv_password(owner_id)
     if account is None or password is None:
         return False
+    session.clear_session_cookies()
     try:
         fresh = session.login_cgv(account["cgv_user_id"], password)
     except LoginError as exc:
         log.warning("owner %s: CGV 로그인 실패 — %s", owner_id, exc)
         store.set_cgv_account_status(owner_id, "error", error=str(exc))
         return False
+    session.mark_logged_in(owner_id)
     store.set_cgv_tokens(owner_id, fresh)
     return True

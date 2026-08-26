@@ -326,3 +326,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_range_idx
                      scn_time_from, scn_time_to, screen_types, rows);
 
 DROP INDEX IF EXISTS seat_watches_uniq_idx;
+
+
+-- ── 알림이 어느 좌석 감시에서 나왔는지 ───────────────────────────────────────
+-- 미전송 알림을 다시 시도할 때 새 행을 만들지 않고 기존 행을 재사용하는데
+-- (store.record_alert), 그 "같은 알림" 판정에 좌석 감시가 빠져 있었다. 좌석
+-- 알림은 target_id가 없고 dates가 [scn_ymd] 하나뿐이라, **한 사람이 같은 날짜에
+-- 건 좌석 감시가 둘이면** 서로의 미전송 알림을 덮어쓴다 — 한쪽 알림이 조용히
+-- 사라진다. 어느 감시에서 나왔는지를 행에 남겨 판정에 함께 넣는다.
+-- 감시가 지워져도 이력은 남아야 하므로 SET NULL이다.
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS
+    seat_watch_id integer REFERENCES seat_watches(id) ON DELETE SET NULL;

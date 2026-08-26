@@ -247,6 +247,17 @@ class TestSelectShowtimes(unittest.TestCase):
         got = seats.select_showtimes(self.SCHEDULE, scn_time="22:10")
         self.assertEqual(self.times(got), ["2210"])
 
+    def test_exact_time_across_screens_is_also_latest_first(self):
+        # 같은 시각이 여러 상영관에 있으면 회차가 여럿 나온다. 순서가 곧 선점
+        # 우선순위이므로 범위 지정과 같은 규칙을 따라야 한다.
+        schedule = [
+            {"scnsrtTm": "2210", "scnsNo": "IMAX", "scnSseq": "1"},
+            {"scnsrtTm": "2210", "scnsNo": "일반", "scnSseq": "2"},
+        ]
+        got = seats.select_showtimes(schedule, scn_time="22:10")
+        self.assertEqual([r["scnsNo"] for r in got], ["IMAX", "일반"],
+                         "같은 시각끼리는 원래 순서를 지켜야 한다")
+
     def test_range_is_latest_first(self):
         # 이 기능의 핵심 — 시간대 안에서 늦은 회차부터 잡는다.
         got = seats.select_showtimes(self.SCHEDULE, scn_time_from="17:00",

@@ -39,6 +39,7 @@ os.environ.setdefault("PUBLIC_BASE_URL", "http://localhost:8787")
 os.environ["DEV_LOGIN"] = "0"          # 테스트가 개발모드 로그인을 열지 않게
 
 import store  # noqa: E402
+import watch  # noqa: E402
 
 _ADMIN = make_conninfo(os.environ["DATABASE_URL"], dbname="postgres")
 _skip_reason: str | None = None
@@ -524,6 +525,231 @@ class TestAutoBookOrchestration(DbCase):
                                     mov_nm="오디세이", site_nm="용산",
                                     hold_fn=lambda s, c: {"ok": True})
         self.assertEqual(out["action"], "skip")
+
+
+class FakeCookieJar:
+    """Playwright BrowserContext의 쿠키 부분만 흉내낸다."""
+
+    def __init__(self) -> None:
+        self.jar: dict[str, str] = {}
+
+    def cookies(self):
+        return [{"name": k, "value": v} for k, v in self.jar.items()]
+
+    def clear_cookies(self, name=None):
+        if name is None:
+            self.jar.clear()
+        else:
+            self.jar.pop(name, None)
+
+    def add_cookies(self, cookies):
+        for c in cookies:
+            self.jar[c["name"]] = c["value"]
+
+
+class FakeSession:
+    """브라우저 없는 CgvSession.
+
+    쿠키를 다루는 메서드는 **진짜 CgvSession의 것을 그대로 빌려 쓴다** — 소유자
+    판정이 거기 들어 있으므로, 흉내낸 구현으로 바꾸면 정작 검증하려던 로직이
+    테스트에서 빠져나간다.
+    """
+
+    logged_in = watch.CgvSession.logged_in
+    logged_in_as = watch.CgvSession.logged_in_as
+    mark_logged_in = watch.CgvSession.mark_logged_in
+    clear_session_cookies = watch.CgvSession.clear_session_cookies
+    session_tokens = watch.CgvSession.session_tokens
+    restore_tokens = watch.CgvSession.restore_tokens
+
+    def __init__(self) -> None:
+        self.logged_in_owner = None
+        self._page = type("P", (), {})()
+        self._page.context = FakeCookieJar()
+        self.logins: list[str] = []
+        self.refresh_ok = False
+
+    def refresh_session(self) -> bool:
+        if not self.refresh_ok:
+            return False
+        self._page.context.jar["accessToken"] = "refreshed"
+        return True
+
+    def login_cgv(self, user_id, password, *, timeout_ms=20_000):
+        self.logins.append(user_id)
+        self._page.context.jar.update({"accessToken": f"tok-{user_id}",
+                                       "refresh_token": f"ref-{user_id}"})
+        return self.session_tokens()
+
+
+class TestCgvSessionIsPerOwner(DbCase):
+    """회귀: 브라우저 세션 하나를 여러 사용자가 나눠 쓴다.
+
+    `logged_in()`은 accessToken 쿠키가 **있는지**만 본다. 그 값만 보고 통과시키면
+    앞사람의 로그인으로 뒷사람의 좌석을 조회하고, 자동 예매까지 앞사람 계정으로
+    나간다. 세션이 **누구의** 것인지를 봐야 한다.
+    """
+
+    def link(self, name: str, cgv_id: str) -> int:
+        uid = self.make_user(name)["id"]
+        store.set_cgv_account(uid, cgv_id, f"pw-{cgv_id}")
+        store.set_cgv_tokens(uid, {"accessToken": f"tok-{cgv_id}",
+                                   "refresh_token": f"ref-{cgv_id}"})
+        return uid
+
+    def test_second_owner_does_not_inherit_the_first_session(self):
+        import cgv_login
+
+        a = self.link("owner", "alice")
+        b = self.link("member", "bob")
+        session = FakeSession()
+
+        self.assertTrue(cgv_login.ensure_logged_in(a, session))
+        self.assertEqual(session._page.context.jar["accessToken"], "tok-alice")
+
+        self.assertTrue(cgv_login.ensure_logged_in(b, session))
+        self.assertEqual(session.logged_in_owner, b)
+        self.assertEqual(session._page.context.jar["accessToken"], "tok-bob",
+                         "B의 좌석을 A의 로그인으로 조회하고 있다")
+
+    def test_same_owner_twice_does_not_relogin(self):
+        import cgv_login
+
+        a = self.link("owner", "alice")
+        session = FakeSession()
+        cgv_login.ensure_logged_in(a, session)
+        cgv_login.ensure_logged_in(a, session)
+        self.assertEqual(session.logins, [], "같은 사람인데 다시 로그인했다")
+
+    def test_recover_never_writes_another_owners_tokens(self):
+        import cgv_login
+
+        a = self.link("owner", "alice")
+        b = self.link("member", "bob")
+        session = FakeSession()
+        cgv_login.ensure_logged_in(a, session)      # 세션은 A의 것
+        session.refresh_ok = True                   # refresh는 성공할 수 있다
+
+        cgv_login.recover_session(b, session)
+
+        self.assertEqual(store.cgv_tokens(a)["accessToken"], "tok-alice",
+                         "A의 저장된 세션이 손상됐다")
+        self.assertNotEqual(store.cgv_tokens(b)["accessToken"], "refreshed",
+                            "A의 세션을 refresh해 B의 행에 저장했다")
+        self.assertEqual(session.logins, ["bob"],
+                         "B로 다시 로그인했어야 한다")
+        self.assertEqual(session.logged_in_owner, b)
+
+    def test_login_now_clears_a_stale_session_first(self):
+        import cgv_login
+
+        a = self.link("owner", "alice")
+        b = self.link("member", "bob")
+        session = FakeSession()
+        cgv_login.ensure_logged_in(a, session)
+
+        self.assertTrue(cgv_login.login_now(b, session))
+        # A의 refresh_token이 남아 있으면 B의 세션에 섞여 저장된다.
+        self.assertEqual(store.cgv_tokens(b),
+                         {"accessToken": "tok-bob", "refresh_token": "ref-bob"})
+
+    def test_clearing_keeps_non_session_cookies(self):
+        # 통째로 지우면 Cloudflare 통과 흔적까지 날아가 날짜 확인이 403을 맞는다.
+        session = FakeSession()
+        session._page.context.jar.update({"accessToken": "t", "cf_clearance": "cf"})
+        session.clear_session_cookies()
+        self.assertEqual(session._page.context.jar, {"cf_clearance": "cf"})
+        self.assertIsNone(session.logged_in_owner)
+
+
+class TestAlertDedupeIsPerSeatWatch(DbCase):
+    """회귀: 미전송 알림의 중복 판정이 좌석 감시도 봐야 한다.
+
+    좌석 알림은 target_id가 없고 dates가 [scn_ymd] 하나뿐이다. 한 사람이 같은
+    날짜에 감시를 둘 걸면(A열·B열) 서로의 미전송 행을 덮어써 한쪽 알림이
+    조용히 사라진다.
+    """
+
+    def watches(self):
+        uid = self.make_user("owner")["id"]
+        a = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["A"])
+        b = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["B"])
+        return uid, a["id"], b["id"]
+
+    def test_two_watches_same_date_keep_separate_rows(self):
+        uid, a, b = self.watches()
+        first = store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                                   dates=["20260825"], seat_watch_id=a)
+        second = store.record_alert("seat_open", "B열 빈자리", owner_id=uid,
+                                    dates=["20260825"], seat_watch_id=b)
+
+        self.assertNotEqual(first, second)
+        bodies = {r["body"] for r in store.recent_alerts(owner_id=uid)}
+        self.assertEqual(bodies, {"A열 빈자리", "B열 빈자리"})
+
+    def test_same_watch_retry_reuses_the_row(self):
+        uid, a, _ = self.watches()
+        first = store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                                   dates=["20260825"], seat_watch_id=a)
+        again = store.record_alert("seat_open", "A열 빈자리(재시도)", owner_id=uid,
+                                   dates=["20260825"], seat_watch_id=a)
+
+        self.assertEqual(first, again)
+        rows = store.recent_alerts(owner_id=uid)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["attempts"], 2)
+
+    def test_history_carries_the_watch_id(self):
+        uid, a, _ = self.watches()
+        store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                           dates=["20260825"], seat_watch_id=a)
+        self.assertEqual(store.recent_alerts(owner_id=uid)[0]["seat_watch_id"], a)
+
+    def test_deleting_the_watch_keeps_the_history(self):
+        uid, a, _ = self.watches()
+        store.record_alert("seat_open", "A열 빈자리", owner_id=uid,
+                           dates=["20260825"], seat_watch_id=a)
+        store.delete_seat_watch(a, owner_id=uid)
+        rows = store.recent_alerts(owner_id=uid)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["seat_watch_id"])
+
+
+class TestHealthIsReachableWithoutLogin(DbCase):
+    """헬스체크는 로그인할 수 없는 쪽이 부른다 — 대신 내용을 권한에 따라 자른다."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import web.app
+        cls.app = web.app.create_app(start_background=False)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = self.app.test_client()
+
+    def test_anonymous_gets_a_bare_ok(self):
+        resp = self.client.get("/api/health")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertIs(payload["ok"], True)
+        # 접속 문자열·워커 내부는 익명에게 나가면 안 된다.
+        self.assertEqual(set(payload), {"ok"})
+
+    def test_owner_gets_the_detail(self):
+        owner = self.make_user("owner")
+        with self.client.session_transaction() as sess:
+            sess["user_id"] = owner["id"]
+        payload = self.client.get("/api/health").get_json()
+        self.assertIn("worker", payload)
+        self.assertIn("db", payload)
+
+    def test_member_gets_the_bare_form(self):
+        self.make_user("owner")
+        member = self.make_user("member")
+        store.set_user_status(member["id"], "approved")
+        with self.client.session_transaction() as sess:
+            sess["user_id"] = member["id"]
+        self.assertEqual(set(self.client.get("/api/health").get_json()), {"ok"})
 
 
 if __name__ == "__main__":
