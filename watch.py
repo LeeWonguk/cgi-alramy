@@ -786,6 +786,12 @@ def diff_dates(candidates: list[str], known: set[str],
     return tracked, [d for d in tracked if d not in known]
 
 
+# 영화·극장 목록을 DB 캐시로 때울 수 있는 기간. 이보다 낡으면 새로 받는다.
+# 폴러가 하루에 한 번 갱신하므로(web/poller.py CATALOG_MAX_AGE_HOURS) 그보다
+# 넉넉히 잡아 둔다 — 갱신이 잠깐 밀렸다고 매 바퀴 두 번씩 다시 받을 이유는 없다.
+CATALOG_CACHE_MAX_AGE_HOURS = 36
+
+
 class Catalog:
     """예매 영화·극장 목록을 처음 필요할 때 한 번만 받아오는 지연 로더.
 
@@ -802,6 +808,7 @@ class Catalog:
         self._persist = persist
         self._movies: list[dict] | None = None
         self._sites: list[dict] | None = None
+        self._from_db = False   # 지금 들고 있는 게 DB 캐시인지
 
     @property
     def movies(self) -> list[dict]:
@@ -812,6 +819,60 @@ class Catalog:
     def sites(self) -> list[dict]:
         self._load()
         return self._sites  # type: ignore[return-value]
+
+    def resolve_movie(self, query: str) -> tuple[dict | None, str]:
+        """영화 이름을 코드로. DB 캐시를 먼저 보고, 못 찾으면 새로 받아 다시 본다.
+
+        **못 찾았을 때 반드시 새로 받는 게 핵심이다.** 영화 목록에는 예매가 열린
+        영화만 들어 있어서, 목록에 나타나는 순간이 곧 오픈이다. 캐시에 없다고
+        "아직 안 열렸다"고 답해 버리면 오픈을 영영 감지하지 못한다.
+
+        반대로 **찾았다면 캐시로 충분하다.** 이미 열린 영화가 목록에서 사라질 일은
+        상영 종료뿐이고, 그건 몇 초를 다툴 일이 아니다.
+        """
+        return self._resolve_cached(query, "movie")
+
+    def resolve_site(self, query: str) -> tuple[dict | None, str]:
+        """극장 이름을 코드로. 영화와 같은 방식이다."""
+        return self._resolve_cached(query, "site")
+
+    def _resolve_cached(self, query: str, kind: str) -> tuple[dict | None, str]:
+        name_key = "movNm" if kind == "movie" else "siteNm"
+        if not self._loaded():
+            cached = self._db_cache(kind)
+            if cached is not None:
+                found, problem = resolve(query, cached, name_key)
+                if found is not None:
+                    return found, problem
+                # 못 찾았다 — 캐시가 낡아서일 수 있으므로 실물을 보고 판단한다.
+        items = self.movies if kind == "movie" else self.sites
+        return resolve(query, items, name_key)
+
+    def _loaded(self) -> bool:
+        return self._movies is not None
+
+    @staticmethod
+    def _db_cache(kind: str) -> list[dict] | None:
+        """DB에 담아 둔 목록을 API와 같은 모양으로. 없거나 낡았으면 None.
+
+        저장은 스네이크 케이스(mov_no)인데 resolve는 API 모양(movNo)을 보므로
+        여기서 맞춰 준다.
+        """
+        try:
+            refreshed = store.catalog_refreshed_at()
+            if refreshed is None:
+                return None
+            age = datetime.now().astimezone() - refreshed
+            if age > timedelta(hours=CATALOG_CACHE_MAX_AGE_HOURS):
+                return None
+            if kind == "movie":
+                return [{"movNo": r["mov_no"], "movNm": r["mov_nm"]}
+                        for r in store.catalog_movies()]
+            return [{"siteNo": r["site_no"], "siteNm": r["site_nm"]}
+                    for r in store.catalog_sites()]
+        except Exception as exc:  # noqa: BLE001 - 캐시를 못 읽으면 그냥 새로 받는다
+            log.debug("영화·극장 캐시를 읽지 못했습니다: %s", exc)
+            return None
 
     def _load(self) -> None:
         if self._movies is not None:

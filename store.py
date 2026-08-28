@@ -34,7 +34,7 @@ CONFIG_PATH = ROOT / "config.toml"
 LEGACY_STATE_PATH = ROOT / "state.json"
 
 DEFAULT_DSN = "postgresql://postgres:postgres@127.0.0.1:5432/cgv"
-MIN_INTERVAL_SECONDS = 10  # 이보다 짧으면 CGV 쪽 부담이 커진다
+MIN_INTERVAL_SECONDS = 3  # 이보다 짧으면 CGV 쪽 부담이 커진다
 
 log = logging.getLogger("cgv-watch.store")
 

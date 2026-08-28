@@ -117,6 +117,15 @@ DATE_ACTIVE_MARK = "itemActive"
 # 실패했을 때 화면을 남겨 둘 곳. 셀렉터가 깨졌는지 좌석이 없어진 건지는 스크린샷
 # 없이는 사후에 가릴 수 없다.
 SHOT_DIR = Path(__file__).resolve().parent / "logs" / "booking"
+# 성공한 선점 요청의 형태를 남겨 두는 곳. 지금은 **기록만** 한다 — 언젠가 UI를
+# 몰지 않고 seatTempPrmp를 직접 부르려면 그 요청이 어떻게 생겼는지 알아야 하는데,
+# 지금 우리는 응답만 가로챌 뿐 요청은 CGV의 JS가 만들어 보내고 있어 형태를 모른다.
+HOLD_SPEC_DIR = Path(__file__).resolve().parent / "logs" / "holdspec"
+
+# 기록에서 가려야 할 값. 이름에 이 조각이 들어간 헤더·필드는 값을 지운다 —
+# 선점 요청에 로그인 토큰이 실려 나가므로 그대로 남기면 파일이 곧 자격증명이다.
+SECRET_HINTS = ("token", "cookie", "authorization", "auth", "secret",
+                "password", "pwd", "session", "csrf", "custno")
 
 # ── 결제 화면 (auto_pay) ────────────────────────────────────────────────────
 # 2026-08 실측 구조.
@@ -158,11 +167,17 @@ KAKAO_BRIDGE_API_MARK = "/pc/bridge"
 KAKAO_PAY_LINK = ("https://online-payment.kakaopay.com"
                   "/bridge/mobile-pc/reseller/one-time/payment/{hash}")
 
-# 결제 화면으로 넘어갈 때까지 '결제하기'를 다시 눌러 보는 횟수와 간격.
+# 결제 화면으로 넘어갈 때까지 '결제하기'를 다시 눌러 보는 횟수와 한 바퀴의 상한.
 PAY_PAGE_ROUNDS = 6
 PAY_PAGE_ROUND_MS = 2500
+# 결제수단을 누른 뒤 그게 켜졌는지, 약관 동의가 켜졌는지 기다리는 상한.
+# 값은 예전 고정 대기와 같다 — 상한만 같고 실제로는 반영되는 즉시 넘어간다.
+PAY_METHOD_ACTIVE_MS = 1500
+TERMS_CHECK_MS = 800
 # 결제 요청 뒤 카카오페이 iframe이 뜨기를 기다리는 시간.
 PAY_BRIDGE_WAIT_MS = 25_000
+# iframe이 뜬 뒤 브릿지 응답이 늦게 올 때 더 기다리는 상한.
+PAY_BRIDGE_BODY_MS = 5000
 
 # ── 화면 전환 기다리기 ───────────────────────────────────────────────────────
 # 예전에는 단계마다 고정 시간을 잤다(인원 1.5초 · 좌석맵 1.5초 · 선택완료 2.5초 ·
@@ -170,6 +185,8 @@ PAY_BRIDGE_WAIT_MS = 25_000
 # (실측 18초)의 절반을 넘었다. 좌석 경쟁은 초 단위라 이 시간이 곧 "그 사이 팔린 것
 # 같습니다"가 된다 — 화면이 준비되면 **바로** 넘어가도록 짧게 폴링한다.
 STEP_POLL_MS = 100
+# 날짜를 누른 뒤 그 날짜가 활성으로 바뀌기를 기다리는 상한.
+DATE_SELECT_MS = 2500
 SEATMAP_READY_MS = 5000      # 좌석맵 모달이 열려 좌석이 눌릴 수 있게 될 때까지
 PAY_BUTTON_READY_MS = 6000   # 좌석 선택완료 → '결제하기'가 뜰 때까지
 HOLD_RESPONSE_MS = 12000     # '결제하기' → seatTempPrmp 응답이 올 때까지
@@ -213,6 +230,22 @@ MODAL_KEEP_TEXTS = ("결제하기", "선택완료")
 # 경쟁이 심하면 어차피 다음 사이클에 다시 본다.
 SEAT_PICK_ATTEMPTS = 3
 SEAT_PICK_DEADLINE = 10.0  # 초
+
+# 좌석 하나를 누르는 데 줄 시간. 여기 도착했다는 건 _seatmap_ready가 "보이는
+# 좌석이 있다"를 이미 확인했다는 뜻이라, 3초씩 걸릴 이유가 없다 — 그만큼 걸렸다면
+# 화면을 덮은 무언가에 막힌 것이고, 그건 기다린다고 풀리지 않는다.
+SEAT_CLICK_MS = 1500
+
+# 미리 띄워 둔 예매 화면은 **회차 목록이 그때의 스냅샷**이다. 매진이던 회차에
+# 취소표가 나도 화면은 '매진'인 채로 남는다(그 버튼은 aria-disabled라 Playwright가
+# "element is not enabled"로 6초를 기다렸다 죽는다). 좌석이 났다는 건 우리가 API로
+# 방금 확인한 사실이므로, 화면이 매진이라고 하면 화면 쪽이 낡은 것이다.
+#
+# 실측(2026-08-28): 탭은 세션 재기동(30분)에만 다시 열려서 그 사이 최대 30분 낡는다.
+# 다시 받는 값은 날짜를 다른 날로 옮겼다 되돌리면 된다 — 같은 날짜를 다시 누르는
+# 것은 무효고(SPA가 요청을 안 보낸다), 페이지 리로드는 6.2초다. 왕복은 1.2초.
+SHOWTIME_STALE_MS = 4000     # 다시 받은 목록에서 그 회차가 살아나기를 기다리는 상한
+DATE_SWITCH_MS = 4000        # 날짜 하나를 옮기고 활성으로 바뀌기를 기다리는 상한
 
 
 def _fmt_hhmm(scnsrt: str) -> str:
@@ -651,7 +684,10 @@ def _click_date(page, scn_ymd: str) -> None:
             if text not in wanted:
                 continue
             button.click(timeout=6000)
-            page.wait_for_timeout(2500)
+            # 눌린 날짜가 활성으로 바뀌기를 기다린다. 바로 뒤 _assert_date_selected가
+            # 어차피 검증하므로, 여기서 고정 2.5초를 잘 이유가 없다.
+            _wait_until(page, lambda: _date_is_selected(page, wanted) is True,
+                        DATE_SELECT_MS)
             _assert_date_selected(page, wanted, scn_ymd)
             if i:
                 log.warning("날짜 버튼을 대체 셀렉터로 찾았습니다 (%s) — CGV가 "
@@ -688,7 +724,15 @@ def _assert_date_selected(page, wanted: list[str], scn_ymd: str) -> None:
                 "%s로 진행합니다", scn_ymd)
 
 
-def _click_showtime(page, start_hhmm: str, screen_name: str = "") -> None:
+class _ShowtimeBlocked(RuntimeError):
+    """그 회차가 매진·예매종료로 표시돼 눌리지 않는다.
+
+    '못 찾았다'와 구분해야 한다 — 목록을 다시 받아 풀 수 있는 건 이쪽뿐이다.
+    """
+
+
+def _click_showtime(page, start_hhmm: str, screen_name: str = "",
+                    scn_ymd: str = "") -> None:
     """상영 시작 시각 버튼을 누른다. 셀렉터를 순서대로 내려가며 찾는다.
 
     시작 시각이 **정확히** 일치하는 요소만 본다. 부분일치로 두면 '18:00'이
@@ -697,8 +741,51 @@ def _click_showtime(page, start_hhmm: str, screen_name: str = "") -> None:
     같은 시각의 회차가 여러 상영관에 있으면(IMAX 21:00과 일반관 21:00) 상영관
     이름으로 가린다. 그래도 못 가리면 **아무거나 누르지 않고 멈춘다** — 잘못
     고르면 다른 상영관의 좌석을 선점하게 되고, 그건 안 잡느니만 못하다.
+
+    화면이 '매진'이라고 하면 **화면 쪽이 낡은 것으로 본다.** 좌석이 났다는 건
+    방금 API로 확인한 사실이고, 미리 띄워 둔 탭의 회차 목록은 최대 30분 전
+    스냅샷이기 때문이다(scn_ymd를 주면 다시 받아 한 번 더 시도한다).
     """
     _wait_for_any(page, SHOWTIME_SELECTORS)
+    try:
+        _find_and_click_showtime(page, start_hhmm, screen_name)
+        return
+    except _ShowtimeBlocked:
+        if not scn_ymd:
+            raise
+    log.info("%s 회차가 화면에는 매진입니다 — 미리 띄운 화면이 낡았을 수 있어 "
+             "회차 목록을 다시 받습니다", start_hhmm)
+    if not _refresh_showtimes(page, scn_ymd):
+        raise RuntimeError(
+            f"{start_hhmm} 회차가 매진으로 표시돼 있고 목록을 다시 받지도 "
+            f"못했습니다")
+    _wait_for_any(page, SHOWTIME_SELECTORS)
+    # 날짜가 활성으로 바뀌는 것과 목록이 다시 그려지는 것 사이에 틈이 있다.
+    # 그 틈에 확인하면 아직 낡은 목록을 보고 "정말 매진"이라고 단정하게 된다.
+    _wait_until(page, lambda: not _showtime_is_blocked(page, start_hhmm,
+                                                       screen_name),
+                SHOWTIME_STALE_MS)
+    # 다시 받은 뒤에도 막혀 있으면 정말 매진이다 — 여기서 6초를 더 쓰지 않는다.
+    _find_and_click_showtime(page, start_hhmm, screen_name, refreshed=True)
+
+
+def _showtime_is_blocked(page, start_hhmm: str, screen_name: str) -> bool:
+    """지금 화면에서 그 회차가 매진으로 표시돼 있는지. 못 찾으면 막힌 것으로 본다."""
+    for selector in SHOWTIME_SELECTORS:
+        try:
+            nodes = [n for n in _visible(page.locator(selector).all())
+                     if (n.text_content() or "").strip() == start_hhmm]
+        except Exception:  # noqa: BLE001 - 다음 셀렉터로
+            continue
+        if not nodes:
+            continue
+        nodes = _narrow_by_screen(nodes, screen_name)
+        return bool(nodes) and _showtime_blocked(nodes[0])
+    return True
+
+
+def _find_and_click_showtime(page, start_hhmm: str, screen_name: str,
+                             *, refreshed: bool = False) -> None:
     last_exc: Exception | None = None
     for i, selector in enumerate(SHOWTIME_SELECTORS):
         try:
@@ -717,6 +804,14 @@ def _click_showtime(page, start_hhmm: str, screen_name: str = "") -> None:
                 f"가리지 못했습니다 (상영관: {screen_name or '지정 없음'}). "
                 f"엉뚱한 상영관을 선점하지 않도록 멈춥니다.")
 
+        if _showtime_blocked(nodes[0]):
+            # 눌러 봐야 Playwright가 타임아웃까지 기다렸다 죽는다.
+            if refreshed:
+                raise RuntimeError(
+                    f"{start_hhmm} 회차가 매진입니다 (목록을 다시 받아 "
+                    f"확인했습니다) — 그 사이 팔린 것 같습니다")
+            raise _ShowtimeBlocked(
+                f"{start_hhmm} 회차가 매진으로 표시돼 있습니다")
         _click_showtime_node(nodes[0], start_hhmm)
         if i:
             log.warning("회차 버튼을 대체 셀렉터로 찾았습니다 (%s) — CGV가 "
@@ -726,6 +821,70 @@ def _click_showtime(page, start_hhmm: str, screen_name: str = "") -> None:
     raise RuntimeError(
         f"{start_hhmm} 회차 버튼을 찾지 못했습니다"
         f"{f' — {last_exc}' if last_exc else ''}")
+
+
+def _showtime_blocked(node) -> bool:
+    """그 회차 버튼이 지금 눌리지 않는 상태인지(매진·예매종료).
+
+    CGV는 `disabled` 속성이 아니라 **aria-disabled="true"** 로 표시한다(실측).
+    Playwright는 이걸 '실행 불가'로 보고 타임아웃까지 기다리므로, 미리 알아채면
+    6초를 버리지 않는다.
+    """
+    try:
+        button = node.locator("xpath=ancestor::button[1]")
+        if not button.count():
+            return False
+        first = button.first
+        return (first.get_attribute("aria-disabled") == "true"
+                or first.get_attribute("disabled") is not None)
+    except Exception:  # noqa: BLE001 - 못 읽으면 막힌 것으로 보지 않는다
+        return False
+
+
+def _refresh_showtimes(page, scn_ymd: str) -> bool:
+    """회차 목록을 다시 받는다. 되돌아와 그 날짜가 다시 골라졌으면 True.
+
+    날짜를 **다른 날로 옮겼다 되돌린다.** 같은 날짜를 다시 누르면 SPA가 요청을
+    보내지 않아 아무 일도 일어나지 않는다(실측). 리로드는 확실하지만 6.2초라,
+    좌석 경쟁 중에 쓰기에는 너무 비싸다.
+
+    되돌아온 뒤 날짜가 맞는지 반드시 확인한다 — 여기서 틀리면 **다른 날짜의 같은
+    시각 회차를 선점하게 된다.** 그건 안 잡느니만 못하다.
+    """
+    wanted = date_labels(scn_ymd)
+    try:
+        buttons = []
+        for selector in DATE_BUTTON_SELECTORS:
+            buttons = _visible(page.locator(selector).all())
+            if buttons:
+                break
+        other = None
+        for button in buttons:
+            try:
+                text = (button.locator(DATE_NUMBER_SELECTOR).first
+                        .text_content() or "").strip()
+            except Exception:  # noqa: BLE001 - 번호 없는 버튼은 건너뛴다
+                continue
+            if text and text not in wanted:
+                other = button
+                break
+        if other is None:
+            log.warning("옮겨 갈 다른 날짜가 없어 회차 목록을 다시 받지 못했습니다")
+            return False
+
+        other.click(timeout=DATE_SWITCH_MS)
+        # **정말 떠났는지 확인한다.** 클릭이 먹지 않았는데 되돌아오는 클릭만
+        # 하면, 날짜는 처음부터 그대로라 목록을 다시 받은 적이 없다. 그걸
+        # "다시 받았다"고 답하면 낡은 매진 표시를 보고 "정말 매진"이라 단정한다.
+        if not _wait_until(page, lambda: _date_is_selected(page, wanted) is False,
+                           DATE_SWITCH_MS):
+            log.warning("날짜를 옮기지 못해 회차 목록을 다시 받지 못했습니다")
+            return False
+        _click_date(page, scn_ymd)      # 되돌아오며 날짜 확인까지 한다
+        return True
+    except Exception as exc:  # noqa: BLE001 - 실패하면 낡은 목록 그대로 간다
+        log.warning("회차 목록을 다시 받지 못했습니다: %s", exc)
+        return False
 
 
 def _click_showtime_node(node, start_hhmm: str) -> None:
@@ -762,27 +921,249 @@ def seat_notice(page) -> str:
     return ""
 
 
-def _pick_seats(page, seat_labels) -> tuple[list[str], list[str], str]:
+# 좌석 클릭이 막혔을 때 그 자리를 들여다보는 스크립트. Playwright는 "무엇이
+# 가로챘다"까지만 알려 주는데, IMAX처럼 좌석맵이 한 화면에 다 안 들어오는 관에서는
+# **좌석이 보이는 영역 밖이라** 좌표가 배경에 떨어진 것일 수 있다. 둘은 대처가
+# 전혀 다르다(팝업이면 닫으면 되고, 화면 밖이면 좌석맵을 밀어야 한다).
+#
+# elementFromPoint가 그 둘을 가른다 — 좌석 좌표에 실제로 무엇이 있는지 본다.
+# 조상들의 scrollWidth·overflow·transform까지 함께 봐야 어떻게 밀어야 하는지
+# (네이티브 스크롤인지 transform 팬인지) 알 수 있다.
+# 좌석이 좌석맵의 보이는 영역 밖이면 밀어 넣고, 누를 좌표를 돌려준다.
+#
+# 2026-08-28 용산아이파크몰 IMAX관 실측으로 확인한 구조다. 좌석맵은 잘라내는
+# 상자(client 600px / scroll 2090px · overflow:hidden) 안에서 **transform으로**
+# 미는 방식이라, Playwright의 자동 스크롤(scrollIntoViewIfNeeded)로는 반쪽만
+# 닿는다. 스크롤 범위는 변형 전 레이아웃 기준으로 잡히는데 transform이 내용을
+# 왼쪽으로 824px 밀어 두므로, scrollLeft가 0이어도 왼쪽 끝 좌석은 상자 밖에
+# 남는다(실측: A3이 상자보다 579px 왼쪽). 그래서 transform을 직접 옮긴다.
+#
+# 화면 밖 좌석을 그냥 누르면 좌표가 배경 위에 떨어져 Playwright가 "modal-bg
+# intercepts pointer events"라고 적는다 — 팝업이 뜬 것과 **글자가 똑같아서**
+# 오래 헷갈렸다. 실제로 못 잡던 좌석이 전부 K1·L1처럼 번호 1~2번(왼쪽 끝)이었다.
+_SEAT_REACH_JS = r"""(arg) => {
+  const {sel, label} = arg;
+  const hits = [...document.querySelectorAll(sel)]
+      .filter(e => (e.textContent || '').trim() === label);
+  if (!hits.length) return {error: '좌석 요소가 DOM에 없습니다'};
+  const el = hits[hits.length - 1];        // 파이썬 쪽 .last와 같은 것을 본다
+
+  // 눌렸는지 확인할 지문. 선택되면 어딘가에 상태 클래스가 붙는데 그 이름을
+  // 우리가 모르므로, 좌석과 그 위 두 단계의 class를 통째로 비교한다.
+  const fp = (e) => [e, e.parentElement,
+                     e.parentElement && e.parentElement.parentElement]
+      .filter(Boolean).map(n => String(n.className)).join('|');
+
+  const reach = () => {
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const t = document.elementFromPoint(cx, cy);
+    return {x: cx, y: cy,
+            ok: !!t && (t === el || el.contains(t) || t.contains(el))};
+  };
+
+  let s = reach();
+  if (s.ok) return {reachable: true, panned: false,
+                    x: s.x, y: s.y, fingerprint: fp(el)};
+
+  let clip = null, pan = null, p = el.parentElement;
+  for (let i = 0; i < 12 && p; i++, p = p.parentElement) {
+    const cs = getComputedStyle(p);
+    if (!clip && p.scrollWidth > p.clientWidth + 1
+        && /hidden|auto|scroll/.test(cs.overflowX)) clip = p;
+    if (!pan && cs.transform && cs.transform !== 'none') pan = p;
+  }
+  if (!clip || !pan) return {reachable: false, panned: false,
+                             x: s.x, y: s.y, reason: '미는 구조를 못 찾았습니다'};
+
+  const cr = clip.getBoundingClientRect(), er = el.getBoundingClientRect();
+  // **밖으로 나간 축만** 옮긴다. 세로가 멀쩡한데 세로까지 건드리면 멀쩡하던
+  // 좌석을 오히려 상자 밖으로 밀어낸다.
+  let dx = 0, dy = 0;
+  if (er.left < cr.left || er.right > cr.right)
+    dx = (cr.left + cr.width / 2) - (er.left + er.width / 2);
+  if (er.top < cr.top || er.bottom > cr.bottom)
+    dy = (cr.top + cr.height / 2) - (er.top + er.height / 2);
+
+  const before = pan.style.transform;
+  const m = new DOMMatrix(getComputedStyle(pan).transform);
+  pan.style.transform =
+      `matrix(${m.a},${m.b},${m.c},${m.d},${m.e + dx},${m.f + dy})`;
+  s = reach();
+  if (!s.ok) {
+    pan.style.transform = before;   // 못 닿으면 화면을 어질러 두지 않는다
+    return {reachable: false, panned: false, x: s.x, y: s.y,
+            reason: '밀어도 좌석에 닿지 않습니다'};
+  }
+  return {reachable: true, panned: true, x: s.x, y: s.y,
+          moved: [Math.round(dx), Math.round(dy)], fingerprint: fp(el)};
+}"""
+
+# 좌석이 눌렸는지 보는 지문만 다시 읽는다.
+_SEAT_FP_JS = r"""(arg) => {
+  const {sel, label} = arg;
+  const hits = [...document.querySelectorAll(sel)]
+      .filter(e => (e.textContent || '').trim() === label);
+  if (!hits.length) return null;
+  const el = hits[hits.length - 1];
+  return [el, el.parentElement,
+          el.parentElement && el.parentElement.parentElement]
+      .filter(Boolean).map(n => String(n.className)).join('|');
+}"""
+
+
+_SEAT_DIAG_JS = r"""(arg) => {
+  const {sel, label} = arg;
+  const hits = [...document.querySelectorAll(sel)]
+      .filter(e => (e.textContent || '').trim() === label);
+  if (!hits.length) return {error: '좌석 요소가 DOM에 없습니다'};
+  const el = hits[hits.length - 1];        // 파이썬 쪽 .last와 같은 것을 본다
+  const desc = (n) => {
+    if (!n) return 'null';
+    const cls = (typeof n.className === 'string' ? n.className : '').trim();
+    return n.tagName.toLowerCase()
+         + (cls ? '.' + cls.split(/\s+/).slice(0, 2).join('.') : '');
+  };
+  const r = el.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const top = document.elementFromPoint(cx, cy);
+
+  // 좌석을 잘라내는 조상과 좌석맵을 미는 조상을 찾는다. 창 뷰포트 기준으로는
+  // 판정할 수 없다 — IMAX 실측에서 잘린 좌석도 창 안에는 들어 있었다(창이
+  // 2560이고 좌석맵은 600만 보이는 구조라 그렇다).
+  let clip = null, pan = null, p = el.parentElement;
+  for (let i = 0; i < 12 && p; i++, p = p.parentElement) {
+    const cs = getComputedStyle(p);
+    if (!clip && p.scrollWidth > p.clientWidth + 1
+        && /hidden|auto|scroll/.test(cs.overflowX)) clip = p;
+    if (!pan && cs.transform && cs.transform !== 'none') pan = p;
+  }
+  const box = clip && clip.getBoundingClientRect();
+  return {
+    seat_rect: [r.left, r.top, r.right, r.bottom].map(Math.round),
+    at_point: desc(top),
+    // 좌석 자신(또는 그 자식)이 나오면 덮인 게 아니다 — 다른 이유로 막힌 것이다.
+    reaches_seat: !!top && (top === el || el.contains(top) || top.contains(el)),
+    clip: clip ? {
+      node: desc(clip),
+      rect: [box.left, box.top, box.right, box.bottom].map(Math.round),
+      client_w: clip.clientWidth, scroll_w: clip.scrollWidth,
+      scroll_left: Math.round(clip.scrollLeft),
+      scroll_max: Math.round(clip.scrollWidth - clip.clientWidth),
+      // 이게 거짓이면 '팝업이 덮은 것'이 아니라 '보이는 영역 밖'이다.
+      seat_inside: cx >= box.left && cx <= box.right
+                   && cy >= box.top && cy <= box.bottom,
+    } : null,
+    pan: pan ? {node: desc(pan), transform: getComputedStyle(pan).transform} : null,
+    window: [innerWidth, innerHeight],
+  };
+}"""
+
+
+def _seat_click_diagnosis(page, label: str) -> str:
+    """좌석 클릭이 막힌 자리를 들여다본 결과. 못 읽으면 ''.
+
+    **판정하지 않고 사실만 남긴다.** 지금 우리는 IMAX 좌석맵이 네이티브 스크롤인지
+    transform 팬인지조차 모른다 — 추측으로 대응 코드를 넣으면 지금 잘 되는 가운데
+    좌석까지 망친다. 우선 한 번이라도 실물을 보고 나서 정한다.
+    """
+    try:
+        import json as _json
+
+        out = page.evaluate(_SEAT_DIAG_JS,
+                            {"sel": SEAT_MAP_SELECTOR, "label": label})
+        return _json.dumps(out, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001 - 진단 실패가 선점을 막으면 안 된다
+        log.debug("좌석 진단을 읽지 못했습니다: %s", exc)
+        return ""
+
+
+def _click_seat(page, label: str) -> None:
+    """좌석 하나를 누른다. 보이는 영역 밖이면 좌석맵을 밀어 넣고 누른다.
+
+    화면 안에 있는 좌석은 **지금까지의 경로 그대로** 간다. 그쪽은 실제로 잘 되고
+    있고(실측 G36·G37 선점 성공), Playwright의 실행 가능 판정을 그대로 쓰는 편이
+    안전하다. 밀어야 하는 좌석만 다른 길로 보낸다.
+
+    민 좌석은 `locator.click()`을 쓸 수 없다. 그게 누르기 직전에 다시
+    scrollIntoViewIfNeeded를 돌려 방금 맞춰 둔 위치를 흐트러뜨리기 때문이다.
+    좌표로 누르는 대신, **눌린 게 맞는지 따로 확인한다** — 좌표 클릭은 빗나가도
+    예외를 내지 않아서, 확인이 없으면 안 눌린 좌석을 눌렀다고 세게 된다. 그건
+    인원수를 채운 줄 알고 넘어가 엉뚱한 자리를 선점하는 길이다.
+    """
+    node = page.get_by_text(label, exact=True).last
+    try:
+        spot = page.evaluate(_SEAT_REACH_JS,
+                             {"sel": SEAT_MAP_SELECTOR, "label": label})
+    except Exception as exc:  # noqa: BLE001 - 못 읽으면 예전 경로로 간다
+        log.debug("좌석 %s 위치를 읽지 못했습니다: %s", label, exc)
+        spot = None
+
+    if not spot or not spot.get("panned"):
+        # 이미 닿거나, 밀 구조가 아니거나, 밀어도 안 되는 경우. 마지막 둘은 여기서
+        # 제대로 된 실패 문구와 함께 죽는 편이 낫다.
+        _click_through_modals(page, node, what=f"좌석 {label}",
+                              timeout=SEAT_CLICK_MS, retries=1)
+        return
+
+    log.info("좌석 %s가 좌석맵 밖에 있어 %s만큼 밀어 넣었습니다",
+             label, spot.get("moved"))
+    page.mouse.click(spot["x"], spot["y"])
+    try:
+        after = page.evaluate(_SEAT_FP_JS,
+                              {"sel": SEAT_MAP_SELECTOR, "label": label})
+    except Exception as exc:  # noqa: BLE001
+        log.debug("좌석 %s 상태를 다시 읽지 못했습니다: %s", label, exc)
+        return  # 확인할 수단이 없으면 눌린 것으로 본다 — 예전과 같은 수준이다
+    if after is not None and after == spot.get("fingerprint"):
+        raise RuntimeError(
+            f"좌석 {label}을 밀어 넣고 눌렀지만 선택되지 않았습니다 "
+            f"(화면이 다시 그려져 위치가 어긋난 것일 수 있습니다)")
+
+
+def _pick_seats(page, seat_labels) -> tuple[list[str], list[str], str, bool]:
     """좌석맵에서 지정한 좌석을 하나씩 누른다.
 
-    반환: (누른 것, 못 누른 것, 안내 문구). 안내 문구가 있으면 그게 실패 사유다.
+    반환: (누른 것, 못 누른 것, 안내 문구, 팝업에 막혔는지).
+    안내 문구가 있으면 그게 실패 사유다.
 
     한 좌석이 실패해도 나머지는 마저 눌러 본다 — 무엇이 팔렸는지 전부 알아야
     쓸 만한 오류 문구가 나오고, 어차피 여기서는 아직 아무것도 선점되지 않는다.
-    다만 **안내 팝업이 뜨면 거기서 멈춘다**: 팝업이 화면을 덮고 있어 나머지 클릭은
-    어차피 타임아웃까지 기다렸다 실패할 뿐이다(좌석 하나에 3초씩 버린다).
+    다만 **화면을 덮은 것이 있으면 거기서 멈춘다**: 그 아래 좌석은 어차피
+    타임아웃까지 기다렸다 실패할 뿐이다.
+
+    막히는 방식이 둘이라 따로 다룬다. 좌석 안내 팝업(seat_notice)은 "이 좌석은
+    이렇게 못 삽니다"라는 **답**이라 다시 고를 이유가 없고, 포인터를 가로채는
+    오버레이는 **사고**라 닫고 다시 누르면 풀린다(_click_through_modals).
+    닫아도 안 풀리면 그때는 나머지 좌석을 눌러 봐야 같은 것에 막힐 뿐이다 —
+    실측에서 좌석 둘에 3초씩 버리고 재시도까지 돌아 42.9초를 썼다.
 
     **무엇을 눌렀는지도 함께 돌려준다.** 다시 고를 수 있는지가 여기에 달렸다:
     하나도 못 눌렀으면 화면에 아무 흔적이 없어 그냥 다시 고르면 되지만, 일부가
     이미 선택돼 있으면 인원수를 넘겨 엉뚱한 자리를 선점할 수 있다.
     """
     clicked, missed = [], []
+    diagnosed = False
     for i, label in enumerate(seat_labels):
         try:
-            page.get_by_text(label, exact=True).last.click(timeout=3000)
+            _click_seat(page, label)
         except Exception as exc:  # noqa: BLE001 - 못 누른 좌석은 모아서 보고
             log.warning("좌석 %s 클릭 실패: %s", label, exc)
             missed.append(label)
+            # 첫 실패에서 한 번만 들여다본다. 좌석마다 찍으면 로그만 불어나고,
+            # 어차피 같은 화면이라 첫 장이면 원인을 가리기에 충분하다.
+            if not diagnosed:
+                diagnosed = True
+                detail = _seat_click_diagnosis(page, label)
+                if detail:
+                    log.warning("좌석 %s 자리 진단: %s", label, detail)
+            if _blocked_by_modal(exc):
+                # 닫고 다시 눌렀는데도 가로막혔다. 나머지는 시도하지 않는다.
+                log.warning("좌석맵이 팝업에 덮여 있습니다 — 남은 좌석(%s)은 "
+                            "누르지 않습니다",
+                            ", ".join(seat_labels[i + 1:]) or "없음")
+                missed.extend(seat_labels[i + 1:])
+                return clicked, missed, "", True
         else:
             clicked.append(label)
 
@@ -791,8 +1172,8 @@ def _pick_seats(page, seat_labels) -> tuple[list[str], list[str], str]:
             log.warning("좌석 안내 팝업: %s", notice)
             dismiss_modals(page)
             missed.extend(seat_labels[i + 1:])
-            return clicked, missed, notice
-    return clicked, missed, ""
+            return clicked, missed, notice, False
+    return clicked, missed, "", False
 
 
 def live_seats(session, ctx: dict) -> list[dict]:
@@ -856,9 +1237,28 @@ def _select_block(session, page, ctx: dict, *, seats_fn=None) -> dict:
                 log.info("좌석을 다시 골랐습니다: %s → %s",
                          ", ".join(candidate) or "(없음)", ", ".join(labels))
 
-        clicked, missed, notice = _pick_seats(page, labels)
+        # 누르기 직전에 화면을 한 번 정리한다. _click_through_modals는 막힌
+        # **뒤에야** 닫으므로, 이걸 안 하면 첫 좌석은 반드시 한 번 막힌다.
+        # 로딩이 걷히는 순간 팝업이 뜨는 경합이 있어(커밋 bf71721) 로딩을 먼저
+        # 기다려야 의미가 있다. 좌석맵 자체는 MODAL_KEEP_TEXTS가 지켜 준다.
+        _wait_for_loading(page)
+        dismiss_modals(page, rounds=1)
+
+        clicked, missed, notice, blocked = _pick_seats(page, labels)
         if not missed:
             return {"ok": True, "labels": labels, "error": ""}
+
+        # 오버레이가 안 걷힌다. 같은 블록을 다시 골라 봐야 그 아래를 누르는 것은
+        # 마찬가지라 좌석 수만큼 타임아웃을 또 버린다 — 사실대로 끝낸다.
+        if blocked:
+            shot = _save_screenshot(page, ctx) if not shot_saved else shot
+            # "그 사이 팔렸다"(_partial_seats_error)와 섞으면 안 된다. 좌석은
+            # 멀쩡히 있었고 우리가 못 누른 것이라, 사람이 직접 예매하면 된다.
+            detail = (f" — {', '.join(clicked)}는 골라진 채로 남았습니다"
+                      if clicked else "")
+            return {"ok": False, "labels": [],
+                    "error": f"좌석맵이 팝업에 덮여 좌석을 누르지 못했습니다"
+                             f"{detail}" + (f" (화면: {shot})" if shot else "")}
 
         # 안내 팝업이 있으면 그게 진짜 사유다. 좌석 종류가 요구하는 인원 단위가
         # 안 맞는 것 같은 경우라, 다시 고른다고 풀리지 않는다 — 바로 끝낸다.
@@ -1190,6 +1590,70 @@ def _save_screenshot(page, ctx: dict) -> str | None:
 
 
 
+def _is_secret(name: str) -> bool:
+    """그 이름이 가려야 할 값인지. 대소문자·구분자를 무시하고 조각으로 본다."""
+    flat = "".join(ch for ch in str(name).lower() if ch.isalnum())
+    return any(hint.lower() in flat for hint in SECRET_HINTS)
+
+
+def mask_secrets(value):
+    """기록에 남기기 전에 자격증명을 지운다. 구조는 그대로 두고 값만 가린다.
+
+    형태를 배우는 게 목적이라 **키와 중첩 구조는 남겨야** 한다. 그래서 값을
+    지우되 무엇이 있었는지는 "(가림: 39자)"로 적어 둔다 — 나중에 직접 채울 때
+    자리를 알아볼 수 있다.
+    """
+    if isinstance(value, dict):
+        return {k: (f"(가림: {len(str(v))}자)" if _is_secret(k)
+                    else mask_secrets(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [mask_secrets(v) for v in value]
+    return value
+
+
+def _record_hold_request(captured: dict, ctx: dict) -> None:
+    """성공한 선점 요청의 형태를 파일로 남긴다. 실패해도 조용히 넘어간다.
+
+    **동작은 바꾸지 않는다.** 선점은 지금까지처럼 UI로 하고, 여기서는 그때 나간
+    요청을 들여다볼 뿐이다. 이 기록이 쌓여야 "UI를 몰지 않고 직접 부른다"를
+    설계할 수 있다 — 지금은 요청 바디가 코드 어디에도 없어 설계 자체가 불가능하다.
+    """
+    req = captured.get("request")
+    if not req:
+        return
+    try:
+        import json as _json
+
+        HOLD_SPEC_DIR.mkdir(parents=True, exist_ok=True)
+        body = req.get("post_data")
+        try:
+            body = mask_secrets(_json.loads(body)) if body else None
+        except (ValueError, TypeError):
+            body = "(JSON이 아님)" if body else None
+
+        record = {
+            "관측시각": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "url": req.get("url"),
+            "method": req.get("method"),
+            "headers": mask_secrets(req.get("headers") or {}),
+            "body": body,
+            # 어떤 상황의 요청인지 — 인원수·좌석 수가 바디의 어느 값과 맞는지
+            # 대조하려면 이게 있어야 한다.
+            "party": ctx.get("party"),
+            "seats": list(ctx.get("seat_labels") or []),
+            "scn_ymd": ctx.get("scn_ymd"),
+            "start_hhmm": ctx.get("start_hhmm"),
+        }
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = HOLD_SPEC_DIR / f"{stamp}_hold.json"
+        path.write_text(_json.dumps(record, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        log.info("선점 요청의 형태를 남겼습니다: %s", path)
+    except Exception as exc:  # noqa: BLE001 - 관찰 실패로 선점을 망치지 않는다
+        log.debug("선점 요청을 기록하지 못했습니다: %s", exc)
+
+
 def hold_block(session, ctx: dict) -> dict:
     """CGV 예매 UI를 구동해 좌석을 임시 선점한다. 결제 버튼 이후로는 가지 않는다.
 
@@ -1224,7 +1688,22 @@ def hold_block(session, ctx: dict) -> dict:
             # 여기 걸리면 우리가 '선점'으로 알고 누른 버튼이 결제를 진행시킨
             # 것이다. 첫 번째 것만 남긴다 — 뒤따르는 요청은 같은 사건이다.
             captured.setdefault("payment_url", r.url)
+
+    def on_req(r):
+        # 관찰 전용 — 나가는 선점 요청의 생김새만 챙긴다. 여기서 손대는 것은
+        # 없고, 실패해도 선점에는 영향이 없어야 한다.
+        if SEAT_HOLD_URL_MARK not in r.url:
+            return
+        try:
+            captured.setdefault("request", {
+                "url": r.url, "method": r.method,
+                "headers": dict(r.headers or {}), "post_data": r.post_data,
+            })
+        except Exception:  # noqa: BLE001 - 못 읽으면 그냥 안 남긴다
+            pass
+
     page.on("response", on_resp)
+    page.on("request", on_req)
 
     try:
         # 영화 → 극장 → 날짜를 주소 하나로 건너뛴다. 그 세 클릭이 자동 예매가 가장
@@ -1234,19 +1713,21 @@ def hold_block(session, ctx: dict) -> dict:
             log.info("미리 띄워 둔 예매 화면을 그대로 씁니다 (%s)", ctx["scn_ymd"])
         elif not _open_booking_direct(page, ctx):
             page.goto(BOOKING_PAGE, wait_until="domcontentloaded", timeout=40000)
-            page.wait_for_timeout(3500)
+            # 여기 있던 고정 대기 셋(3.5 + 2.5 + 2.5초)을 걷어냈다. 뒤따르는 셋이
+            # 이미 같은 것을 기다린다 — _click_visible은 wait_for_selector로
+            # 보일 때까지, _click_date는 _wait_for_any로 날짜 스트립이 그려질
+            # 때까지. 자고 나서 또 기다리고 있었던 셈이다.
             _click_visible(page, ctx["mov_nm"], exact=True, what="영화",
                            timeout=10000)
-            page.wait_for_timeout(2500)
             _click_visible(page, ctx["site_nm"], exact=False, what="극장",
                            timeout=6000)
-            page.wait_for_timeout(2500)
             # 날짜를 고른다. 이 화면은 기본이 **오늘**이라, 건너뛰면 오늘 상영표에서
             # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한
             # 날짜를 선점한다.
             _click_date(page, ctx["scn_ymd"])
         steps.mark("화면진입")
-        _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""))
+        _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""),
+                        ctx.get("scn_ymd", ""))
         steps.mark("회차")
         # 인원 선택 화면에 닿을 때까지 기다린다. 고정 시간으로 넘겨짚으면 안 된다 —
         # 접속이 몰리면 CGV가 가상 대기열을 세우고, 그동안 화면은 그대로다.
@@ -1315,10 +1796,13 @@ def hold_block(session, ctx: dict) -> dict:
         return {"ok": False, "error": f"UI 구동 실패: {exc}{detail}",
                 "seat_labels": chosen}
     finally:
-        try:
-            page.remove_listener("response", on_resp)
-        except Exception:  # noqa: BLE001
-            pass
+        # 하나씩 따로 뗀다. 한 묶음으로 두면 앞엣것이 터졌을 때 뒤엣것이 남는데,
+        # 이 페이지는 미리 띄워 둔 상주 탭이라 선점할 때마다 리스너가 쌓인다.
+        for event, handler in (("response", on_resp), ("request", on_req)):
+            try:
+                page.remove_listener(event, handler)
+            except Exception:  # noqa: BLE001
+                pass
         # 성공이든 실패든 어디에 시간을 썼는지 남긴다 — "느린 것 같다"는 인상만
         # 가지고는 어느 단계를 고쳐야 할지 알 수 없다.
         log.info("자동 예매 소요 — %s", steps.summary())
@@ -1340,6 +1824,7 @@ def hold_block(session, ctx: dict) -> dict:
     body = captured.get("body") or {}
     data = (body.get("data") or {}) if isinstance(body, dict) else {}
     if data.get("resultCode") in ("0", 0):
+        _record_hold_request(captured, ctx)
         return {
             "ok": True,
             "seat_labels": chosen,
@@ -1434,7 +1919,12 @@ def _open_payment_page(page) -> bool:
                 buttons[-1].click(timeout=4000)
             except Exception as exc:  # noqa: BLE001 - 다음 바퀴에 다시 본다
                 log.debug("결제 화면으로 넘기는 클릭 실패: %s", exc)
-        page.wait_for_timeout(PAY_PAGE_ROUND_MS)
+        # 예전에는 여기서 무조건 2.5초를 잤다. 화면이 0.3초 만에 떠도 그대로
+        # 자고 **다음 바퀴에 가서야** True를 돌려주니, 성공한 경우에도 2.5초가
+        # 통째로 버려졌다. 떴으면 그 자리에서 끝낸다.
+        if _wait_until(page, lambda: _payment_page_ready(page),
+                       PAY_PAGE_ROUND_MS):
+            return True
     return _payment_page_ready(page)
 
 
@@ -1455,8 +1945,10 @@ def _choose_pay_method(page, method: str) -> None:
         raise RuntimeError(f"결제수단에 {alt}가 없습니다 "
                            f"(이 극장·상품에서 못 쓰는 수단일 수 있습니다)")
     visible[0].click(timeout=5000)
-    page.wait_for_timeout(1500)
-    if not _pay_method_active(page, alt):
+    # 눌린 게 화면에 반영되기를 기다린다. 상한은 예전 고정 대기와 같게 두므로
+    # 느려지는 경우는 없고, 빨리 반영되면 그만큼 일찍 넘어간다.
+    if not _wait_until(page, lambda: _pay_method_active(page, alt),
+                       PAY_METHOD_ACTIVE_MS):
         raise RuntimeError(f"{alt}를 눌렀지만 선택되지 않았습니다")
 
 
@@ -1486,14 +1978,20 @@ def _agree_terms(page) -> None:
         page.locator(TERMS_ALL_LABEL).first.click(timeout=4000)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"약관 동의를 누르지 못했습니다: {exc}") from exc
-    page.wait_for_timeout(800)
-    try:
-        checked = page.evaluate(
+
+    def checked():
+        return page.evaluate(
             "(sel) => { const el = document.querySelector(sel);"
             "           return el ? el.checked : null; }", TERMS_ALL_INPUT)
+
+    # 켜졌으면 바로 넘어간다. 못 읽는 경우(None)는 예전처럼 통과시킨다 —
+    # 확인할 수단이 없는 것과 꺼져 있는 것은 다르다.
+    _wait_until(page, lambda: checked() is not False, TERMS_CHECK_MS)
+    try:
+        state = checked()
     except Exception:  # noqa: BLE001
-        checked = None
-    if checked is False:
+        state = None
+    if state is False:
         raise RuntimeError("약관 동의가 켜지지 않았습니다")
 
 
@@ -1528,7 +2026,7 @@ def _wait_for_bridge(page, timeout_ms: int = PAY_BRIDGE_WAIT_MS):
                     return frame
         except Exception:  # noqa: BLE001 - 프레임 목록이 바뀌는 중일 수 있다
             pass
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(STEP_POLL_MS)
     return None
 
 
@@ -1574,10 +2072,8 @@ def pay_block(session, ctx: dict, *, method: str = DEFAULT_PAY_METHOD) -> dict:
         # 브릿지 응답이 프레임보다 늦게 올 수 있다. **리스너를 떼기 전에** 기다려야
         # 한다 — 떼고 나서 기다리면 그 사이 온 응답을 아무도 받지 않는다.
         # 못 받아도 프레임 주소로 같은 링크를 만들 수 있으니 오래 끌지는 않는다.
-        for _ in range(10):
-            if captured.get("bridge"):
-                break
-            page.wait_for_timeout(500)
+        _wait_until(page, lambda: bool(captured.get("bridge")),
+                    PAY_BRIDGE_BODY_MS)
     except Exception as exc:  # noqa: BLE001 - 결제 요청 실패는 선점을 무르지 않는다
         shot = _save_screenshot(page, ctx)
         detail = f" (화면: {shot})" if shot else ""

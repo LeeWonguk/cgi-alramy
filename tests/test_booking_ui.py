@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -28,11 +29,13 @@ import booking  # noqa: E402
 
 # ── 가짜 DOM ────────────────────────────────────────────────────────────────
 class FakeNode:
-    def __init__(self, tag="span", cls="", text="", visible=True, children=()):
+    def __init__(self, tag="span", cls="", text="", visible=True, children=(),
+                 attrs=None):
         self.tag = tag
         self.cls = cls
         self.own_text = text
         self.visible = visible
+        self.attrs = dict(attrs or {})
         self.children = list(children)
         self.parent = None
         self.clicks = 0
@@ -49,7 +52,9 @@ class FakeNode:
         return self.visible
 
     def get_attribute(self, name):
-        return self.cls if name == "class" else None
+        if name == "class":
+            return self.cls
+        return self.attrs.get(name)
 
     def click(self, timeout=None):
         self.clicks += 1
@@ -178,8 +183,14 @@ def date_strip(numbers, active=None, with_hidden_twins=True) -> list[FakeNode]:
     return visible + hidden
 
 
-def showtime(start: str, end: str, screen="IMAX관") -> FakeNode:
+def showtime(start: str, end: str, screen="IMAX관",
+             soldout=False) -> FakeNode:
+    """회차 버튼 하나. soldout이면 실제 화면처럼 aria-disabled를 단다.
+
+    CGV는 매진을 `disabled` 속성이 아니라 aria-disabled로 표시한다(2026-08 실측).
+    """
     return FakeNode("button", "screenInfo_timeLink cinemaSchedule_scrollItemBtn",
+                    attrs={"aria-disabled": "true"} if soldout else None,
                     children=[
                         FakeNode("span", "screenInfo_start__6BZbu "
                                          "cinemaSchedule_startTime__ZE5Zp", start),
@@ -291,6 +302,137 @@ class TestClickShowtime(unittest.TestCase):
         self.assertIn("멈춥니다", str(caught.exception))
         self.assertEqual(page.clicked, [])
 
+    def test_a_soldout_showtime_is_not_clicked(self):
+        """매진 버튼을 그냥 누르면 Playwright가 6초를 기다렸다 죽는다.
+
+        CGV는 매진을 aria-disabled로 표시하고, Playwright는 그걸 '실행 불가'로
+        본다 — 2026-08-28 실패가 정확히 이 모양이었다("element is not enabled").
+        """
+        page = FakePage([screen_block("IMAX관",
+                                      [showtime("25:00", "-28:02", soldout=True)])])
+        with self.assertRaises(booking._ShowtimeBlocked):
+            booking._click_showtime(page, "25:00")
+        self.assertEqual(page.clicked, [], "매진인 걸 알고도 눌렀다")
+
+
+class TestStaleShowtimeList(unittest.TestCase):
+    """미리 띄워 둔 화면의 회차 목록은 그때의 스냅샷이다.
+
+    2026-08-28 실측: 15:03:07에 띄운 탭을 15:04:58에 그대로 썼는데, 그 사이
+    좌석이 나서 자동 예매가 돌았다. 화면은 여전히 '매진'이었고 클릭은 6초를
+    기다렸다 죽었다. 탭은 세션 재기동(30분)에만 다시 열려 최대 30분 낡는다.
+
+    좌석이 났다는 건 방금 API로 확인한 사실이므로, 화면이 매진이라고 하면
+    **화면 쪽을 의심한다.**
+    """
+
+    def setUp(self):
+        for name in ("DATE_SWITCH_MS", "SHOWTIME_STALE_MS"):
+            self.addCleanup(setattr, booking, name, getattr(booking, name))
+            setattr(booking, name, 50)
+
+    def build(self, *, soldout: bool, revive: bool):
+        """매진으로 그려진 화면. revive면 날짜를 다시 고를 때 목록이 되살아난다."""
+        target = showtime("25:00", "-28:02", soldout=soldout)
+        page = FakePage(date_strip(["28", "29"], active="28")
+                        + [screen_block("IMAX관", [target])])
+
+        def activate(button):
+            original = button.click
+
+            def go(timeout=None):
+                for b in page.descendants():
+                    if b.tag == "button" and "dayScroll_scrollItem" in b.cls:
+                        b.cls = b.cls.replace(" dayScroll_itemActive__fZ5Sq", "")
+                button.cls += " dayScroll_itemActive__fZ5Sq"
+                if revive and button.text_content().strip().endswith("28"):
+                    # 목록을 다시 받아 오니 매진이 풀렸다.
+                    target.attrs.pop("aria-disabled", None)
+                original(timeout=timeout)
+
+            button.click = go
+
+        for b in page.descendants():
+            if b.tag == "button" and "dayScroll_scrollItem" in b.cls and b.visible:
+                activate(b)
+        return page, target
+
+    def test_a_stale_soldout_is_refreshed_and_then_clicked(self):
+        page, target = self.build(soldout=True, revive=True)
+        booking._click_showtime(page, "25:00", "IMAX관", "20260828")
+        self.assertIn(target, page.clicked, "목록을 다시 받고도 회차를 못 눌렀다")
+
+    def test_a_real_soldout_survives_the_refresh_and_fails_clearly(self):
+        """다시 받아도 매진이면 정말 매진이다 — 사유가 그렇게 적혀야 한다."""
+        page, target = self.build(soldout=True, revive=False)
+        with self.assertRaises(RuntimeError) as caught:
+            booking._click_showtime(page, "25:00", "IMAX관", "20260828")
+        msg = str(caught.exception)
+        self.assertIn("매진", msg)
+        self.assertIn("다시 받아", msg)
+        self.assertNotIn(target, page.clicked)
+
+    def test_an_available_showtime_never_pays_for_a_refresh(self):
+        # 잘 되던 경로는 그대로여야 한다 — 날짜를 건드리지 않는다.
+        page, target = self.build(soldout=False, revive=False)
+        booking._click_showtime(page, "25:00", "IMAX관", "20260828")
+        self.assertEqual(page.clicked, [target],
+                         "멀쩡한 회차인데 날짜를 옮겼다")
+
+    def test_without_a_date_it_reports_instead_of_guessing(self):
+        # 날짜를 모르면 목록을 다시 받을 수 없다 — 조용히 넘어가지 않는다.
+        page, _ = self.build(soldout=True, revive=True)
+        with self.assertRaises(booking._ShowtimeBlocked):
+            booking._click_showtime(page, "25:00", "IMAX관")
+
+
+class TestRefreshShowtimes(unittest.TestCase):
+    """목록을 다시 받는 길은 날짜 왕복이다 — 되돌아온 날짜를 반드시 확인한다."""
+
+    def setUp(self):
+        # 실패 경로가 실제 상한만큼 자면 테스트가 몇 초씩 멎는다.
+        for name in ("DATE_SWITCH_MS", "SHOWTIME_STALE_MS"):
+            self.addCleanup(setattr, booking, name, getattr(booking, name))
+            setattr(booking, name, 50)
+
+    def test_it_bounces_to_another_date_and_back(self):
+        page = FakePage(date_strip(["28", "29"], active="28"))
+        for b in page.descendants():
+            if b.tag == "button" and "dayScroll_scrollItem" in b.cls and b.visible:
+                def make(button):
+                    original = button.click
+
+                    def go(timeout=None):
+                        for n in page.descendants():
+                            if n.tag == "button" and "dayScroll_scrollItem" in n.cls:
+                                n.cls = n.cls.replace(
+                                    " dayScroll_itemActive__fZ5Sq", "")
+                        button.cls += " dayScroll_itemActive__fZ5Sq"
+                        original(timeout=timeout)
+
+                    button.click = go
+                make(b)
+
+        self.assertTrue(booking._refresh_showtimes(page, "20260828"))
+        pressed = [n.text_content().strip()[-2:] for n in page.clicked]
+        self.assertEqual(pressed, ["29", "28"], "다른 날짜로 갔다 되돌아와야 한다")
+
+    def test_a_single_date_strip_cannot_be_refreshed(self):
+        # 옮겨 갈 날짜가 없으면 거짓을 돌려준다 — 같은 날짜 재클릭은 무효다(실측).
+        page = FakePage(date_strip(["28"], active="28"))
+        self.assertFalse(booking._refresh_showtimes(page, "20260828"))
+        self.assertEqual(page.clicked, [])
+
+    def test_a_bounce_that_does_not_come_back_is_reported(self):
+        """되돌아오지 못하면 실패다.
+
+        여기서 참을 돌려주면 **다른 날짜의 같은 시각 회차를 선점한다.**
+        """
+        page = FakePage(date_strip(["28", "29"], active="28"))
+        self.assertFalse(booking._refresh_showtimes(page, "20260828"))
+
+
+class TestClickShowtimeMore(unittest.TestCase):
     def test_raises_with_the_time_when_nothing_matches(self):
         page = FakePage([screen_block("IMAX관", [showtime("20:05", "-23:07")])])
         with self.assertRaises(RuntimeError) as caught:
@@ -372,9 +514,14 @@ class TestPickSeats(unittest.TestCase):
     """
 
     class SeatPage:
-        def __init__(self, available):
+        def __init__(self, available, *, blocked_until: int = 0):
             self.available = set(available)
             self.clicked: list[str] = []
+            # 0이면 막힘 없음. n이면 앞의 n번 클릭이 오버레이에 가로막힌다 —
+            # 실제 화면에서 modal-bg가 포인터를 먹던 상황을 그대로 흉내 낸다.
+            self.blocked_until = blocked_until
+            self.click_attempts = 0
+            self.dismissed = 0
 
         def get_by_text(self, label, exact=False):
             page = self
@@ -385,30 +532,86 @@ class TestPickSeats(unittest.TestCase):
                     return self
 
                 def click(self, timeout=None):
+                    page.click_attempts += 1
+                    if page.click_attempts <= page.blocked_until:
+                        raise RuntimeError(
+                            '<div class="modal-bg"></div> intercepts pointer '
+                            'events')
                     if label not in page.available:
                         raise RuntimeError(f"좌석 없음: {label}")
                     page.clicked.append(label)
 
             return Loc()
 
+        # _wait_for_loading·dismiss_modals가 쓰는 최소한의 표면. 둘 다 "덮은 게
+        # 없다"로 답하게 해 두고, 오버레이는 위 click에서만 흉내 낸다.
+        def wait_for_timeout(self, ms):
+            pass
+
+        def locator(self, selector, **kwargs):
+            page = self
+
+            class Empty:
+                def count(self):
+                    return 0
+
+                def all(self):
+                    return []
+
+                @property
+                def first(self):
+                    return self
+
+                def is_visible(self):
+                    return False
+
+            return Empty()
+
     def test_all_seats_clicked_reports_nothing_missed(self):
         page = self.SeatPage(["J22", "J23"])
         self.assertEqual(booking._pick_seats(page, ["J22", "J23"]),
-                         (["J22", "J23"], [], ""))
+                         (["J22", "J23"], [], "", False))
         self.assertEqual(page.clicked, ["J22", "J23"])
 
     def test_reports_every_seat_it_could_not_click(self):
         # 하나가 실패해도 나머지를 마저 눌러 봐야 무엇이 팔렸는지 다 알 수 있다.
         page = self.SeatPage(["J22"])
         self.assertEqual(booking._pick_seats(page, ["J22", "J23", "J24"]),
-                         (["J22"], ["J23", "J24"], ""))
+                         (["J22"], ["J23", "J24"], "", False))
 
     def test_reports_what_it_managed_to_click(self):
         # 다시 고를 수 있는지가 여기에 달렸다 — 이미 골라 둔 게 있으면 못 고친다.
         page = self.SeatPage(["J23"])
-        clicked, missed, _ = booking._pick_seats(page, ["J22", "J23"])
+        clicked, missed, _, _ = booking._pick_seats(page, ["J22", "J23"])
         self.assertEqual(clicked, ["J23"])
         self.assertEqual(missed, ["J22"])
+
+    def test_a_blocking_overlay_is_closed_and_the_click_retried(self):
+        """오버레이는 사고라 닫고 다시 누르면 풀린다 — 그 좌석을 포기하면 안 된다."""
+        page = self.SeatPage(["J22", "J23"], blocked_until=1)
+        clicked, missed, notice, blocked = booking._pick_seats(
+            page, ["J22", "J23"])
+        self.assertEqual(clicked, ["J22", "J23"])
+        self.assertEqual(missed, [])
+        self.assertFalse(blocked)
+        self.assertEqual(notice, "")
+
+    def test_seats_under_a_stuck_overlay_are_not_hammered(self):
+        """닫아도 안 걷히면 남은 좌석은 누르지 않는다.
+
+        실측에서 좌석 둘에 3초씩 버리고 재시도까지 돌아 42.9초를 썼다. 그 아래
+        좌석은 어차피 같은 것에 막히므로 시도 자체가 낭비다.
+        """
+        page = self.SeatPage(["K1", "K2", "K3"], blocked_until=99)
+        clicked, missed, notice, blocked = booking._pick_seats(
+            page, ["K1", "K2", "K3"])
+        self.assertTrue(blocked)
+        self.assertEqual(clicked, [])
+        self.assertEqual(missed, ["K1", "K2", "K3"])
+        self.assertEqual(notice, "", "오버레이는 좌석 안내 팝업이 아니다")
+        # 첫 좌석에 두 번(원클릭 + 팝업 닫고 재시도)까지가 전부다.
+        self.assertEqual(page.click_attempts, 2,
+                         "막힌 걸 알고도 남은 좌석을 계속 눌렀다")
 
     def test_error_message_names_the_missing_seats(self):
         msg = booking._partial_seats_error(["J22", "J23"], ["J23"])
@@ -417,7 +620,7 @@ class TestPickSeats(unittest.TestCase):
 
     def test_no_seat_clicked_at_all_is_reported_the_same_way(self):
         page = self.SeatPage([])
-        clicked, missed, _ = booking._pick_seats(page, ["J22", "J23"])
+        clicked, missed, _, _ = booking._pick_seats(page, ["J22", "J23"])
         self.assertEqual(missed, ["J22", "J23"])
         self.assertEqual(clicked, [])
         self.assertEqual(page.clicked, [])
@@ -551,6 +754,30 @@ class TestSelectBlockRepicksAtTheSeatMap(unittest.TestCase):
                               seats_fn=lambda s, c: seat_map(["K1", "K2"]))
         self.assertEqual(len(self.shots), 1)
         self.assertEqual(self.shots[0]["start_hhmm"], "18:00")
+
+    def test_a_stuck_overlay_stops_the_retries(self):
+        """오버레이에 막혔으면 같은 블록을 다시 고르지 않는다.
+
+        다시 골라 봐야 그 아래를 누르는 건 마찬가지라 좌석 수만큼 타임아웃을 또
+        버린다 — 실측 44.5초(좌석고르기 42.9초)가 이 경로였다.
+        """
+        page = TestPickSeats.SeatPage(["K5", "K6"], blocked_until=99)
+        calls = []
+
+        def seats_fn(session, ctx):
+            calls.append(1)
+            return seat_map(["K5", "K6"])
+
+        out = booking._select_block(
+            None, page, self.ctx(["K5", "K6"]), seats_fn=seats_fn)
+
+        self.assertFalse(out["ok"])
+        self.assertIn("팝업에 덮여", out["error"])
+        self.assertNotIn("팔린", out["error"],
+                         "좌석은 멀쩡했다 — 팔렸다고 하면 사용자가 헛짚는다")
+        self.assertEqual(len(calls), 1, "막힌 걸 알고도 좌석을 다시 골랐다")
+        self.assertEqual(page.clicked, [])
+        self.assertTrue(self.shots, "원인을 좁힐 화면을 안 남겼다")
 
     def test_retry_count_is_bounded(self):
         page = TestPickSeats.SeatPage([])          # 무엇을 골라도 못 누른다
@@ -824,7 +1051,8 @@ class TestSeatNoticeIsReportedHonestly(unittest.TestCase):
 
     def test_notice_is_returned_instead_of_a_sold_out_guess(self):
         page = self.NoticePage(["H1", "H2", "H3"], self.NOTICE)
-        clicked, missed, notice = booking._pick_seats(page, ["H1", "H2", "H3"])
+        clicked, missed, notice, _ = booking._pick_seats(
+            page, ["H1", "H2", "H3"])
         self.assertEqual(clicked, ["H1"])
         self.assertEqual(missed, ["H2", "H3"])
         self.assertIn("4인 단위", notice)
@@ -902,6 +1130,339 @@ class TestHoldExpiryIsKoreanTime(unittest.TestCase):
     def test_unparsable_limit_is_none(self):
         self.assertIsNone(booking._parse_limit_dt(""))
         self.assertIsNone(booking._parse_limit_dt("20261332000000"))
+
+
+class TestSeatOutsideTheVisibleMap(unittest.TestCase):
+    """좌석맵 밖에 있는 좌석도 잡아야 한다.
+
+    2026-08-28 용산아이파크몰 IMAX관 실측: 624석 중 한 번에 보이는 건 600px
+    폭뿐이고(내용은 2090px), 미는 방식이 transform이라 Playwright의 자동
+    스크롤로는 왼쪽 끝에 닿지 못한다. 못 잡던 좌석이 전부 K1·L1처럼 번호
+    1~2번이었던 것이 그 증거다.
+    """
+
+    class MapPage:
+        def __init__(self, plan):
+            self.plan = plan          # _SEAT_REACH_JS가 돌려줄 값
+            self.fp_after = None      # 클릭 뒤의 지문
+            self.mouse = self
+            self.clicked_at = []
+            self.locator_clicks = []
+
+        # page.mouse.click
+        def click(self, x, y):
+            self.clicked_at.append((x, y))
+
+        def evaluate(self, script, arg=None):
+            if "fingerprint" in script or "reachable" in script:
+                return self.plan
+            return self.fp_after
+
+        def get_by_text(self, label, exact=False):
+            page = self
+
+            class Loc:
+                @property
+                def last(self):
+                    return self
+
+                def click(self, timeout=None):
+                    page.locator_clicks.append(label)
+
+            return Loc()
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def locator(self, selector, **kwargs):
+            class Empty:
+                def count(self): return 0
+                def all(self): return []
+                @property
+                def first(self): return self
+                def is_visible(self): return False
+            return Empty()
+
+    def test_a_seat_already_in_view_takes_the_proven_path(self):
+        """잘 되고 있는 경로를 건드리지 않는다 — 좌표 클릭으로 갈아타지 않는다."""
+        page = self.MapPage({"reachable": True, "panned": False,
+                             "x": 100, "y": 200, "fingerprint": "a|b"})
+        booking._click_seat(page, "A17")
+        self.assertEqual(page.locator_clicks, ["A17"])
+        self.assertEqual(page.clicked_at, [], "밀 필요가 없는데 좌표로 눌렀다")
+
+    def test_an_off_screen_seat_is_panned_in_and_clicked_by_point(self):
+        page = self.MapPage({"reachable": True, "panned": True,
+                             "x": 1280, "y": 371, "moved": [859, 0],
+                             "fingerprint": "seat|row|map"})
+        page.fp_after = "seat selected|row|map"      # 눌려서 클래스가 바뀌었다
+        booking._click_seat(page, "A3")
+        self.assertEqual(page.clicked_at, [(1280, 371)])
+        self.assertEqual(page.locator_clicks, [],
+                         "민 좌석을 locator.click으로 누르면 위치가 흐트러진다")
+
+    def test_a_point_click_that_did_not_take_is_an_error(self):
+        """좌표 클릭은 빗나가도 예외를 내지 않는다 — 확인이 없으면 조용히 샌다.
+
+        안 눌린 좌석을 눌렀다고 세면 인원수를 채운 줄 알고 넘어가, 결국 엉뚱한
+        자리를 선점한다. 일부만 잡느니 멈추는 게 이 코드의 원칙이다.
+        """
+        page = self.MapPage({"reachable": True, "panned": True,
+                             "x": 1280, "y": 371, "moved": [859, 0],
+                             "fingerprint": "seat|row|map"})
+        page.fp_after = "seat|row|map"               # 그대로 = 안 눌렸다
+        with self.assertRaises(RuntimeError) as caught:
+            booking._click_seat(page, "A3")
+        self.assertIn("A3", str(caught.exception))
+
+    def test_a_seat_that_cannot_be_reached_even_by_panning_falls_back(self):
+        # 밀어도 안 되면 예전 경로로 보내 제대로 된 실패 문구를 받는다.
+        page = self.MapPage({"reachable": False, "panned": False,
+                             "x": 0, "y": 0, "reason": "밀어도 좌석에 닿지 않습니다"})
+        booking._click_seat(page, "A3")
+        self.assertEqual(page.locator_clicks, ["A3"])
+        self.assertEqual(page.clicked_at, [])
+
+    def test_a_broken_probe_falls_back_instead_of_dying(self):
+        page = self.MapPage(None)
+
+        def boom(script, arg=None):
+            raise RuntimeError("페이지가 갈아 끼워지는 중")
+
+        page.evaluate = boom
+        booking._click_seat(page, "A3")
+        self.assertEqual(page.locator_clicks, ["A3"])
+
+
+class TestSeatClickDiagnosis(unittest.TestCase):
+    """좌석 클릭이 막혔을 때 '화면 밖'과 '팝업이 덮음'을 가릴 수 있어야 한다.
+
+    Playwright는 "modal-bg가 가로챘다"까지만 알려 준다. IMAX처럼 좌석맵이 한
+    화면에 다 안 들어오는 관에서는 좌석이 보이는 영역 밖이라 좌표가 배경에
+    떨어진 것일 수도 있는데, 그 둘은 대처가 정반대다.
+    """
+
+    class DiagPage:
+        def __init__(self, result):
+            self.result = result
+            self.asked = []
+
+        def evaluate(self, script, arg=None):
+            self.asked.append(arg)
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    def test_it_reports_what_actually_sits_at_the_seat(self):
+        page = self.DiagPage({
+            "at_point": "div.modal-bg", "reaches_seat": False,
+            "seat_rect": [100, 200, 120, 220],
+        })
+        out = booking._seat_click_diagnosis(page, "K1")
+        self.assertIn("modal-bg", out)
+        # 어느 좌석을 물었는지 스크립트에 실려 나가야 한다.
+        self.assertEqual(page.asked[0]["label"], "K1")
+        self.assertEqual(page.asked[0]["sel"], booking.SEAT_MAP_SELECTOR)
+
+    def test_off_screen_and_covered_are_told_apart(self):
+        """둘 다 at_point는 modal-bg다 — 가르는 것은 seat_inside다.
+
+        2026-08-28 IMAX관 실측: 창은 2560px인데 좌석맵은 600px만 보이고, 잘린
+        좌석도 창 안에는 들어 있었다. 그래서 창 뷰포트로는 판정할 수 없다.
+        """
+        off = booking._seat_click_diagnosis(self.DiagPage({
+            "at_point": "div.modal-bg", "reaches_seat": False,
+            "clip": {"node": "div.seatMap", "rect": [980, 48, 1580, 1140],
+                     "client_w": 600, "scroll_w": 2090, "scroll_left": 0,
+                     "scroll_max": 1490, "seat_inside": False},
+            "pan": {"node": "div.pan",
+                    "transform": "matrix(1.076, 0, 0, 1.076, -824.42, 13.38)"},
+        }), "A3")
+        self.assertIn('"seat_inside": false', off)
+        self.assertIn("matrix", off, "얼마나 밀어야 하는지 단서가 남아야 한다")
+        self.assertIn("2090", off, "잘린 폭을 알아야 한다")
+
+        covered = booking._seat_click_diagnosis(self.DiagPage({
+            "at_point": "div.modal-bg", "reaches_seat": False,
+            "clip": {"node": "div.seatMap", "seat_inside": True},
+        }), "A17")
+        self.assertIn('"seat_inside": true', covered)
+
+    def test_korean_survives_the_json(self):
+        page = self.DiagPage({"at_point": "div.안내팝업"})
+        self.assertIn("안내팝업", booking._seat_click_diagnosis(page, "K1"))
+
+    def test_a_diagnosis_that_fails_is_silent(self):
+        """진단은 부가 기능이다 — 여기서 터져서 선점을 망치면 안 된다."""
+        page = self.DiagPage(RuntimeError("페이지가 갈아 끼워지는 중"))
+        self.assertEqual(booking._seat_click_diagnosis(page, "K1"), "")
+
+
+class TestHoldRequestRecording(unittest.TestCase):
+    """선점 요청을 기록하되, 그 파일이 자격증명이 되면 안 된다.
+
+    이 기록은 언젠가 UI를 몰지 않고 seatTempPrmp를 직접 부르기 위한 관찰이다.
+    형태를 배우는 게 목적이므로 **키와 구조는 남기고 값만 가린다.**
+    """
+
+    def test_credentials_are_masked_but_the_shape_survives(self):
+        out = booking.mask_secrets({
+            "accessToken": "eyJhbGciOi...",
+            "custNo": "12345678",
+            "scnsNo": "0013",
+            "seats": [{"seatLocNo": "L01", "refreshToken": "zzz"}],
+        })
+        self.assertNotIn("eyJhbGciOi", str(out))
+        self.assertNotIn("12345678", str(out))
+        self.assertNotIn("zzz", str(out))
+        # 값만 가리고 키·구조·무해한 값은 그대로 남아야 배울 수 있다.
+        self.assertEqual(out["scnsNo"], "0013")
+        self.assertEqual(out["seats"][0]["seatLocNo"], "L01")
+        self.assertIn("accessToken", out)
+        self.assertIn("refreshToken", out["seats"][0])
+
+    def test_masking_notes_how_long_the_hidden_value_was(self):
+        # 나중에 직접 채울 때 그 자리가 무엇이었는지 가늠할 수 있어야 한다.
+        out = booking.mask_secrets({"Authorization": "Bearer abc"})
+        self.assertIn(str(len("Bearer abc")), out["Authorization"])
+
+    def test_secret_names_are_matched_regardless_of_style(self):
+        for name in ("Set-Cookie", "access_token", "CUST_NO", "X-CSRF-Token"):
+            self.assertTrue(booking._is_secret(name), name)
+        for name in ("scnsNo", "seatLocNo", "siteNo", "content-type"):
+            self.assertFalse(booking._is_secret(name), name)
+
+    def test_recording_never_breaks_the_hold(self):
+        """관찰이 선점을 망치면 안 된다 — 무엇이 터져도 조용히 넘어간다."""
+        booking._record_hold_request({"request": None}, {})   # 기록할 게 없음
+        booking._record_hold_request({}, {})                  # 리스너가 못 잡음
+        booking._record_hold_request({"request": object()}, {})  # 모양이 틀림
+
+
+class TestPaymentStepsDoNotSleepWhenReady(unittest.TestCase):
+    """결제 단계는 준비되면 바로 넘어간다.
+
+    예전에는 셋 다 검증 함수를 **가지고 있으면서도** 고정 시간을 잤다. 특히
+    _open_payment_page는 조건 확인이 루프 위에 있어, 화면이 0.3초 만에 떠도
+    2.5초를 자고 다음 바퀴에 가서야 True를 돌려줬다.
+    """
+
+    class PayPage:
+        """결제 화면을 흉내 낸다. 잔 시간을 합산해 낭비를 잡아낸다.
+
+        wait_for_timeout은 **실제로 잔다.** _wait_until이 벽시계로 마감을 재기
+        때문에, 자는 시늉만 하면 마감까지 루프가 폭주해 호출 횟수가 무의미해진다.
+        """
+
+        def __init__(self, *, ready_after_clicks=0, active_after_evals=0,
+                     checked_after_evals=0):
+            self.slept = 0
+            self.clicks = 0
+            self.evals = 0
+            self._ready_after = ready_after_clicks
+            # None이면 끝내 켜지지 않는다.
+            self._active_after = active_after_evals
+            self._checked_after = checked_after_evals
+
+        def wait_for_timeout(self, ms):
+            self.slept += ms
+            time.sleep(ms / 1000)
+
+        @property
+        def ready(self):
+            return self.clicks >= self._ready_after
+
+        def locator(self, selector, **kwargs):
+            page = self
+
+            class Node:
+                def is_visible(self):
+                    return True
+
+                def click(self, timeout=None):
+                    page.clicks += 1
+
+            class Loc:
+                def count(self):
+                    if selector == booking.PAY_LIST_SELECTOR:
+                        return 1 if page.ready else 0
+                    return 0
+
+                def all(self):
+                    # '결제하기' 버튼 목록과 결제수단 <li> 안의 버튼 양쪽에
+                    # 답한다. 모달 셀렉터에는 답하지 않는다 — 덮은 게 없다.
+                    if selector.endswith("button"):
+                        return [Node()]
+                    return []
+
+                @property
+                def first(self):
+                    return Node()
+
+            return Loc()
+
+        def evaluate(self, script, arg=None):
+            # _pay_method_active(클래스 문자열)와 _agree_terms(checked) 양쪽을
+            # 같은 훅으로 답한다 — 인자 모양으로 구분한다.
+            self.evals += 1
+            if isinstance(arg, dict):
+                return (booking.PAY_ACTIVE_MARK
+                        if self._reached(self._active_after) else "")
+            return self._reached(self._checked_after)
+
+        def _reached(self, threshold):
+            return threshold is not None and self.evals > threshold
+
+    def test_reaching_the_payment_screen_costs_no_extra_wait(self):
+        # 첫 클릭에 결제수단 목록이 뜬다 — 예전에는 여기서 2.5초를 버렸다.
+        page = self.PayPage(ready_after_clicks=1)
+        self.assertTrue(booking._open_payment_page(page))
+        self.assertEqual(page.clicks, 1)
+        self.assertLessEqual(page.slept, booking.STEP_POLL_MS,
+                             f"준비됐는데도 {page.slept}ms를 잤다")
+
+    def test_already_on_the_payment_screen_clicks_nothing(self):
+        page = self.PayPage(ready_after_clicks=0)
+        self.assertTrue(booking._open_payment_page(page))
+        self.assertEqual(page.clicks, 0)
+        self.assertEqual(page.slept, 0)
+
+    def test_payment_screen_that_never_comes_still_gives_up(self):
+        # 한 바퀴 상한을 줄여 둔다 — 실제 값(2.5초 × 6)이면 이 테스트만 15초다.
+        real = booking.PAY_PAGE_ROUND_MS
+        booking.PAY_PAGE_ROUND_MS = 10
+        self.addCleanup(setattr, booking, "PAY_PAGE_ROUND_MS", real)
+
+        page = self.PayPage(ready_after_clicks=99)
+        self.assertFalse(booking._open_payment_page(page))
+        self.assertEqual(page.clicks, booking.PAY_PAGE_ROUNDS,
+                         "정해진 횟수만큼만 눌러야 한다")
+
+    def test_pay_method_selection_returns_as_soon_as_it_takes(self):
+        page = self.PayPage(active_after_evals=0)   # 누르자마자 활성
+        booking._choose_pay_method(page, "kakaopay")
+        self.assertEqual(page.slept, 0, "켜졌는데도 잤다")
+
+    def test_pay_method_that_does_not_take_is_still_an_error(self):
+        page = self.PayPage(active_after_evals=None)   # 끝내 안 켜진다
+        with self.assertRaises(RuntimeError):
+            booking._choose_pay_method(page, "kakaopay")
+        self.assertLessEqual(page.slept, booking.PAY_METHOD_ACTIVE_MS
+                             + booking.STEP_POLL_MS,
+                             "예전 고정 대기보다 오래 기다리면 안 된다")
+
+    def test_terms_agreement_returns_as_soon_as_it_is_checked(self):
+        page = self.PayPage(checked_after_evals=0)
+        booking._agree_terms(page)
+        self.assertEqual(page.slept, 0, "켜졌는데도 잤다")
+
+    def test_terms_that_stay_off_are_reported(self):
+        page = self.PayPage(checked_after_evals=None)   # 끝내 안 켜진다
+        with self.assertRaises(RuntimeError):
+            booking._agree_terms(page)
+        self.assertLessEqual(page.slept, booking.TERMS_CHECK_MS
+                             + booking.STEP_POLL_MS,
+                             "예전 고정 대기보다 오래 기다리면 안 된다")
 
 
 class TestPaymentTripwire(unittest.TestCase):

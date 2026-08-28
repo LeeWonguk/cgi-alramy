@@ -16,9 +16,27 @@
   // DB 읽기라 비용이 없어 SSE의 장기 연결 관리를 감당할 이유가 없다.
   const REFRESH_MS = 5000
 
+  // 탭 목록은 해시를 검증할 때도 쓰이므로 isOwner와 무관하게 한곳에 둔다.
+  const TABS = [
+    { id: 'dashboard', label: '대시보드' },
+    { id: 'targets', label: '감시 대상' },
+    { id: 'seats', label: '좌석 감시' },
+    { id: 'lookup', label: '상영표 조회' },
+    { id: 'history', label: '이력' },
+    { id: 'users', label: '사용자', ownerOnly: true },
+    { id: 'settings', label: '설정' },
+    { id: 'webhooks', label: '웹훅 설정법' },
+  ]
+
+  // 리로드해도 보던 탭이 유지되도록 주소의 #해시에 담는다.
+  function tabFromHash() {
+    const id = location.hash.slice(1)
+    return TABS.some((item) => item.id === id) ? id : 'dashboard'
+  }
+
   let session = $state(null) // /api/me 응답
   let authState = $state('loading') // loading | anonymous | pending | ready
-  let tab = $state('dashboard')
+  let tab = $state(tabFromHash())
   let data = $state(null)
   let error = $state(null)
   let checking = $state(false)
@@ -27,16 +45,18 @@
   const user = $derived(session?.user)
   const isOwner = $derived(!!user?.is_owner)
 
-  const tabs = $derived([
-    { id: 'dashboard', label: '대시보드' },
-    { id: 'targets', label: '감시 대상' },
-    { id: 'seats', label: '좌석 감시' },
-    { id: 'lookup', label: '상영표 조회' },
-    { id: 'history', label: '이력' },
-    ...(isOwner ? [{ id: 'users', label: '사용자' }] : []),
-    { id: 'settings', label: '설정' },
-    { id: 'webhooks', label: '웹훅 설정법' },
-  ])
+  const tabs = $derived(TABS.filter((item) => !item.ownerOnly || isOwner))
+
+  $effect(() => {
+    // 소유자 전용 탭은 세션이 온 뒤에야 걸러낼 수 있다 — 해시로 직접 들어온 경우.
+    if (authState === 'ready' && !tabs.some((item) => item.id === tab)) {
+      tab = 'dashboard'
+      return
+    }
+    // replaceState라 탭을 옮겨도 히스토리가 쌓이지 않는다. 뒤로가기는 이 화면에
+    // 들어오기 전으로 돌아가는 것이 자연스럽다.
+    if (location.hash.slice(1) !== tab) history.replaceState(null, '', `#${tab}`)
+  })
 
   async function loadSession() {
     try {
@@ -91,9 +111,13 @@
     loadSession().then(refresh)
     const poll = setInterval(refresh, REFRESH_MS)
     const tick = setInterval(() => (now = Date.now()), 1000)
+    // 주소창에서 해시를 직접 바꾸는 경우까지 따라간다.
+    const onhash = () => (tab = tabFromHash())
+    addEventListener('hashchange', onhash)
     return () => {
       clearInterval(poll)
       clearInterval(tick)
+      removeEventListener('hashchange', onhash)
     }
   })
 

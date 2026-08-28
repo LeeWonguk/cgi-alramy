@@ -12,6 +12,9 @@ DB나 네트워크를 모른다. 그래서 저장된 픽스처만으로 단위 �
 
 from __future__ import annotations
 
+import contextlib
+import time
+
 from watch import fmt_date, fmt_time
 
 
@@ -409,6 +412,48 @@ def _seat_map(session, guard, **kwargs) -> dict:
         return session.seat_map(**kwargs)
 
 
+class _CycleCost:
+    """좌석 감시 한 바퀴에서 CGV를 몇 번 부르고 얼마나 걸렸는지 센다.
+
+    poll_cycles에는 check_all만 기록되는데(실측 0.009초), 정작 시간을 쓰는 건
+    이 좌석 사이클이다. 그래서 "3초로 맞췄는데 왜 6초마다 도는지"를 로그만으로는
+    가릴 수 없었다 — 사이클이 폴링 간격보다 길면 다음 슬롯을 통째로 놓친다.
+
+    호출 종류별로 재는 이유는 어디를 줄일지가 거기서 갈리기 때문이다. 같은
+    (극장·영화·날짜)를 여러 감시가 함께 보면 showtimes가 중복되고, 카탈로그는
+    감시와 무관하게 매 바퀴 두 번 나간다.
+    """
+
+    def __init__(self) -> None:
+        self._t0 = time.monotonic()
+        self._counts: dict[str, int] = {}
+        self._spent: dict[str, float] = {}
+
+    @contextlib.contextmanager
+    def call(self, kind: str):
+        """이 블록에서 CGV를 한 번 부른다고 세고 걸린 시간을 더한다."""
+        t = time.monotonic()
+        try:
+            yield
+        finally:
+            self._counts[kind] = self._counts.get(kind, 0) + 1
+            self._spent[kind] = self._spent.get(kind, 0.0) + (time.monotonic() - t)
+
+    def hit(self, kind: str) -> None:
+        """부르지 않고 캐시로 넘어간 횟수. 줄인 게 실제로 줄었는지 본다."""
+        self._counts[kind] = self._counts.get(kind, 0) + 1
+
+    def summary(self) -> str:
+        total = time.monotonic() - self._t0
+        if not self._counts:
+            return f"합계 {total:.1f}s"
+        parts = " · ".join(
+            f"{k} {self._counts[k]}회"
+            + (f" {self._spent[k]:.1f}s" if k in self._spent else "")
+            for k in sorted(self._counts))
+        return f"합계 {total:.1f}s ({parts})"
+
+
 # ── 사이클: 좌석 감시 한 바퀴 ────────────────────────────────────────────────
 def check_seat_watches(session, *, dry_run: bool = False) -> dict:
     """모든 좌석 감시를 한 바퀴 확인한다. 세션은 로그인 가능한 상태여야 한다.
@@ -427,6 +472,15 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
         return summary
 
     catalog = watch.Catalog(session)
+    cost = _CycleCost()
+    # 이 바퀴 안에서만 사는 캐시. 같은 (극장·영화·날짜)를 여러 감시가 함께 보면
+    # 상영표가 그만큼 중복으로 나가고(실측 8건 중 4건이 중복), 예매 화면 프리워밍도
+    # 같은 탭을 몇 번씩 다시 검증한다. 한 바퀴 안에서는 같은 답이므로 한 번만 받는다.
+    #
+    # **바퀴를 넘겨 두지는 않는다.** 상영표는 회차가 새로 열리는 걸 봐야 하는
+    # 자료라, 오래 들고 있으면 그게 곧 감지 지연이 된다.
+    sched_cache: dict[tuple, list] = {}
+    warmed: set[str] = set()
 
     by_owner: dict[int, list[dict]] = {}
     for w in watches:
@@ -455,9 +509,13 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
             summary["watches_checked"] += 1
             sent = _check_one_seat_watch(
                 session, catalog, w, webhook, webhook_kind, guard=guard,
-                dry_run=dry_run)
+                dry_run=dry_run, cost=cost, sched_cache=sched_cache,
+                warmed=warmed)
             summary["alerts_sent"] += sent
 
+    # 사이클이 폴링 간격을 넘으면 다음 슬롯을 통째로 놓친다 — 그 사실이 로그에
+    # 남아야 간격을 줄인 게 실제로 먹었는지 알 수 있다.
+    watch.log.info("좌석 감시 소요 — %s", cost.summary())
     return summary
 
 
@@ -492,13 +550,22 @@ def _cycle_error(checked: int, failures: list[str]) -> str | None:
 
 def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                           *, guard: "_AuthGuard | None" = None,
-                          dry_run: bool) -> int:
-    """좌석 감시 하나를 확인하고 보낸 알림 수를 돌려준다."""
+                          dry_run: bool, cost: "_CycleCost | None" = None,
+                          sched_cache: dict | None = None,
+                          warmed: set | None = None) -> int:
+    """좌석 감시 하나를 확인하고 보낸 알림 수를 돌려준다.
+
+    cost·sched_cache·warmed는 한 바퀴를 함께 도는 감시들이 나눠 쓴다. 안 넘겨도
+    동작은 같다 — 세지 않고 캐시 없이 돌 뿐이라 CLI·테스트에서 그냥 부를 수 있다.
+    """
     import store
     import watch
 
-    movie, movie_problem = watch.resolve(w["movie_query"], catalog.movies, "movNm")
-    site, site_problem = watch.resolve(w["site_query"], catalog.sites, "siteNm")
+    # DB 캐시를 먼저 본다 — 못 찾을 때만 목록을 새로 받으므로, 이미 열린 영화를
+    # 보는 감시는 매 바퀴 나가던 두 번의 조회가 사라진다. 아직 안 열린 영화는
+    # 예전처럼 매번 실물을 확인한다(목록에 뜨는 순간이 곧 오픈이다).
+    movie, movie_problem = catalog.resolve_movie(w["movie_query"])
+    site, site_problem = catalog.resolve_site(w["site_query"])
     if movie is None or site is None:
         problem = movie_problem if movie is None else site_problem
         if not dry_run:
@@ -509,8 +576,17 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
     mov_no, site_no = movie["movNo"], site["siteNo"]
     mov_nm, site_nm = movie["movNm"], site["siteNm"]
 
+    sched_key = (site_no, mov_no, w["scn_ymd"])
     try:
-        schedule = session.showtimes(site_no, mov_no, w["scn_ymd"])
+        if sched_cache is not None and sched_key in sched_cache:
+            schedule = sched_cache[sched_key]
+            if cost:
+                cost.hit("상영표(캐시)")
+        else:
+            with cost.call("상영표") if cost else contextlib.nullcontext():
+                schedule = session.showtimes(site_no, mov_no, w["scn_ymd"])
+            if sched_cache is not None:
+                sched_cache[sched_key] = schedule
     except RuntimeError as exc:
         if not dry_run:
             store.save_seat_state(w["id"], store.prev_seat_state(w["id"]),
@@ -536,8 +612,20 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
     # 띄워 둬도 감시 자체에는 영향이 없다.
     if w.get("auto_book") and not dry_run:
         import booking
-        booking.prewarm(session, {"mov_no": mov_no, "site_no": site_no,
-                                  "site_nm": site_nm, "scn_ymd": w["scn_ymd"]})
+        warm_ctx = {"mov_no": mov_no, "site_no": site_no,
+                    "site_nm": site_nm, "scn_ymd": w["scn_ymd"]}
+        # 탭은 (영화·극장·날짜)로 갈리므로 같은 날짜를 보는 감시들은 한 탭을
+        # 함께 쓴다. 이미 이 바퀴에 확인했으면 다시 볼 것이 없다 — 확인 자체가
+        # 날짜 버튼을 하나씩 훑는 일이라 공짜가 아니다.
+        wkey = booking.warm_key(warm_ctx)
+        if warmed is not None and wkey in warmed:
+            if cost:
+                cost.hit("화면준비(캐시)")
+        else:
+            with cost.call("화면준비") if cost else contextlib.nullcontext():
+                booking.prewarm(session, warm_ctx)
+            if warmed is not None:
+                warmed.add(wkey)
 
     prev = store.prev_seat_state(w["id"])
     fresh_state: dict[str, list[str]] = {}
@@ -553,11 +641,12 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
             continue
         key = showtime_key(row)
         try:
-            seat_data = _seat_map(
-                session, guard,
-                site_no=row.get("siteNo") or site_no,
-                scns_no=row["scnsNo"], ymd=w["scn_ymd"],
-                scn_sseq=row["scnSseq"])
+            with cost.call("좌석맵") if cost else contextlib.nullcontext():
+                seat_data = _seat_map(
+                    session, guard,
+                    site_no=row.get("siteNo") or site_no,
+                    scns_no=row["scnsNo"], ymd=w["scn_ymd"],
+                    scn_sseq=row["scnSseq"])
         except RuntimeError as exc:
             # 이 회차만 실패 — 직전 상태를 유지해 다음에 다시 본다.
             if key in prev:

@@ -364,6 +364,125 @@ class TestCycleError(unittest.TestCase):
         self.assertIn("시간초과", msg)
 
 
+class TestCatalogCache(unittest.TestCase):
+    """영화·극장 목록을 매 바퀴 다시 받지 않는다 — 다만 오픈은 놓치면 안 된다.
+
+    실측(2026-08-28): 폴링을 3초로 맞췄는데 실제로는 6초마다 돌았다. 사이클이
+    ~4초라 다음 슬롯을 통째로 놓친 것이고, 그 안에서 감시와 무관하게 매번 나가는
+    호출이 이 목록 두 건이었다.
+    """
+
+    class FakeCgv:
+        def __init__(self):
+            self.movie_calls = 0
+            self.site_calls = 0
+
+        def bookable_movies(self):
+            self.movie_calls += 1
+            return [{"movNo": "9", "movNm": "실물에만 있는 영화"}]
+
+        def sites(self):
+            self.site_calls += 1
+            return [{"siteNo": "0013", "siteNm": "용산아이파크몰"}], {}
+
+    def setUp(self):
+        self.cgv = self.FakeCgv()
+        self.cat = watch.Catalog(self.cgv, persist=False)
+
+    def use_cache(self, movies, sites):
+        """DB 캐시가 이렇게 들어 있다고 해 둔다. None이면 캐시 없음."""
+        self.cat._db_cache = (  # noqa: SLF001 - 캐시 경로를 시험한다
+            lambda kind: movies if kind == "movie" else sites)
+
+    def test_a_hit_never_touches_the_network(self):
+        self.use_cache([{"movNo": "1", "movNm": "오디세이"}],
+                       [{"siteNo": "0013", "siteNm": "용산아이파크몰"}])
+        movie, _ = self.cat.resolve_movie("오디세이")
+        site, _ = self.cat.resolve_site("용산아이파크몰")
+        self.assertEqual(movie["movNo"], "1")
+        self.assertEqual(site["siteNo"], "0013")
+        self.assertEqual(self.cgv.movie_calls, 0, "캐시에 있는데 다시 받았다")
+        self.assertEqual(self.cgv.site_calls, 0)
+
+    def test_a_miss_still_goes_and_looks(self):
+        """캐시에 없으면 반드시 실물을 본다 — 목록에 뜨는 순간이 곧 오픈이다.
+
+        여기서 캐시만 믿고 "없다"고 답하면, 아직 안 열린 영화를 미리 걸어 둔
+        감시는 오픈을 영영 감지하지 못한다. 시간대 감시의 존재 이유가 그건데.
+        """
+        self.use_cache([{"movNo": "1", "movNm": "오디세이"}], [])
+        movie, _ = self.cat.resolve_movie("실물에만 있는 영화")
+        self.assertIsNotNone(movie, "캐시에 없다고 오픈을 놓쳤다")
+        self.assertEqual(movie["movNo"], "9")
+        self.assertEqual(self.cgv.movie_calls, 1)
+
+    def test_no_cache_at_all_behaves_as_before(self):
+        self.use_cache(None, None)
+        movie, _ = self.cat.resolve_movie("실물에만 있는 영화")
+        self.assertEqual(movie["movNo"], "9")
+        self.assertEqual(self.cgv.movie_calls, 1)
+
+    def test_a_live_fetch_is_shared_by_the_rest_of_the_cycle(self):
+        # 한 번 실물을 받았으면 그 바퀴의 나머지는 그걸 쓴다.
+        self.use_cache([], [])
+        self.cat.resolve_movie("실물에만 있는 영화")
+        self.cat.resolve_movie("실물에만 있는 영화")
+        self.cat.resolve_site("용산아이파크몰")
+        self.assertEqual(self.cgv.movie_calls, 1)
+        self.assertEqual(self.cgv.site_calls, 1)
+
+
+class TestCatalogCacheExpiry(unittest.TestCase):
+    """낡은 캐시를 쓰면 안 된다 — 그 사이 새로 열린 영화가 통째로 빠진다."""
+
+    def test_a_stale_cache_is_refused(self):
+        real = watch.store.catalog_refreshed_at
+        old = (watch.datetime.now().astimezone()
+               - watch.timedelta(hours=watch.CATALOG_CACHE_MAX_AGE_HOURS + 1))
+        watch.store.catalog_refreshed_at = lambda: old
+        self.addCleanup(setattr, watch.store, "catalog_refreshed_at", real)
+        self.assertIsNone(watch.Catalog._db_cache("movie"))
+
+    def test_an_empty_cache_is_refused(self):
+        real = watch.store.catalog_refreshed_at
+        watch.store.catalog_refreshed_at = lambda: None
+        self.addCleanup(setattr, watch.store, "catalog_refreshed_at", real)
+        self.assertIsNone(watch.Catalog._db_cache("movie"))
+
+    def test_an_unreadable_cache_is_refused_quietly(self):
+        real = watch.store.catalog_refreshed_at
+
+        def boom():
+            raise RuntimeError("DB가 죽었다")
+
+        watch.store.catalog_refreshed_at = boom
+        self.addCleanup(setattr, watch.store, "catalog_refreshed_at", real)
+        self.assertIsNone(watch.Catalog._db_cache("movie"))
+
+
+class TestCycleCost(unittest.TestCase):
+    """사이클이 폴링 간격을 넘으면 다음 슬롯을 놓친다 — 그게 로그에 남아야 한다."""
+
+    def test_it_counts_calls_and_cache_hits_apart(self):
+        cost = seats._CycleCost()
+        with cost.call("상영표"):
+            pass
+        cost.hit("상영표(캐시)")
+        cost.hit("상영표(캐시)")
+        out = cost.summary()
+        self.assertIn("상영표 1회", out)
+        self.assertIn("상영표(캐시) 2회", out)
+        self.assertIn("합계", out)
+
+    def test_a_failing_call_is_still_counted(self):
+        """실패한 호출도 시간을 쓴다 — 안 세면 사이클 길이가 설명되지 않는다."""
+        cost = seats._CycleCost()
+        with self.assertRaises(RuntimeError):
+            with cost.call("좌석맵"):
+                raise RuntimeError("조회 실패")
+        self.assertIn("좌석맵 1회", cost.summary())
+
+
 class TestAuthRecovery(unittest.TestCase):
     """좌석 조회가 401을 내면 세션을 되살리고 한 번 다시 시도해야 한다.
 

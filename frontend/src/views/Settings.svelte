@@ -223,9 +223,9 @@
     <div class="fields">
       <label class="field">
         <span>확인 간격 (초)</span>
-        <input type="number" min="10" step="5" bind:value={draft.poll_interval_seconds} />
+        <input type="number" min="3" step="1" bind:value={draft.poll_interval_seconds} />
         <small class="muted">
-          최소 10초. 60의 약수(10·15·20·30·60)를 쓰면 확인 시각이 매분 같은 자리에
+          최소 3초. 60의 약수(3·5·10·15·20·30·60)를 쓰면 확인 시각이 매분 같은 자리에
           고정됩니다. <code>./install.sh</code>를 다시 실행할 필요는 없습니다.
         </small>
       </label>
