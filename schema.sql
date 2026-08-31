@@ -362,3 +362,23 @@ ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_method     text;
 ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_url        text;
 ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_expires_at timestamptz;
 ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_error      text;
+
+-- 좌석 번호 범위. 열 필터(rows)가 세로를 자른다면 이건 **가로를 자른다** —
+-- 같은 H열이라도 1번은 화면 왼쪽 끝이고 20번은 한가운데다. IMAX처럼 한 열이
+-- 45석까지 가는 관에서는 열만으로는 "좋은 자리"가 가려지지 않는다.
+--
+-- 0은 '제한 없음'이다. 둘 다 0이면 예전처럼 그 열의 모든 번호를 본다.
+-- 화면의 '선호좌석' 버튼이 H~O열 · 13~32번을 한 번에 채운다.
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    seat_num_from integer NOT NULL DEFAULT 0;
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    seat_num_to   integer NOT NULL DEFAULT 0;
+
+-- 같은 조합에서 번호 범위만 다른 감시를 따로 둘 수 있어야 한다 — 유일성에도 넣는다.
+-- 앞의 범위 인덱스와 같은 방식이다: 이름을 새로 쓰고 예전 것을 지운다(멱등).
+CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_seatnum_idx
+    ON seat_watches (owner_id, movie_query, site_query, scn_ymd, scn_time,
+                     scn_time_from, scn_time_to, screen_types, rows,
+                     seat_num_from, seat_num_to);
+
+DROP INDEX IF EXISTS seat_watches_uniq_range_idx;

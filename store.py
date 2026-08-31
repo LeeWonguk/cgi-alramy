@@ -712,6 +712,7 @@ def clear_cgv_tokens(owner_id: int) -> None:
 SEAT_WATCH_COLUMNS = """
     id, owner_id, movie_query, site_query, scn_ymd, scn_time,
     scn_time_from, scn_time_to, screen_types, rows,
+    seat_num_from, seat_num_to,
     min_consecutive, auto_book, auto_pay, pay_method,
     party_size, ticket_spec, enabled, created_at
 """
@@ -824,7 +825,7 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
                    min_consecutive: int = 0, auto_book: bool = False,
                    party_size: int = 1, ticket_spec=None, scn_time="",
                    scn_time_from="", scn_time_to="", auto_pay: bool = False,
-                   pay_method=None) -> dict:
+                   pay_method=None, seat_num_from=0, seat_num_to=0) -> dict:
     """좌석 감시를 추가한다. 같은 조합이 있으면 옵션을 갱신해 돌려준다.
 
     회차 지정은 셋 중 하나다:
@@ -841,6 +842,7 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
         raise ValueError("영화·극장·날짜는 비울 수 없습니다")
     types = normalize_screen_types(screen_types)
     row_filter = normalize_rows(rows)
+    num_from, num_to = normalize_seat_nums(seat_num_from, seat_num_to)
     stime = normalize_scn_time(scn_time)
     tfrom, tto = normalize_time_range(scn_time_from, scn_time_to)
     if stime:
@@ -864,13 +866,15 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
             f"insert into seat_watches"
             f"   (owner_id, movie_query, site_query, scn_ymd, scn_time,"
             f"    scn_time_from, scn_time_to, screen_types, rows,"
+            f"    seat_num_from, seat_num_to,"
             f"    min_consecutive, auto_book, party_size, ticket_spec,"
             f"    auto_pay, pay_method)"
-            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-            f"         %s, %s)"
+            f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
+            f"         %s, %s, %s)"
             f" on conflict (owner_id, movie_query, site_query, scn_ymd, scn_time,"
-            f"              scn_time_from, scn_time_to,"
-            f"              screen_types, rows) do update set enabled = true,"
+            f"              scn_time_from, scn_time_to, screen_types, rows,"
+            f"              seat_num_from, seat_num_to)"
+            f"           do update set enabled = true,"
             f"              min_consecutive = excluded.min_consecutive,"
             f"              auto_book = excluded.auto_book,"
             f"              party_size = excluded.party_size,"
@@ -879,8 +883,8 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
             f"              pay_method = excluded.pay_method"
             f" returning {SEAT_WATCH_COLUMNS}",
             (owner_id, movie_query, site_query, scn_ymd, stime, tfrom, tto,
-             types, row_filter, need, bool(auto_book), party, Json(spec),
-             pay_on, method),
+             types, row_filter, num_from, num_to, need, bool(auto_book),
+             party, Json(spec), pay_on, method),
         ).fetchone()
     return dict(row)
 
@@ -899,6 +903,10 @@ def set_seat_watch(seat_watch_id: int, owner_id: int | None = None,
         "min_consecutive": lambda v: max(0, int(v or 0)),
         "party_size": lambda v: max(1, int(v or 1)),
         "ticket_spec": lambda v: Json(normalize_ticket_spec(v)),
+        # 번호 범위는 짝이지만 여기서는 한쪽만 고칠 수 있다. 서로 어긋난 값이
+        # 들어오면 seats.normalize_seat_nums가 읽을 때 다시 바로잡는다.
+        "seat_num_from": lambda v: max(0, int(v or 0)),
+        "seat_num_to": lambda v: max(0, int(v or 0)),
     }
     sets, params = [], []
     for key, coerce in allowed.items():
@@ -971,6 +979,25 @@ def save_seat_state(seat_watch_id: int, available: dict,
             (seat_watch_id, Json(available), None if error else stamp,
              error, stamp),
         )
+
+
+def normalize_seat_nums(num_from, num_to) -> tuple[int, int]:
+    """좌석 번호 범위를 (from, to)로. 0은 '제한 없음' — seats와 같은 규칙이다.
+
+    거꾸로 들어와도 바로잡는다(32~13 → 13~32). 화면에서 큰 숫자를 먼저 적는
+    일은 흔한데, 그대로 저장하면 아무 좌석도 안 걸려 감시가 조용히 멎는다.
+    """
+    def one(v) -> int:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return n if n > 0 else 0
+
+    lo, hi = one(num_from), one(num_to)
+    if lo and hi and lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
 
 
 def normalize_rows(rows) -> list[str]:

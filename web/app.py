@@ -193,6 +193,9 @@ def seat_watch_view(row: dict) -> dict:
         "scn_time_to": row["scn_time_to"] or "",
         "screen_types": row["screen_types"] or [],
         "rows": row["rows"] or [],
+        # 좌석 번호 범위(가로). 0은 '제한 없음'이다.
+        "seat_num_from": row["seat_num_from"] or 0,
+        "seat_num_to": row["seat_num_to"] or 0,
         "min_consecutive": row["min_consecutive"] or 0,
         "auto_book": row["auto_book"],
         "auto_pay": row["auto_pay"],
@@ -734,7 +737,9 @@ def register_api(app: Flask) -> None:
                 pay_method=data.get("pay_method"),
                 scn_time=data.get("scn_time", ""),
                 scn_time_from=data.get("scn_time_from", ""),
-                scn_time_to=data.get("scn_time_to", ""))
+                scn_time_to=data.get("scn_time_to", ""),
+                seat_num_from=data.get("seat_num_from", 0),
+                seat_num_to=data.get("seat_num_to", 0))
         except ValueError as exc:
             return fail(str(exc))
         return jsonify(seat_watch_view(row)), 201

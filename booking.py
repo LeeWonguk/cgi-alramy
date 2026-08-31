@@ -273,8 +273,8 @@ def _parse_limit_dt(raw: str):
 
 def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
                   *, mov_nm: str = "", site_nm: str = "", site_no: str = "",
-                  mov_no: str = "", hold_fn=None, pay_fn=None,
-                  dry_run: bool = False) -> dict:
+                  mov_no: str = "", num_from: int = 0, num_to: int = 0,
+                  hold_fn=None, pay_fn=None, dry_run: bool = False) -> dict:
     """감시 하나의 한 회차에서 자동 선점을(auto_pay면 결제 요청까지) 시도한다.
 
     반환: {"action": skip|held|failed|no_seats, ...}. hold_fn(session, ctx)->result 와
@@ -294,7 +294,8 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
         return {"action": "skip", "reason": "already held"}
 
     party = max(1, int(watch.get("party_size") or 1))
-    chosen = seats_mod.pick_block(parsed_seats, party, watch.get("rows"))
+    chosen = seats_mod.pick_block(parsed_seats, party, watch.get("rows"),
+                                  num_from, num_to)
     if len(chosen) < party:
         return {"action": "no_seats", "reason": f"{party}석 연속 없음"}
 
@@ -315,7 +316,9 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
     ctx = {"mov_nm": mov_nm, "site_nm": site_nm, "scn_ymd": watch["scn_ymd"],
            "start_hhmm": start_hhmm, "seat_labels": labels, "party": party,
            # 좌석맵에서 다시 고를 때 쓴다 — 후보와 같은 조건이어야 한다.
+           # 범위가 빠지면 후보는 선호 구역인데 실제로 누르는 좌석은 그 밖이 된다.
            "rows": watch.get("rows"), "site_no": site_no,
+           "num_from": num_from, "num_to": num_to,
            # 예매 화면을 딥링크로 바로 열 때 쓴다 (booking_url).
            "mov_no": mov_no,
            # 같은 시각의 회차가 여러 상영관에 있을 때 어느 쪽인지 가리는 데 쓴다.
@@ -1225,7 +1228,9 @@ def _select_block(session, page, ctx: dict, *, seats_fn=None) -> dict:
                 return {"ok": False, "labels": [],
                         "error": "좌석 배치도를 읽지 못했습니다"}
         else:
-            block = seats_mod.pick_block(live, party, ctx.get("rows"))
+            block = seats_mod.pick_block(live, party, ctx.get("rows"),
+                                         ctx.get("num_from") or 0,
+                                         ctx.get("num_to") or 0)
             if len(block) < party:
                 # 후보를 고른 뒤 여기 오는 사이에 다 팔린 것이다. 낡은 좌석을
                 # 눌러 보는 것보다 사실대로 끝내는 편이 낫다.

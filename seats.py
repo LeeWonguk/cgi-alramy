@@ -80,12 +80,54 @@ def normalize_rows(rows) -> list[str]:
     return out
 
 
-def available_labels(seats: list[dict], rows=None) -> set[str]:
-    """지정한 열에서 지금 비어 있는(판매 가능) 좌석 라벨 집합. rows가 비면 전 열."""
+def normalize_seat_nums(num_from, num_to) -> tuple[int, int]:
+    """좌석 번호 범위를 (from, to)로. 0은 '제한 없음'이다.
+
+    거꾸로 들어오면 바로잡는다 — 32~13이라고 적어도 13~32로 본다. 사람이 큰
+    숫자를 먼저 적는 일은 흔한데, 그대로 두면 아무 좌석도 안 걸려서 감시가
+    조용히 멎는다.
+    """
+    def one(v) -> int:
+        n = _to_int(v)
+        return n if n and n > 0 else 0
+
+    lo, hi = one(num_from), one(num_to)
+    if lo and hi and lo > hi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def in_scope(seat: dict, rows=None, num_from=0, num_to=0) -> bool:
+    """그 좌석이 감시 범위 안인지 — 열(세로)과 번호(가로) 둘 다 본다.
+
+    열 필터가 세로를 자른다면 번호 범위는 가로를 자른다. 같은 H열이라도 1번은
+    화면 왼쪽 끝이고 20번은 한가운데라, IMAX처럼 한 열이 45석까지 가는 관에서는
+    열만으로 '좋은 자리'가 가려지지 않는다.
+
+    번호를 못 읽는 좌석은 **범위를 걸었으면 뺀다.** 번호로 고른다고 해 놓고
+    번호를 모르는 자리를 끼워 주면 범위 밖 좌석을 잡게 된다.
+    """
     wanted = normalize_rows(rows)
+    if wanted and seat["row"].upper() not in wanted:
+        return False
+    lo, hi = normalize_seat_nums(num_from, num_to)
+    if not lo and not hi:
+        return True
+    n = _to_int(seat["no"])
+    if n is None:
+        return False
+    return (not lo or n >= lo) and (not hi or n <= hi)
+
+
+def available_labels(seats: list[dict], rows=None, num_from=0,
+                     num_to=0) -> set[str]:
+    """감시 범위에서 지금 비어 있는(판매 가능) 좌석 라벨 집합.
+
+    rows가 비면 전 열, 번호 범위가 0이면 그 열의 모든 번호를 본다.
+    """
     return {
         s["label"] for s in seats
-        if s["available"] and (not wanted or s["row"].upper() in wanted)
+        if s["available"] and in_scope(s, rows, num_from, num_to)
     }
 
 
@@ -106,12 +148,17 @@ def _adjacent(a: dict, b: dict) -> bool:
     return an is not None and bn is not None and bn - an == 1
 
 
-def _rows_by_x(seats: list[dict], rows=None) -> dict[str, list[dict]]:
-    """열별로 x좌표(없으면 번호) 순으로 정렬한 좌석 리스트."""
-    wanted = normalize_rows(rows)
+def _rows_by_x(seats: list[dict], rows=None, num_from=0,
+               num_to=0) -> dict[str, list[dict]]:
+    """열별로 x좌표(없으면 번호) 순으로 정렬한 좌석 리스트. 범위 밖은 뺀다.
+
+    **범위 밖 좌석은 아예 빼고 연속을 센다.** 12번과 13번이 붙어 있어도 범위가
+    13번부터면 그 둘은 한 구간이 아니다 — 잡을 수 없는 자리를 구간에 넣으면
+    "2석 연속 있음"이라고 알려 놓고 정작 못 잡는다.
+    """
     grouped: dict[str, list[dict]] = {}
     for s in seats:
-        if wanted and s["row"].upper() not in wanted:
+        if not in_scope(s, rows, num_from, num_to):
             continue
         grouped.setdefault(s["row"], []).append(s)
     for row in grouped:
@@ -121,14 +168,14 @@ def _rows_by_x(seats: list[dict], rows=None) -> dict[str, list[dict]]:
 
 
 def consecutive_runs(seats: list[dict], available: set[str] | None = None,
-                     rows=None) -> list[list[str]]:
+                     rows=None, num_from=0, num_to=0) -> list[list[str]]:
     """비어 있는 좌석들이 이루는 '연속 구간'들의 라벨 리스트.
 
     available을 주면 그 집합에 든 좌석만 비어 있는 것으로 본다(이전 상태를 현재
     배치에 대입해 비교할 때 쓴다). 안 주면 지금 판매 가능한 좌석을 쓴다.
     """
     runs: list[list[str]] = []
-    for row_seats in _rows_by_x(seats, rows).values():
+    for row_seats in _rows_by_x(seats, rows, num_from, num_to).values():
         current: list[dict] = []
         for seat in row_seats:
             free = seat["label"] in available if available is not None \
@@ -149,14 +196,14 @@ def consecutive_runs(seats: list[dict], available: set[str] | None = None,
 
 
 def max_consecutive(seats: list[dict], available: set[str] | None = None,
-                    rows=None) -> int:
+                    rows=None, num_from=0, num_to=0) -> int:
     """지금 나란히 붙은 빈자리의 최대 개수. 아무도 없으면 0."""
-    runs = consecutive_runs(seats, available, rows)
+    runs = consecutive_runs(seats, available, rows, num_from, num_to)
     return max((len(r) for r in runs), default=0)
 
 
 def consecutive_starts(seats: list[dict], available: set[str], n: int,
-                       rows=None) -> set[str]:
+                       rows=None, num_from=0, num_to=0) -> set[str]:
     """n석을 나란히 앉을 수 있는 '시작 좌석' 라벨 집합.
 
     길이 L인 연속 구간은 시작점이 L-n+1개 나온다(A1~A3에서 2연속이면 A1·A2).
@@ -165,13 +212,14 @@ def consecutive_starts(seats: list[dict], available: set[str], n: int,
     if n < 1:
         return set()
     starts: set[str] = set()
-    for run in consecutive_runs(seats, available, rows):
+    for run in consecutive_runs(seats, available, rows, num_from, num_to):
         for i in range(len(run) - n + 1):
             starts.add(run[i])
     return starts
 
 
-def pick_block(seats: list[dict], party: int, rows=None) -> list[dict]:
+def pick_block(seats: list[dict], party: int, rows=None, num_from=0,
+               num_to=0) -> list[dict]:
     """인원수(party)만큼 나란히 붙은 '가장 좋은' 좌석 블록을 고른다.
 
     자동 예매가 이 함수로 잡을 좌석을 정한다. 규칙:
@@ -185,7 +233,8 @@ def pick_block(seats: list[dict], party: int, rows=None) -> list[dict]:
     """
     party = max(1, int(party or 1))
     by_label = {s["label"]: s for s in seats}
-    runs = [r for r in consecutive_runs(seats, rows=rows) if len(r) >= party]
+    runs = [r for r in consecutive_runs(seats, rows=rows, num_from=num_from,
+                                        num_to=num_to) if len(r) >= party]
     if not runs:
         return []
 
@@ -205,16 +254,15 @@ def pick_block(seats: list[dict], party: int, rows=None) -> list[dict]:
     return [by_label[l] for l in chosen]
 
 
-def summarize(seats: list[dict], rows=None) -> dict:
-    """열 필터를 적용한 좌석 요약 — {total, available, rows}."""
-    wanted = normalize_rows(rows)
-    scoped = [s for s in seats
-              if not wanted or s["row"].upper() in wanted]
+def summarize(seats: list[dict], rows=None, num_from=0, num_to=0) -> dict:
+    """감시 범위(열·번호)를 적용한 좌석 요약 — {total, available, rows}."""
+    scoped = [s for s in seats if in_scope(s, rows, num_from, num_to)]
     return {
         "total": len(scoped),
         "available": sum(1 for s in scoped if s["available"]),
         "rows": sorted({s["row"] for s in scoped}),
-        "max_consecutive": max_consecutive(seats, rows=rows),
+        "max_consecutive": max_consecutive(seats, rows=rows, num_from=num_from,
+                                           num_to=num_to),
     }
 
 
@@ -272,19 +320,21 @@ def build_consecutive_alert(mov_nm: str, site_nm: str, ymd: str, start_hhmm: str
 
 
 def new_consecutive_runs(seats: list[dict], prev_available: set[str],
-                         current: set[str], n: int, rows=None) -> list[list[str]]:
+                         current: set[str], n: int, rows=None,
+                         num_from=0, num_to=0) -> list[list[str]]:
     """이전엔 n연속이 안 되던 곳에 이번에 새로 생긴 n석 이상 연속 구간들.
 
     현재 연속 구간 중, 그 시작 좌석이 '새로 생긴 n연속 시작'을 포함하는 구간만
     골라 돌려준다 — 이미 알린 구간을 다시 알리지 않는다.
     """
-    prev_starts = consecutive_starts(seats, prev_available, n, rows)
-    cur_starts = consecutive_starts(seats, current, n, rows)
+    prev_starts = consecutive_starts(seats, prev_available, n, rows,
+                                     num_from, num_to)
+    cur_starts = consecutive_starts(seats, current, n, rows, num_from, num_to)
     fresh_starts = cur_starts - prev_starts
     if not fresh_starts:
         return []
     result = []
-    for run in consecutive_runs(seats, current, rows):
+    for run in consecutive_runs(seats, current, rows, num_from, num_to):
         if len(run) < n:
             continue
         # 이 구간의 n연속 시작점 중 새로 생긴 게 있으면 알린다.
@@ -601,6 +651,10 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         scn_time_from=w.get("scn_time_from") or "",
         scn_time_to=w.get("scn_time_to") or "")
     rows = w["rows"]
+    # 좌석 번호 범위(가로). 열 필터와 함께 '어디를 볼지'를 정한다 — 화면의
+    # '선호좌석' 버튼이 H~O열 · 13~32번을 한 번에 채운다.
+    num_from, num_to = normalize_seat_nums(w.get("seat_num_from"),
+                                           w.get("seat_num_to"))
     need = int(w.get("min_consecutive") or 0)   # 0·1 = 개별 좌석, 2+ = 연속 좌석
 
     # 자동 예매를 켠 감시라면 예매 화면을 **미리 띄워 둔다.** 좌석이 난 순간
@@ -658,7 +712,7 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         checked += 1
 
         seats = parse_seats(seat_data)
-        current = available_labels(seats, rows)
+        current = available_labels(seats, rows, num_from, num_to)
         fresh_state[key] = sort_labels(current)
         start_hhmm = row.get("scnsrtTm") or ""
 
@@ -680,7 +734,8 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
             seat_alert = None
         elif need >= 2:
             # 나란히 붙은 n석이 새로 생긴 회차만 본다.
-            runs = new_consecutive_runs(seats, set(prev[key]), current, need, rows)
+            runs = new_consecutive_runs(seats, set(prev[key]), current, need,
+                                        rows, num_from, num_to)
             event = bool(runs)
             seat_alert = (build_consecutive_alert(
                 mov_nm, site_nm, w["scn_ymd"], start_hhmm,
@@ -704,7 +759,10 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                 # — 위 _seat_map 호출과 같은 값을 쓴다.
                 site_no=site_no,
                 # 예매 화면을 딥링크로 바로 열 때 쓴다 (booking.booking_url).
-                mov_no=mov_no)
+                mov_no=mov_no,
+                # 좌석맵에서 다시 고를 때도 같은 범위를 써야 한다 — 여기서
+                # 빠지면 후보는 범위 안인데 실제로 누르는 좌석은 범위 밖이 된다.
+                num_from=num_from, num_to=num_to)
             act = outcome.get("action")
             if act == "held":
                 alerts.append({"kind": "book_held", "body": booking.build_hold_alert(

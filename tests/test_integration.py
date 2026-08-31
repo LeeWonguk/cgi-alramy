@@ -319,6 +319,42 @@ class TestSeatWatchStore(DbCase):
         self.assertTrue(store.delete_seat_watch(w["id"], owner_id=uid))
         self.assertEqual(store.seat_watches(owner_id=uid), [])
 
+    def test_seat_number_range_round_trips(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 rows=["H"], seat_num_from=13, seat_num_to=32)
+        self.assertEqual((w["seat_num_from"], w["seat_num_to"]), (13, 32))
+        self.assertEqual(store.seat_watch(w["id"])["seat_num_from"], 13)
+
+    def test_a_reversed_range_is_stored_corrected(self):
+        """32~13으로 적어도 13~32로 저장된다 — 아니면 아무 좌석도 안 걸린다."""
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 seat_num_from=32, seat_num_to=13)
+        self.assertEqual((w["seat_num_from"], w["seat_num_to"]), (13, 32))
+
+    def test_no_range_defaults_to_unlimited(self):
+        """예전 감시는 컬럼이 0이라 전 번호를 본다 — 동작이 바뀌면 안 된다."""
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["H"])
+        self.assertEqual((w["seat_num_from"], w["seat_num_to"]), (0, 0))
+
+    def test_watches_differing_only_by_range_are_separate(self):
+        # 같은 열을 보되 앞구역·뒷구역을 따로 걸 수 있어야 한다.
+        uid = self.make_user("owner")["id"]
+        a = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 rows=["H"], seat_num_from=13, seat_num_to=32)
+        b = store.add_seat_watch(uid, "오디세이", "용산", "20260825",
+                                 rows=["H"], seat_num_from=1, seat_num_to=12)
+        self.assertNotEqual(a["id"], b["id"])
+
+    def test_the_range_can_be_edited_afterwards(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["H"])
+        out = store.set_seat_watch(w["id"], owner_id=uid,
+                                   seat_num_from=13, seat_num_to=32)
+        self.assertEqual((out["seat_num_from"], out["seat_num_to"]), (13, 32))
+
     def test_duplicate_reenables(self):
         uid = self.make_user("owner")["id"]
         a = store.add_seat_watch(uid, "오디세이", "용산", "20260825", rows=["A"])

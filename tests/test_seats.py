@@ -77,6 +77,94 @@ class TestRowFilter(unittest.TestCase):
         self.assertEqual(summ["total"], 8)   # A열 8석
 
 
+class TestSeatNumberRange(unittest.TestCase):
+    """좌석 번호 범위 — 열 필터가 세로를 자른다면 이건 가로를 자른다.
+
+    IMAX처럼 한 열이 45석까지 가는 관에서는 열만 걸어서는 화면 끝자리가 그대로
+    후보에 남는다. 화면의 '선호좌석' 버튼이 H~O열 · 13~32번을 채운다.
+    """
+
+    def row(self, label, x, available=True):
+        """H13처럼 라벨로 좌석 하나. x는 왼쪽부터의 좌표(인접 판정에 쓰인다)."""
+        i = 0
+        while i < len(label) and not label[i].isdigit():
+            i += 1
+        return _seat(label[:i], label[i:], x, x + 2, available)
+
+    def test_normalize_accepts_only_positive_numbers(self):
+        self.assertEqual(seats.normalize_seat_nums(13, 32), (13, 32))
+        self.assertEqual(seats.normalize_seat_nums(0, 0), (0, 0))
+        self.assertEqual(seats.normalize_seat_nums(None, None), (0, 0))
+        self.assertEqual(seats.normalize_seat_nums("13", "32"), (13, 32))
+        self.assertEqual(seats.normalize_seat_nums(-5, 32), (0, 32))
+        self.assertEqual(seats.normalize_seat_nums("", ""), (0, 0))
+
+    def test_a_reversed_range_is_corrected(self):
+        """32~13이라고 적어도 13~32로 본다.
+
+        큰 숫자를 먼저 적는 일은 흔한데, 그대로 두면 아무 좌석도 안 걸려
+        감시가 조용히 멎는다 — 화면에는 정상으로 보이면서.
+        """
+        self.assertEqual(seats.normalize_seat_nums(32, 13), (13, 32))
+
+    def test_only_seats_inside_the_range_are_watched(self):
+        rows = [self.row(f"H{i}", i * 2) for i in range(1, 41)]
+        labels = seats.available_labels(rows, ["H"], 13, 32)
+        self.assertEqual(len(labels), 20)
+        self.assertIn("H13", labels)
+        self.assertIn("H32", labels)
+        self.assertNotIn("H12", labels)
+        self.assertNotIn("H33", labels)
+
+    def test_an_open_ended_range_works_both_ways(self):
+        rows = [self.row(f"H{i}", i * 2) for i in range(1, 21)]
+        self.assertNotIn("H12", seats.available_labels(rows, None, 13, 0))
+        self.assertIn("H13", seats.available_labels(rows, None, 13, 0))
+        self.assertIn("H12", seats.available_labels(rows, None, 0, 13))
+        self.assertNotIn("H14", seats.available_labels(rows, None, 0, 13))
+
+    def test_no_range_means_every_number(self):
+        rows = [self.row(f"H{i}", i * 2) for i in range(1, 21)]
+        self.assertEqual(len(seats.available_labels(rows, ["H"], 0, 0)), 20)
+
+    def test_rows_and_numbers_are_both_applied(self):
+        rows = ([self.row(f"H{i}", i * 2) for i in range(1, 41)]
+                + [self.row(f"A{i}", i * 2) for i in range(1, 41)])
+        labels = seats.available_labels(rows, ["H"], 13, 32)
+        self.assertTrue(all(l.startswith("H") for l in labels))
+        self.assertEqual(len(labels), 20)
+
+    def test_a_run_does_not_reach_across_the_edge(self):
+        """12번과 13번이 붙어 있어도 범위가 13부터면 한 구간이 아니다.
+
+        잡을 수 없는 자리를 구간에 넣으면 "2석 연속 있음"이라고 알려 놓고
+        정작 못 잡는다.
+        """
+        rows = [self.row("H12", 24), self.row("H13", 26), self.row("H14", 28)]
+        runs = seats.consecutive_runs(rows, None, ["H"], 13, 0)
+        self.assertEqual(runs, [["H13", "H14"]])
+
+    def test_pick_block_stays_inside_the_range(self):
+        # 범위 밖(H1·H2)이 더 앞이지만 골라선 안 된다.
+        rows = ([self.row("H1", 2), self.row("H2", 4)]
+                + [self.row(f"H{i}", i * 2, available=(i >= 13))
+                   for i in range(3, 21)])
+        block = seats.pick_block(rows, 2, ["H"], 13, 32)
+        self.assertEqual(len(block), 2)
+        for s in block:
+            self.assertGreaterEqual(int(s["no"]), 13)
+
+    def test_summarize_counts_only_the_range(self):
+        rows = [self.row(f"H{i}", i * 2) for i in range(1, 41)]
+        self.assertEqual(seats.summarize(rows, ["H"], 13, 32)["total"], 20)
+
+    def test_a_seat_without_a_number_is_dropped_when_a_range_is_set(self):
+        """번호로 고른다고 해 놓고 번호를 모르는 자리를 끼워 주면 안 된다."""
+        odd = _seat("H", "A", 2, 4, True)     # 번호를 읽을 수 없는 좌석
+        self.assertTrue(seats.in_scope(odd, ["H"], 0, 0), "범위가 없으면 통과")
+        self.assertFalse(seats.in_scope(odd, ["H"], 13, 32), "범위가 있으면 제외")
+
+
 class TestDiffAndSort(unittest.TestCase):
     def test_diff_only_new(self):
         known = {"A1", "A2"}

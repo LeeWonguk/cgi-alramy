@@ -30,6 +30,9 @@
   let times = $state([]) // 선택한 영화·극장·날짜의 회차 시간 목록
   let loadingTimes = $state(false)
   let rowsText = $state('')
+  // 좌석 번호 범위(가로). 비우면 그 열의 모든 번호를 본다.
+  let numFrom = $state('')
+  let numTo = $state('')
   let minConsecutive = $state(0) // 0·1 = 개별 좌석, 2+ = 나란히 붙은 N석
   let autoBook = $state(false) // 좌석 확보 시 자동 선점
   let autoPay = $state(false) // 선점에 이어 카카오페이 결제까지 요청
@@ -38,6 +41,31 @@
   let savingWatch = $state(false)
   let watchMsg = $state(null)
   let watchErr = $state(null)
+
+  // '선호좌석' 프리셋. 스크린에서 적당히 떨어진 H~O열의, 좌우 끝을 뺀 가운데
+  // 구역이다 — IMAX처럼 한 열이 45석까지 가는 관에서는 열만 걸어서는 화면
+  // 끝자리가 그대로 후보에 남는다.
+  const PREFERRED = { rows: 'H, I, J, K, L, M, N, O', from: 13, to: 32 }
+
+  function applyPreferred() {
+    rowsText = PREFERRED.rows
+    numFrom = String(PREFERRED.from)
+    numTo = String(PREFERRED.to)
+  }
+
+  function fmtNums(w) {
+    // 한쪽만 걸 수도 있다 — '13번부터' / '~32번' 처럼 열린 범위로 적는다.
+    const a = w.seat_num_from || 0
+    const b = w.seat_num_to || 0
+    if (a && b) return `${a}~${b}번`
+    return a ? `${a}번부터` : `~${b}번`
+  }
+
+  const isPreferred = $derived(
+    rowsText.trim() === PREFERRED.rows &&
+      Number(numFrom) === PREFERRED.from &&
+      Number(numTo) === PREFERRED.to,
+  )
 
   let bookings = $state([])
 
@@ -175,6 +203,8 @@
         scn_ymd: ymd.replaceAll('-', ''),
         screen_types: [...types],
         rows: rowsText.split(/[,\s]+/).map((r) => r.trim()).filter(Boolean),
+        seat_num_from: Number(numFrom) || 0,
+        seat_num_to: Number(numTo) || 0,
         scn_time: timeMode === 'one' ? scnTime : '',
         scn_time_from: timeMode === 'range' ? timeFrom : '',
         scn_time_to: timeMode === 'range' ? timeTo : '',
@@ -188,6 +218,8 @@
         ? `좌석 감시를 추가했습니다 (자동 예매 켜짐${autoPay ? ' · 카카오페이 결제까지' : ''})`
         : '좌석 감시를 추가했습니다'
       rowsText = ''
+      numFrom = ''
+      numTo = ''
       await loadWatches()
     } catch (exc) {
       watchErr = exc.message
@@ -387,9 +419,33 @@
     </div>
 
     <div class="field">
-      <label for="s-rows">열 필터</label>
+      <div class="label-row">
+        <label for="s-rows">열 필터</label>
+        <button
+          type="button"
+          class="preset"
+          class:on={isPreferred}
+          onclick={applyPreferred}>
+          {isPreferred ? '✓ 선호좌석' : '선호좌석'}
+        </button>
+      </div>
       <input id="s-rows" bind:value={rowsText} placeholder="예: A, B (비우면 전 열)" />
       <div class="small muted">쉼표·공백으로 구분. 비우면 모든 열의 빈좌석을 봅니다.</div>
+    </div>
+
+    <div class="field">
+      <label for="s-num-from">좌석 번호</label>
+      <div class="row" style="gap: 6px; align-items: center">
+        <input id="s-num-from" type="number" min="1" bind:value={numFrom}
+               placeholder="처음" style="width: 5.5em" />
+        <span class="muted">~</span>
+        <input type="number" min="1" bind:value={numTo}
+               placeholder="끝" style="width: 5.5em" aria-label="좌석 번호 끝" />
+      </div>
+      <div class="small muted">
+        비우면 그 열의 모든 번호를 봅니다. 열 필터가 세로를 자른다면 이건
+        가로를 자릅니다 — 같은 H열도 1번은 화면 끝, 20번은 한가운데입니다.
+      </div>
     </div>
 
     <div class="field">
@@ -494,7 +550,12 @@
             <td>{w.site_query}</td>
             <td>{fmtYmd(w.scn_ymd)} <span class="small muted">{fmtWhen(w)}</span></td>
             <td>{w.screen_types.length ? w.screen_types.join(', ') : '전체'}</td>
-            <td>{w.rows.length ? w.rows.join(', ') : '전 열'}</td>
+            <td>
+              {w.rows.length ? w.rows.join(', ') : '전 열'}
+              {#if w.seat_num_from || w.seat_num_to}
+                <span class="small muted">· {fmtNums(w)}</span>
+              {/if}
+            </td>
             <td>{w.min_consecutive >= 2 ? `${w.min_consecutive}석` : '개별'}</td>
             <td>
               {#if w.auto_book}
@@ -579,10 +640,39 @@
     flex-direction: column;
     gap: 6px;
   }
-  .field > label:first-child {
+  .field > label:first-child,
+  .label-row > label {
     font-size: 12px;
     color: var(--muted);
     font-weight: 600;
+  }
+  /* 라벨과 프리셋 버튼을 한 줄에 — 버튼이 열 필터 바로 위에 붙는다. */
+  .label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 20px;
+  }
+  button.preset {
+    font-size: 11px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--muted);
+    font-weight: 600;
+    line-height: 1.6;
+  }
+  button.preset:hover {
+    color: var(--text);
+    border-color: var(--muted);
+  }
+  /* 켜져 있으면 지금 그 프리셋이 적용된 상태라는 뜻이다. */
+  button.preset.on {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: var(--accent-soft);
   }
   /* 회차를 '시간대로' 고를 때의 시작~끝 입력 */
   .range {
