@@ -213,9 +213,41 @@ class TestDateLabels(unittest.TestCase):
         self.assertIn("9.1", booking.date_labels("20260901"))
         self.assertIn("1", booking.date_labels("20260901"))
 
-    def test_no_zero_padding(self):
-        # 스트립은 '01'이 아니라 '1'로 적는다.
-        self.assertEqual(booking.date_labels("20260901")[0], "1")
+    def test_zero_padded_form_is_offered_too(self):
+        """달을 넘긴 2일부터 CGV는 '02'처럼 0을 붙인다 (2026-08-31 실측).
+
+        이걸 놓쳐서 9/2 이후 딥링크가 전부 "다른 날짜"로 잘못 판정됐다 — 화면은
+        그 날짜를 제대로 열어 놓고도 우리가 실패로 보고 클릭 경로로 되돌아갔다.
+        """
+        self.assertIn("02", booking.date_labels("20260902"))
+        self.assertIn("2", booking.date_labels("20260902"))
+        self.assertIn("9.2", booking.date_labels("20260902"))
+
+    def test_two_digit_days_are_not_duplicated(self):
+        # 10일부터는 패딩 유무가 같은 글자다 — 후보에 두 번 넣을 이유가 없다.
+        self.assertEqual(booking.date_labels("20260910").count("10"), 1)
+
+    def test_a_zero_padded_strip_is_matched(self):
+        """스트립이 '02'로만 적혀 있어도 그 날짜를 고를 수 있어야 한다."""
+        page = FakePage(date_strip(["31", "9.1", "02", "03"], active="02"))
+        self.assertTrue(booking._date_is_selected(page,
+                                                  booking.date_labels("20260902")))
+
+    def test_a_zero_padded_strip_still_rejects_the_wrong_day(self):
+        # 후보를 늘렸다고 엉뚱한 날짜까지 통과시키면 안 된다.
+        page = FakePage(date_strip(["31", "9.1", "02", "03"], active="03"))
+        self.assertFalse(booking._date_is_selected(page,
+                                                   booking.date_labels("20260902")))
+
+    def test_the_bare_day_is_still_offered(self):
+        """0을 붙이지 않은 표기도 후보로 남아야 한다.
+
+        예전에는 이 테스트가 "스트립은 '01'이 아니라 '1'로 적는다"고 단정하고
+        첫 후보만 확인했는데, 실측해 보니 **둘 다 쓰인다**(같은 달은 '31',
+        달을 넘기면 '02'). 그래서 순서가 아니라 '들어 있는지'를 본다.
+        """
+        self.assertIn("1", booking.date_labels("20260901"))
+        self.assertIn("31", booking.date_labels("20260831"))
 
     def test_bad_date_raises(self):
         for bad in ("", "2026", "abc", None):
