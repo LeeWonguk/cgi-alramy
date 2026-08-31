@@ -548,6 +548,173 @@ class TestCatalogCacheExpiry(unittest.TestCase):
         self.assertIsNone(watch.Catalog._db_cache("movie"))
 
 
+class TestSeatFieldsAreEnough(unittest.TestCase):
+    """좌석맵을 묶어 받을 때 브라우저에서 필드를 깎는다 — 그래도 결과가 같아야 한다.
+
+    원본은 좌석당 39개 필드인데 parse_seats가 읽는 건 17개뿐이다. 안 깎으면
+    32건이 한 프로토콜 메시지로 17.6MB가 되어 병렬화 이득을 도로 까먹는다.
+    **필드 이름을 그대로 두므로 출력은 바뀌지 않아야 한다** — 이게 깨지면
+    감시가 조용히 틀린 좌석을 본다.
+    """
+
+    def slim(self, data):
+        """브라우저가 하는 것과 같은 방식으로 좌석 필드를 깎는다."""
+        import copy
+
+        out = copy.deepcopy(data)
+        for item in out.get("items") or []:
+            item["seats"] = [{k: v for k, v in s.items()
+                              if k in seats.SEAT_FIELDS}
+                             for s in item.get("seats") or []]
+        return out
+
+    def test_parsing_a_slimmed_map_gives_the_same_result(self):
+        self.assertEqual(seats.parse_seats(SEAT_DATA),
+                         seats.parse_seats(self.slim(SEAT_DATA)))
+
+    def test_every_field_parse_seats_reads_is_kept(self):
+        """parse_seats가 읽는 필드가 목록에서 빠지면 그 값이 조용히 사라진다."""
+        import re
+
+        source = (ROOT / "seats.py").read_text(encoding="utf-8")
+        body = source.split("def parse_seats")[1].split("\ndef ")[0]
+        read = set(re.findall(r's\.get\("(\w+)"', body))
+        self.assertTrue(read, "parse_seats에서 필드를 못 읽었다")
+        self.assertFalse(read - set(seats.SEAT_FIELDS),
+                         f"SEAT_FIELDS에 빠진 필드: {read - set(seats.SEAT_FIELDS)}")
+
+    def test_the_list_carries_nothing_extra(self):
+        # 안 쓰는 필드를 남기면 그만큼 그냥 무겁다.
+        source = (ROOT / "seats.py").read_text(encoding="utf-8")
+        body = source.split("def parse_seats")[1].split("\ndef ")[0]
+        import re
+        read = set(re.findall(r's\.get\("(\w+)"', body))
+        self.assertFalse(set(seats.SEAT_FIELDS) - read,
+                         f"쓰지 않는 필드: {set(seats.SEAT_FIELDS) - read}")
+
+
+class TestRowsToCheck(unittest.TestCase):
+    """프리페치와 본 루프가 같은 회차를 골라야 한다.
+
+    각자 고르면 어긋날 수 있고, 어긋나면 미리 받아 둔 것이 조용히 무용지물이
+    된다 — 결과는 맞으니 알아채기 어렵다.
+    """
+
+    def row(self, screen):
+        return {"scnsNo": "S1", "scnSseq": "1", "scnsNm": screen,
+                "atktGoodsNm": screen}
+
+    def test_no_filter_takes_everything(self):
+        rows = [self.row("IMAX관"), self.row("4DX관")]
+        self.assertEqual(len(seats.rows_to_check({"screen_types": []}, rows)), 2)
+
+    def test_a_filter_narrows_it(self):
+        rows = [self.row("IMAX관"), self.row("4DX관")]
+        out = seats.rows_to_check({"screen_types": ["IMAX"]}, rows)
+        self.assertEqual(len(out), 1)
+        self.assertIn("IMAX", out[0]["scnsNm"])
+
+    def test_the_key_follows_the_row_site(self):
+        # 회차에 siteNo가 있으면 그걸 쓰고, 없으면 넘겨받은 값으로 떨어진다.
+        w = {"scn_ymd": "20260905"}
+        with_site = seats.seat_map_key(w, {**self.row("IMAX관"),
+                                           "siteNo": "0013"}, "9999")
+        without = seats.seat_map_key(w, self.row("IMAX관"), "9999")
+        self.assertEqual(with_site[0], "0013")
+        self.assertEqual(without[0], "9999")
+
+
+class TestPrefetchIsShared(unittest.TestCase):
+    """미리 받아 둔 좌석맵을 감시들이 나눠 써야 한다.
+
+    같은 영화·극장·날짜를 열만 다르게 걸어 두는 건 흔하다. 처음엔 결과를
+    한 번 쓰고 지웠더니(pop) 첫 감시만 쓰고 나머지는 전부 개별로 다시 받았다 —
+    묶음 3건에 개별 9건이 나갔다. 한 사이클 안에서는 같은 순간의 같은
+    데이터이므로 나눠 쓰는 게 맞다.
+    """
+
+    class Sess:
+        def __init__(self):
+            self.batched = 0
+            self.individual = 0
+
+        def showtimes(self, site_no, mov_no, ymd):
+            return [{"scnsNo": f"S{i}", "scnSseq": str(i), "scnsrtTm": "1800",
+                     "siteNo": site_no, "scnsNm": "IMAX관",
+                     "atktGoodsNm": "IMAX LASER 2D"} for i in range(3)]
+
+        def get_json_many(self, paths, seat_fields=None):
+            self.batched += len(paths)
+            return [{"data": {"items": [{"seats": []}]}} for _ in paths]
+
+        def seat_map(self, **kwargs):
+            self.individual += 1
+            return {"items": [{"seats": []}]}
+
+    class Cat:
+        def resolve_movie(self, q):
+            return {"movNo": "M1", "movNm": q}, ""
+
+        def resolve_site(self, q):
+            return {"siteNo": "0013", "siteNm": q}, ""
+
+    def group(self, n=4):
+        return [{"id": i, "owner_id": 1, "movie_query": "오디세이",
+                 "site_query": "용산아이파크몰", "scn_ymd": "20260905",
+                 "screen_types": ["IMAX"], "rows": [], "scn_time": "",
+                 "scn_time_from": "", "scn_time_to": "", "min_consecutive": 2,
+                 "auto_book": False, "seat_num_from": 0, "seat_num_to": 0}
+                for i in range(1, n + 1)]
+
+    def run_cycle(self, session):
+        import store
+
+        real_save, real_prev = store.save_seat_state, store.prev_seat_state
+        store.save_seat_state = lambda *a, **k: None
+        store.prev_seat_state = lambda i: {}
+        self.addCleanup(setattr, store, "save_seat_state", real_save)
+        self.addCleanup(setattr, store, "prev_seat_state", real_prev)
+
+        group, sched = self.group(), {}
+        pre = seats._prefetch_seat_maps(session, self.Cat(), group,
+                                        sched_cache=sched)
+        for w in group:
+            seats._check_one_seat_watch(session, self.Cat(), w, None, None,
+                                        guard=None, dry_run=False,
+                                        sched_cache=sched, warmed=set(),
+                                        prefetched=pre)
+        return pre
+
+    def test_watches_sharing_a_showtime_share_the_fetch(self):
+        s = self.Sess()
+        self.run_cycle(s)
+        self.assertEqual(s.individual, 0, "미리 받아 뒀는데 개별로 또 받았다")
+        self.assertEqual(s.batched, 3, "같은 회차를 여러 번 받았다")
+
+    def test_the_same_showtime_is_only_requested_once(self):
+        s = self.Sess()
+        pre = seats._prefetch_seat_maps(s, self.Cat(), self.group(),
+                                        sched_cache={})
+        self.assertEqual(len(pre), 3, "감시 4건이 같은 회차 3개를 본다")
+
+    def test_a_missing_entry_falls_back_to_the_individual_path(self):
+        """묶음이 못 받은 항목은 개별로 받아야 한다 — 조용히 빠뜨리면 안 된다."""
+        s = self.Sess()
+        import store
+
+        real_save, real_prev = store.save_seat_state, store.prev_seat_state
+        store.save_seat_state = lambda *a, **k: None
+        store.prev_seat_state = lambda i: {}
+        self.addCleanup(setattr, store, "save_seat_state", real_save)
+        self.addCleanup(setattr, store, "prev_seat_state", real_prev)
+
+        w = self.group(1)[0]
+        seats._check_one_seat_watch(s, self.Cat(), w, None, None, guard=None,
+                                    dry_run=False, sched_cache={},
+                                    warmed=set(), prefetched={})
+        self.assertEqual(s.individual, 3, "미리 받은 게 없으면 개별로 받아야 한다")
+
+
 class TestCycleCost(unittest.TestCase):
     """사이클이 폴링 간격을 넘으면 다음 슬롯을 놓친다 — 그게 로그에 남아야 한다."""
 

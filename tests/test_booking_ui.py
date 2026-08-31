@@ -120,9 +120,41 @@ class FakePage(FakeNode):
         super().__init__(tag="html", children=children)
         self.clicked: list[FakeNode] = []
         self.waits = 0
+        self.evaluates = 0
+        # 예매 화면에 있는 것으로 둔다 — _already_on_booking이 주소를 함께 본다.
+        self.url = booking.BOOKING_PAGE
 
     def wait_for_timeout(self, ms):
         self.waits += 1
+
+    def evaluate(self, script, arg=None):
+        """실제 코드가 쓰는 evaluate를 가짜 DOM 위에서 흉내낸다.
+
+        날짜 판정이 evaluate 한 번으로 바뀌면서(노드마다 왕복하던 것을 합쳤다)
+        가짜 페이지도 그 답을 낼 수 있어야 한다. 모르는 스크립트는 조용히
+        None을 주지 않고 바로 알린다 — 그러면 "왜 판정이 이상하지"를 한참
+        헤매게 된다.
+        """
+        self.evaluates += 1
+        if isinstance(arg, dict) and "daySel" in arg:
+            return self._date_state(arg)
+        raise AssertionError(f"FakePage가 모르는 evaluate: {script[:60]}")
+
+    def _date_state(self, arg):
+        nodes = self.descendants()
+        days = [n for n in _select(nodes, arg["daySel"]) if n.is_visible()]
+
+        def num(button):
+            found = _select(button.descendants(), arg["numSel"])
+            return (found[0].text_content() or "").strip() if found else ""
+
+        shows = _select(nodes, arg["showSel"]) if arg.get("showSel") else []
+        return {
+            "url": self.url,
+            "showtimes": len(shows),
+            "days": len(days),
+            "actives": [num(b) for b in days if arg["activeMark"] in b.cls],
+        }
 
     def wait_for_selector(self, selector, timeout=None, state=None):
         found = _select(self.descendants(), selector)
@@ -212,6 +244,51 @@ class TestDateLabels(unittest.TestCase):
         # 달을 넘기면 스트립이 '9.1'로 적는다.
         self.assertIn("9.1", booking.date_labels("20260901"))
         self.assertIn("1", booking.date_labels("20260901"))
+
+    def test_the_date_check_costs_one_round_trip(self):
+        """이 판정은 자동 예매를 켠 감시마다 매 사이클 돈다.
+
+        예전에는 노드마다 왕복했다 — is_visible()·get_attribute()·text_content()가
+        버튼 수만큼(스와이퍼 숨김 사본까지 24개) 나갔다. 배포 실측으로 판정 하나가
+        783ms였고 프리워밍 6회에 4.7초를 썼다. 왕복 수가 다시 늘면 그대로 되돌아간다.
+        """
+        page = FakePage(date_strip(["30", "31"], active="31"))
+        booking._date_is_selected(page, booking.date_labels("20260831"))
+        self.assertEqual(page.evaluates, 1)
+
+    def test_the_prewarm_check_costs_one_round_trip(self):
+        page = FakePage(date_strip(["30", "31"], active="31")
+                        + [screen_block("IMAX관", [showtime("18:00", "-21:02")])])
+        self.assertTrue(booking._already_on_booking(
+            page, {"scn_ymd": "20260831"}))
+        self.assertEqual(page.evaluates, 1)
+
+    def test_a_screen_without_showtimes_is_not_ready(self):
+        # 날짜는 맞아도 회차 목록이 안 그려졌으면 아직 준비된 게 아니다.
+        page = FakePage(date_strip(["31"], active="31"))
+        self.assertFalse(booking._already_on_booking(
+            page, {"scn_ymd": "20260831"}))
+
+    def test_a_screen_somewhere_else_is_not_ready(self):
+        page = FakePage(date_strip(["31"], active="31")
+                        + [screen_block("IMAX관", [showtime("18:00", "-21:02")])])
+        page.url = "https://cgv.co.kr/mem/login"
+        self.assertFalse(booking._already_on_booking(
+            page, {"scn_ymd": "20260831"}))
+
+    def test_an_unreadable_screen_is_unknown_not_wrong(self):
+        """읽지 못한 것과 '다른 날짜'는 다르다 — 딥링크 판정이 여기 달려 있다."""
+        page = FakePage(date_strip(["31"], active="31"))
+
+        def boom(script, arg=None):
+            raise RuntimeError("갈아 끼우는 중")
+
+        page.evaluate = boom
+        self.assertIsNone(booking._date_is_selected(page, ["31"]))
+
+    def test_no_active_marker_is_unknown(self):
+        page = FakePage(date_strip(["30", "31"], active=None))
+        self.assertIsNone(booking._date_is_selected(page, ["31"]))
 
     def test_zero_padded_form_is_offered_too(self):
         """달을 넘긴 2일부터 CGV는 '02'처럼 0을 붙인다 (2026-08-31 실측).
@@ -881,6 +958,15 @@ class TestDirectOpenFallsBackWhenUnsure(unittest.TestCase):
 
         def wait_for_timeout(self, ms):
             pass
+
+        def evaluate(self, script, arg=None):
+            """날짜 판정이 evaluate 한 번으로 바뀐 뒤의 경로."""
+            if isinstance(arg, dict) and "daySel" in arg:
+                return {"url": booking.BOOKING_PAGE,
+                        "showtimes": 1 if arg.get("showSel") else 0,
+                        "days": len(self.days),
+                        "actives": [d for d in self.days if d in self.active]}
+            raise AssertionError(f"DatePage가 모르는 evaluate: {script[:60]}")
 
         def locator(self, selector):
             page = self

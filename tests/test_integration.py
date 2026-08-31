@@ -722,6 +722,96 @@ class FakeCookieJar:
             self.jar[c["name"]] = c["value"]
 
 
+class TestBatchedJson(unittest.TestCase):
+    """좌석맵을 묶어 받는다 — 실패한 항목만 빠지고 나머지는 살아야 한다.
+
+    실패를 통째로 올리면 배치가 인증 복구까지 떠안게 된다. 그 자리를 None으로
+    두면 호출자가 개별 경로로 다시 받고, 401 복구(_AuthGuard)는 지금처럼
+    거기서 일어난다.
+    """
+
+    def make_session(self, replies):
+        """evaluate가 정해진 답을 주는 세션. replies는 경로 → 항목 dict."""
+        session = watch.CgvSession.__new__(watch.CgvSession)
+        session.requests = 0
+        calls = []
+
+        def evaluate(script, arg):
+            calls.append(list(arg["paths"]))
+            return [replies.get(p, {"status": 0}) for p in arg["paths"]]
+
+        page = type("P", (), {"evaluate": staticmethod(evaluate)})()
+        session._spaces = watch.OrderedDict()
+        session._current = None
+        session._spaces[None] = watch._OwnerSpace(object(), page)
+        return session, calls
+
+    def ok(self, payload=None):
+        return {"status": 200, "json": {"statusCode": 0,
+                                        "data": payload or {"items": []}}}
+
+    def test_good_items_come_back_in_order(self):
+        s, _ = self.make_session({
+            "/a": self.ok({"items": ["A"]}), "/b": self.ok({"items": ["B"]})})
+        out = s.get_json_many(["/a", "/b"])
+        self.assertEqual([o["data"]["items"] for o in out], [["A"], ["B"]])
+
+    def test_a_failed_item_becomes_none_and_the_rest_survive(self):
+        s, _ = self.make_session({"/a": self.ok(), "/c": self.ok()})
+        out = s.get_json_many(["/a", "/b", "/c"])   # /b는 답이 없다
+        self.assertIsNotNone(out[0])
+        self.assertIsNone(out[1])
+        self.assertIsNotNone(out[2])
+
+    def test_a_401_is_left_for_the_individual_path(self):
+        """배치가 인증을 떠안지 않는다 — None으로 두면 개별 경로가 복구한다."""
+        s, _ = self.make_session({"/a": {"status": 401}})
+        self.assertEqual(s.get_json_many(["/a"]), [None])
+
+    def test_an_api_level_error_is_not_mistaken_for_success(self):
+        # HTTP는 200인데 statusCode가 오류인 경우 — get_json과 같은 기준이다.
+        s, _ = self.make_session(
+            {"/a": {"status": 200, "json": {"statusCode": "9999",
+                                            "statusMessage": "오류"}}})
+        self.assertEqual(s.get_json_many(["/a"]), [None])
+
+    def test_unparsable_json_is_not_mistaken_for_success(self):
+        s, _ = self.make_session({"/a": {"status": 200, "bad": "<html>"}})
+        self.assertEqual(s.get_json_many(["/a"]), [None])
+
+    def test_requests_are_chunked(self):
+        """한 메시지가 커지는 것과 CGV로 한꺼번에 나가는 것을 함께 막는다."""
+        n = watch.SEAT_MAP_BATCH * 2 + 3
+        s, calls = self.make_session({})
+        s.get_json_many([f"/p{i}" for i in range(n)])
+        self.assertEqual(len(calls), 3, "묶음이 쪼개지지 않았다")
+        for chunk in calls:
+            self.assertLessEqual(len(chunk), watch.SEAT_MAP_BATCH)
+
+    def test_an_empty_list_does_not_touch_the_browser(self):
+        s, calls = self.make_session({})
+        self.assertEqual(s.get_json_many([]), [])
+        self.assertEqual(calls, [])
+
+    def test_every_request_is_counted(self):
+        s, _ = self.make_session({})
+        s.get_json_many([f"/p{i}" for i in range(5)])
+        self.assertEqual(s.requests, 5, "부하 집계에서 빠지면 안 된다")
+
+    def test_a_dead_batch_falls_back_instead_of_dying(self):
+        s = watch.CgvSession.__new__(watch.CgvSession)
+        s.requests = 0
+
+        def boom(script, arg):
+            raise RuntimeError("페이지가 갈아 끼워지는 중")
+
+        page = type("P", (), {"evaluate": staticmethod(boom)})()
+        s._spaces = watch.OrderedDict()
+        s._current = None
+        s._spaces[None] = watch._OwnerSpace(object(), page)
+        self.assertEqual(s.get_json_many(["/a", "/b"]), [None, None])
+
+
 class TestOwnerSpacesAreIsolated(unittest.TestCase):
     """소유자마다 BrowserContext를 따로 둔다 — 브라우저 없이 구조만 시험한다.
 

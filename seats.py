@@ -450,6 +450,39 @@ class _AuthGuard:
         return self.ok
 
 
+# parse_seats가 실제로 읽는 필드. 좌석맵을 묶어 받을 때 브라우저에서 이것만
+# 남겨 보낸다 — 원본은 좌석당 39개라 안 깎으면 32건이 17.6MB로 넘어온다.
+# **이름을 그대로 두므로 parse_seats 출력은 바뀌지 않는다.**
+SEAT_FIELDS = [
+    "seatRowNm", "seatNo", "seatSaleYn", "stkndNm", "szoneExpoNm", "szoneNm",
+    "xcoordStartVal", "xcoordEndVal", "leftPwayYn", "rghtPwayYn",
+    "seatLocNo", "sbordNo", "seatAreaNo", "szoneNo", "stkndCd",
+    "szoneKindCd", "seatSalfrmCd",
+]
+
+
+def rows_to_check(w: dict, schedule: list[dict]) -> list[dict]:
+    """이 감시가 실제로 좌석을 볼 회차들.
+
+    **프리페치와 본 루프가 이 함수를 함께 쓴다.** 각자 고르면 어긋날 수 있고,
+    어긋나면 미리 받아 둔 것이 조용히 무용지물이 된다 — 결과는 맞으니 알아채기
+    어렵다. 고르는 규칙은 한 곳에만 둔다.
+    """
+    import watch
+
+    import store
+
+    wanted = store.normalize_screen_types(w["screen_types"])
+    return [row for row in schedule
+            if not wanted or watch.matches_screen_types(row, wanted)]
+
+
+def seat_map_key(w: dict, row: dict, site_no: str) -> tuple:
+    """좌석맵 하나를 가리키는 키. 프리페치 결과를 찾을 때 쓴다."""
+    return (row.get("siteNo") or site_no, row["scnsNo"], w["scn_ymd"],
+            row["scnSseq"])
+
+
 def _seat_map(session, guard, **kwargs) -> dict:
     """좌석 배치도를 읽는다. 401이면 세션을 되살리고 한 번만 다시 시도한다."""
     import watch
@@ -502,6 +535,67 @@ class _CycleCost:
             + (f" {self._spent[k]:.1f}s" if k in self._spent else "")
             for k in sorted(self._counts))
         return f"합계 {total:.1f}s ({parts})"
+
+
+def _prefetch_seat_maps(session, catalog, group, *, cost=None,
+                        sched_cache=None) -> dict:
+    """이 소유자의 감시들이 볼 좌석맵을 **한 번에** 받아 둔다.
+
+    회차마다 따로 부르면 왕복을 줄줄이 기다린다 — 배포 실측으로 32건에 6.2초였고
+    그게 사이클 11.8초의 절반이었다. 브라우저 안에서 묶으면 서로 다른 URL 8건이
+    642ms → 65ms다(실측 9.8배).
+
+    받지 못한 항목은 그냥 빠진다. 본 루프가 없는 것을 개별로 받으므로 결과는
+    같고, 인증 복구나 회차별 실패 처리를 여기서 다시 구현하지 않아도 된다.
+
+    여기서 부르는 이름 해석·상영표는 이미 사이클 캐시에 걸리므로(catalog 캐시와
+    sched_cache) 추가 왕복이 없다.
+    """
+    import watch
+
+    keys, paths = [], []
+    for w in group:
+        movie, _ = catalog.resolve_movie(w["movie_query"])
+        site, _ = catalog.resolve_site(w["site_query"])
+        if movie is None or site is None:
+            continue
+        site_no, mov_no = site["siteNo"], movie["movNo"]
+        sched_key = (site_no, mov_no, w["scn_ymd"])
+        if sched_cache is not None and sched_key in sched_cache:
+            schedule = sched_cache[sched_key]
+        else:
+            try:
+                with cost.call("상영표") if cost else contextlib.nullcontext():
+                    schedule = session.showtimes(site_no, mov_no, w["scn_ymd"])
+            except RuntimeError:
+                continue        # 본 루프가 같은 실패를 만나 사유를 기록한다
+            if sched_cache is not None:
+                sched_cache[sched_key] = schedule
+
+        schedule = select_showtimes(
+            schedule, scn_time=w.get("scn_time") or "",
+            scn_time_from=w.get("scn_time_from") or "",
+            scn_time_to=w.get("scn_time_to") or "")
+        for row in rows_to_check(w, schedule):
+            key = seat_map_key(w, row, site_no)
+            if key in keys:
+                continue        # 같은 회차를 여러 감시가 보면 한 번만 받는다
+            keys.append(key)
+            paths.append(watch.EP_SEAT.format(
+                site_no=key[0], scns_no=key[1], ymd=key[2], scn_sseq=key[3]))
+
+    if not paths:
+        return {}
+    with cost.call("좌석맵(묶음)") if cost else contextlib.nullcontext():
+        results = session.get_json_many(paths, seat_fields=SEAT_FIELDS)
+    out = {}
+    for key, payload in zip(keys, results):
+        if payload is not None:
+            out[key] = payload.get("data") or {}
+    if len(out) < len(keys):
+        watch.log.debug("좌석맵 묶음: %d건 중 %d건만 받았습니다 — 나머지는 "
+                        "개별로 받습니다", len(keys), len(out))
+    return out
 
 
 # ── 사이클: 좌석 감시 한 바퀴 ────────────────────────────────────────────────
@@ -558,12 +652,21 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
 
         # 이 소유자의 감시들이 공유한다 — 401 복구는 사이클당 한 번이면 충분하다.
         guard = _AuthGuard(owner_id)
+        # 좌석맵을 미리 묶어 받는다. 실패해도 본 루프가 개별로 받으므로
+        # 여기서 예외를 밖으로 내지 않는다.
+        try:
+            prefetched = _prefetch_seat_maps(session, catalog, group, cost=cost,
+                                             sched_cache=sched_cache)
+        except Exception as exc:  # noqa: BLE001 - 미리 받기는 부가 기능이다
+            watch.log.warning("좌석맵을 미리 받지 못했습니다 (%s) — "
+                              "하나씩 받습니다", exc)
+            prefetched = {}
         for w in group:
             summary["watches_checked"] += 1
             sent = _check_one_seat_watch(
                 session, catalog, w, webhook, webhook_kind, guard=guard,
                 dry_run=dry_run, cost=cost, sched_cache=sched_cache,
-                warmed=warmed)
+                warmed=warmed, prefetched=prefetched)
             summary["alerts_sent"] += sent
 
     # 사이클이 폴링 간격을 넘으면 다음 슬롯을 통째로 놓친다 — 그 사실이 로그에
@@ -605,7 +708,8 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                           *, guard: "_AuthGuard | None" = None,
                           dry_run: bool, cost: "_CycleCost | None" = None,
                           sched_cache: dict | None = None,
-                          warmed: set | None = None) -> int:
+                          warmed: set | None = None,
+                          prefetched: dict | None = None) -> int:
     """좌석 감시 하나를 확인하고 보낸 알림 수를 돌려준다.
 
     cost·sched_cache·warmed는 한 바퀴를 함께 도는 감시들이 나눠 쓴다. 안 넘겨도
@@ -646,7 +750,6 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                                   error=f"시간표 조회 실패: {exc}")
         return 0
 
-    wanted_screens = store.normalize_screen_types(w["screen_types"])
     # 볼 회차를 고른다. 시간대로 걸었다면 늦은 회차부터 나오고, 그 순서가 곧
     # 자동 선점의 우선순위가 된다(첫 성공에서 멈추므로).
     schedule = select_showtimes(
@@ -693,17 +796,31 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
     checked = 0
     failures: list[str] = []
 
-    for row in schedule:
-        if wanted_screens and not watch.matches_screen_types(row, wanted_screens):
-            continue
+    for row in rows_to_check(w, schedule):
         key = showtime_key(row)
         try:
-            with cost.call("좌석맵") if cost else contextlib.nullcontext():
-                seat_data = _seat_map(
-                    session, guard,
-                    site_no=row.get("siteNo") or site_no,
-                    scns_no=row["scnsNo"], ymd=w["scn_ymd"],
-                    scn_sseq=row["scnSseq"])
+            # 사이클 앞에서 묶어 받아 둔 것이 있으면 쓴다. 없으면(그 항목만
+            # 실패했거나 프리페치가 통째로 안 됐으면) 지금처럼 개별로 받는다 —
+            # 401 복구와 회차별 실패 처리가 그 경로에 그대로 있다.
+            # pop이 아니라 get이다. 같은 회차를 여러 감시가 보는 일이 흔한데
+            # (같은 영화·극장·날짜에 열만 다르게 걸어 둔 경우), 한 번 쓰고
+            # 지우면 나머지 감시가 전부 개별로 다시 받는다 — 실측으로 묶음
+            # 3건에 개별 9건이 나갔다. 한 사이클 안에서는 같은 순간의 같은
+            # 데이터이므로 나눠 쓰는 게 맞다.
+            hit = None
+            if prefetched is not None:
+                hit = prefetched.get(seat_map_key(w, row, site_no))
+            if hit is not None:
+                if cost:
+                    cost.hit("좌석맵(묶음)")
+                seat_data = hit
+            else:
+                with cost.call("좌석맵") if cost else contextlib.nullcontext():
+                    seat_data = _seat_map(
+                        session, guard,
+                        site_no=row.get("siteNo") or site_no,
+                        scns_no=row["scnsNo"], ymd=w["scn_ymd"],
+                        scn_sseq=row["scnSseq"])
         except RuntimeError as exc:
             # 이 회차만 실패 — 직전 상태를 유지해 다음에 다시 본다.
             if key in prev:

@@ -109,6 +109,11 @@ BOOKING_PAGE_LIMIT = 4
 # 무한정 쌓이면 안 된다. 넘치면 가장 오래 안 쓴 쪽을 닫고, 그 소유자는 다음
 # 차례에 다시 만들어 로그인한다(= 지금과 같은 비용으로 되돌아갈 뿐이다).
 OWNER_SPACE_LIMIT = 4
+
+# 좌석맵을 한 번에 묶어 받을 개수. 두 가지를 함께 막는다:
+#   · 한 프로토콜 메시지가 커지는 것 — 624석 IMAX 한 건이 깎고도 214KB다
+#   · CGV로 나가는 요청이 한꺼번에 터지는 것 — 부하는 계속 신경 써 왔다
+SEAT_MAP_BATCH = 8
 WEEKDAYS = "월화수목금토일"
 
 log = logging.getLogger("cgv-watch")
@@ -464,6 +469,102 @@ class CgvSession:
             return payload
 
         raise RuntimeError(f"{path.split('?')[0]} 조회 실패 — {last_error}")
+
+    def get_json_many(self, paths: list[str], *,
+                      seat_fields: list[str] | None = None) -> list[dict | None]:
+        """여러 API를 **한꺼번에** 부른다. 길이가 같은 결과 리스트를 돌려준다.
+
+        실패한 항목은 그 자리에 None이 들어간다 — 예외를 내지 않는다. 호출자가
+        None인 것만 개별 경로(get_json)로 다시 받으면, 401 복구나 회차별 실패
+        처리 같은 기존 로직을 배치가 새로 떠안지 않아도 된다.
+
+        **왜 한꺼번에인가.** 회차마다 따로 부르면 왕복을 줄줄이 기다린다. 배포
+        실측으로 좌석맵 32건에 6.2초였고, 그게 사이클 11.8초의 절반이었다.
+        브라우저 안에서 Promise.all로 묶으면 서로 다른 URL 8건이 642ms → 65ms다
+        (실측 9.8배).
+
+        **같은 URL을 여러 번 넣으면 이득이 없다.** 브라우저가 동일 URL 동시
+        요청을 캐시 락으로 직렬화하기 때문이다 — 실측에서 8건이 1.0배로 나왔다.
+        좌석맵은 회차마다 URL이 달라서 해당되지 않지만, 다른 데 쓸 때는
+        알고 있어야 한다.
+
+        seat_fields를 주면 **브라우저에서 좌석 필드를 깎아** 보낸다. 좌석맵
+        원본은 좌석당 39개 필드인데 seats.parse_seats가 읽는 건 17개뿐이라,
+        안 깎으면 32건이 17.6MB로 한 번에 넘어와 병렬화 이득을 도로 까먹는다
+        (깎으면 6.7MB). **필드 이름은 그대로 두므로 parse_seats 출력은 바뀌지
+        않는다.**
+        """
+        if not paths:
+            return []
+
+        # eval을 쓰지 않는다 — CGV 페이지의 CSP가 막을 수 있고, 막히면 배치가
+        # 통째로 실패한다. 깎는 규칙은 필드 목록으로 넘긴다.
+        script = """async (arg) => {
+            const keep = arg.seatFields;
+            const slim = (data) => {
+                if (!keep || !data || !data.data) return data;
+                const items = data.data.items;
+                if (!Array.isArray(items)) return data;
+                for (const item of items) {
+                    if (!Array.isArray(item.seats)) continue;
+                    item.seats = item.seats.map((s) => {
+                        const out = {};
+                        for (const k of keep) if (k in s) out[k] = s[k];
+                        return out;
+                    });
+                }
+                return data;
+            };
+            return Promise.all(arg.paths.map(async (p) => {
+                try {
+                    const res = await fetch(p, {headers: {'accept': 'application/json'}});
+                    const text = await res.text();
+                    if (res.status !== 200) return {status: res.status};
+                    let data;
+                    try { data = JSON.parse(text); }
+                    catch (e) { return {status: 200, bad: text.slice(0, 120)}; }
+                    return {status: 200, json: slim(data)};
+                } catch (e) {
+                    return {status: 0, error: String(e)};
+                }
+            }));
+        }"""
+
+        out: list[dict | None] = []
+        for start in range(0, len(paths), SEAT_MAP_BATCH):
+            chunk = paths[start:start + SEAT_MAP_BATCH]
+            self.requests += len(chunk)
+            try:
+                results = self._page.evaluate(
+                    script, {"paths": chunk, "seatFields": seat_fields})
+            except Exception as exc:  # noqa: BLE001 - 통째로 실패하면 전부 개별로
+                log.warning("좌석 데이터를 묶어 받지 못했습니다 (%s) — "
+                            "하나씩 받습니다", exc)
+                out.extend([None] * len(chunk))
+                continue
+            for path, item in zip(chunk, results):
+                out.append(self._one_of_many(path, item))
+        return out
+
+    @staticmethod
+    def _one_of_many(path: str, item: dict | None) -> dict | None:
+        """묶음 결과 하나를 get_json과 같은 기준으로 판정한다. 실패하면 None.
+
+        401도 None으로 돌려준다 — 개별 경로가 다시 받으면서 AuthRequired를 내고,
+        복구는 지금처럼 거기서 한다.
+        """
+        if not item:
+            return None
+        if item.get("status") != 200 or "json" not in item:
+            return None
+        payload = item["json"]
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("statusCode") not in (0, "0", None):
+            log.debug("%s: API 오류 %s", path.split("?")[0],
+                      payload.get("statusMessage"))
+            return None
+        return payload
 
     # ── 개별 조회 ──
     def bookable_movies(self) -> list[dict]:

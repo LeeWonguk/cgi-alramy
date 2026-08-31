@@ -564,30 +564,61 @@ def booking_url(mov_no: str, site_no: str, site_nm: str, scn_ymd: str) -> str:
         "movNo": mov_no, "siteNo": site_no, "siteNm": site_nm, "scnYmd": scn_ymd})
 
 
+# 날짜 스트립의 상태를 **한 번에** 읽는다.
+#
+# 예전에는 노드마다 왕복했다: locator().all() → is_visible() 24번 →
+# get_attribute("class") 12번 → text_content(). 스와이퍼가 숨김 사본을 한 벌 더
+# 만들어 두므로 버튼이 24개고, 왕복 40번쯤이 한 번의 판정에 들어갔다. 실제
+# CGV 화면은 무거워서 배포에서 이 판정 하나가 783ms였다(프리워밍 6회에 4.7초).
+#
+# 같은 것을 evaluate 한 번으로 읽으면 로컬 실측 69.6ms → 2.2ms(31배)다.
+_DATE_STATE_JS = r"""(arg) => {
+  const vis = (e) => e.offsetWidth || e.offsetHeight;
+  // 셀렉터를 콤마로 묶어 한 번에 찾는다. querySelectorAll이 노드를 중복 없이
+  // 돌려주므로, 예전처럼 후보를 순서대로 훑을 필요가 없다.
+  const days = [...document.querySelectorAll(arg.daySel)].filter(vis);
+  const num = (b) => {
+    const n = b.querySelector(arg.numSel);
+    return n ? (n.textContent || '').trim() : '';
+  };
+  return {
+    url: location.href,
+    // 회차 목록이 그려졌는지. 화면준비 판정이 이것과 날짜를 함께 본다.
+    showtimes: arg.showSel ? document.querySelectorAll(arg.showSel).length : 0,
+    days: days.length,
+    actives: days.filter((b) => String(b.className || '').includes(arg.activeMark))
+                 .map(num),
+  };
+}"""
+
+
+def _date_state(page, *, with_showtimes: bool = False) -> dict | None:
+    """화면 상태 {url, showtimes, days, actives}. 못 읽으면 None."""
+    try:
+        return page.evaluate(_DATE_STATE_JS, {
+            "daySel": ", ".join(DATE_BUTTON_SELECTORS),
+            "numSel": DATE_NUMBER_SELECTOR,
+            "activeMark": DATE_ACTIVE_MARK,
+            "showSel": ", ".join(SHOWTIME_SELECTORS) if with_showtimes else "",
+        })
+    except Exception:  # noqa: BLE001 - 갈아 끼우는 중이면 확인 불가로 본다
+        return None
+
+
 def _date_is_selected(page, wanted: list[str]) -> bool | None:
     """날짜 스트립에서 원하는 날이 활성인지. 확인할 수 없으면 None.
 
     `_assert_date_selected`와 달리 예외를 내지 않는다 — 딥링크가 먹었는지 보고
     아니면 예전 클릭 경로로 되돌아가야 하므로, 판정만 돌려준다.
+
+    **세 값의 뜻이 다르다.** True는 그 날짜가 골라져 있다는 것, False는 다른
+    날짜가 골라져 있다는 것, None은 확인할 수 없다는 것이다(활성 표시를 못 찾음).
+    딥링크 성공 판정이 여기 달려 있어서 셋을 뭉개면 안 된다.
     """
-    for selector in DATE_BUTTON_SELECTORS:
-        try:
-            actives = [b for b in _visible(page.locator(selector).all())
-                       if DATE_ACTIVE_MARK in (b.get_attribute("class") or "")]
-        except Exception:  # noqa: BLE001 - 다음 후보 셀렉터로
-            continue
-        if not actives:
-            continue
-        for button in actives:
-            try:
-                text = (button.locator(DATE_NUMBER_SELECTOR).first
-                        .text_content() or "").strip()
-            except Exception:  # noqa: BLE001
-                continue
-            if text in wanted:
-                return True
-        return False
-    return None
+    state = _date_state(page)
+    if not state or not state.get("actives"):
+        return None                     # 활성 표시가 없다 — 확인 불가
+    return any(text in wanted for text in state["actives"])
 
 
 def warm_key(ctx: dict) -> str:
@@ -634,14 +665,18 @@ def _already_on_booking(page, ctx: dict) -> bool:
     CGV가 화면을 되돌렸을 수도 있다. 회차 목록이 떠 있고 날짜가 그 날짜로 골라져
     있을 때만 '준비됐다'고 본다.
     """
-    try:
-        if BOOKING_PAGE not in (page.url or ""):
-            return False
-        if page.locator(", ".join(SHOWTIME_SELECTORS)).count() == 0:
-            return False
-        return _date_is_selected(page, date_labels(ctx["scn_ymd"])) is True
-    except Exception:  # noqa: BLE001 - 못 읽으면 준비 안 된 것으로 본다
+    # 주소·회차 목록·날짜를 evaluate **한 번**에 읽는다. 이 판정은 자동 예매를
+    # 켠 감시마다 매 사이클 도는 자리라, 노드마다 왕복하면 그게 곧 사이클
+    # 길이가 된다(배포 실측 783ms → 프리워밍 6회에 4.7초).
+    state = _date_state(page, with_showtimes=True)
+    if not state:
         return False
+    if BOOKING_PAGE not in (state.get("url") or ""):
+        return False
+    if not state.get("showtimes"):
+        return False
+    wanted = date_labels(ctx["scn_ymd"])
+    return any(text in wanted for text in state.get("actives") or [])
 
 
 def _open_booking_direct(page, ctx: dict) -> bool:
@@ -721,19 +756,10 @@ def _assert_date_selected(page, wanted: list[str], scn_ymd: str) -> None:
     클릭이 먹지 않았는데 그대로 밀고 나가면 오늘 상영표에서 회차를 고르게 된다 —
     선점까지 성공하면 되돌리기 어려우므로 여기서 끊는다.
     """
-    for selector in DATE_BUTTON_SELECTORS:
-        actives = [b for b in _visible(page.locator(selector).all())
-                   if DATE_ACTIVE_MARK in (b.get_attribute("class") or "")]
-        if not actives:
-            continue
-        for button in actives:
-            try:
-                text = (button.locator(DATE_NUMBER_SELECTOR).first
-                        .text_content() or "").strip()
-            except Exception:  # noqa: BLE001
-                continue
-            if text in wanted:
-                return
+    verdict = _date_is_selected(page, wanted)
+    if verdict is True:
+        return
+    if verdict is False:
         raise RuntimeError(
             f"{scn_ymd} 날짜가 선택되지 않았습니다 — 화면은 다른 날짜를 "
             f"보고 있습니다. 엉뚱한 날짜를 선점하지 않도록 멈춥니다.")
