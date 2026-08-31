@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -546,6 +547,110 @@ class TestCatalogCacheExpiry(unittest.TestCase):
         watch.store.catalog_refreshed_at = boom
         self.addCleanup(setattr, watch.store, "catalog_refreshed_at", real)
         self.assertIsNone(watch.Catalog._db_cache("movie"))
+
+
+class TestStaggeredChecking(unittest.TestCase):
+    """상영이 먼 감시는 몇 바퀴에 한 번만 본다.
+
+    사이클을 11.8초에서 2.2초로 줄였더니 폴링 3초와 겹쳐 요청이 초당 3.4건에서
+    13.7건이 됐고 CGV가 429로 거절했다. 회차 41건을 매 바퀴 전부 보는 한
+    12초보다 빨리 돌 수 없다 — 한계가 우리 쪽이 아니라 상대 쪽이다.
+
+    급한 것과 안 급한 것이 섞여 있다. 내일 상영은 취소표가 초 단위로 나가지만
+    닷새 뒤 상영을 3초마다 볼 이유는 없다.
+    """
+
+    TODAY = date(2026, 8, 31)
+
+    def setUp(self):
+        self.addCleanup(setattr, seats, "_pressure", seats._pressure)
+        self.addCleanup(setattr, seats, "_quiet", seats._quiet)
+        seats._pressure = 0
+        seats._quiet = 0
+
+    def test_near_dates_are_checked_every_cycle(self):
+        for ymd in ("20260831", "20260901"):
+            self.assertEqual(seats.check_every(ymd, self.TODAY), 1, ymd)
+
+    def test_far_dates_are_checked_less_often(self):
+        self.assertGreater(seats.check_every("20260903", self.TODAY), 1)
+        self.assertGreater(seats.check_every("20260905", self.TODAY),
+                           seats.check_every("20260903", self.TODAY))
+
+    def test_an_unreadable_date_is_checked_every_cycle(self):
+        """모르는 것을 덜 보는 쪽으로 기울면 놓친다."""
+        for bad in ("", "abc", "2026", None):
+            self.assertEqual(seats.check_every(bad, self.TODAY), 1, repr(bad))
+
+    def test_a_past_date_is_still_urgent(self):
+        # 지난 날짜는 남은 날이 음수다 — 가장 가까운 칸에 걸려야 한다.
+        self.assertEqual(seats.check_every("20260825", self.TODAY), 1)
+
+    def test_watches_of_the_same_cadence_do_not_bunch_up(self):
+        """같은 주기의 감시가 한 바퀴에 몰리면 평균이 낮아도 그 순간은 몰린다.
+
+        429를 부른 게 바로 그 몰림이었다.
+        """
+        ws = [{"id": i, "scn_ymd": "20260905"} for i in range(1, 13)]
+        per_cycle = [sum(1 for w in ws if seats.due_this_cycle(w, t, self.TODAY))
+                     for t in range(1, 25)]
+        self.assertLess(max(per_cycle), len(ws),
+                        "한 바퀴에 전부 몰렸다 — 위상이 안 흩어졌다")
+
+    def test_every_watch_is_eventually_checked(self):
+        """미루는 것과 빠뜨리는 것은 다르다."""
+        ws = [{"id": i, "scn_ymd": "20260905"} for i in range(1, 13)]
+        seen = set()
+        for t in range(1, 200):
+            seen.update(w["id"] for w in ws
+                        if seats.due_this_cycle(w, t, self.TODAY))
+        self.assertEqual(seen, {w["id"] for w in ws})
+
+
+class TestAdaptivePressure(unittest.TestCase):
+    """한계를 추측하지 않고 맞춰 간다.
+
+    안전한 값을 미리 정해 두면 실제 한계가 그보다 높을 때 공연히 덜 보게 되고,
+    낮을 때는 계속 거절당한다.
+    """
+
+    TODAY = date(2026, 8, 31)
+
+    def setUp(self):
+        self.addCleanup(setattr, seats, "_pressure", seats._pressure)
+        self.addCleanup(setattr, seats, "_quiet", seats._quiet)
+        seats._pressure = 0
+        seats._quiet = 0
+
+    def test_being_refused_slows_everything_down(self):
+        before = seats.check_every("20260901", self.TODAY)
+        seats._raise_pressure()
+        self.assertGreater(seats.check_every("20260901", self.TODAY), before)
+
+    def test_pressure_has_a_ceiling(self):
+        for _ in range(seats.PRESSURE_MAX + 5):
+            seats._raise_pressure()
+        self.assertEqual(seats._pressure, seats.PRESSURE_MAX)
+
+    def test_quiet_cycles_bring_it_back(self):
+        """눌린 채로 남으면 정작 상영일이 다가왔을 때 느리다."""
+        seats._raise_pressure()
+        raised = seats._pressure
+        for _ in range(seats.PRESSURE_EASE_AFTER):
+            seats._ease_pressure()
+        self.assertLess(seats._pressure, raised)
+
+    def test_easing_does_not_go_below_normal(self):
+        for _ in range(seats.PRESSURE_EASE_AFTER * 3):
+            seats._ease_pressure()
+        self.assertEqual(seats._pressure, 0)
+
+    def test_a_refusal_resets_the_quiet_run(self):
+        # 조용했다가 다시 거절당하면 처음부터 세야 한다.
+        for _ in range(seats.PRESSURE_EASE_AFTER - 1):
+            seats._ease_pressure()
+        seats._raise_pressure()
+        self.assertEqual(seats._quiet, 0)
 
 
 class TestSeatFieldsAreEnough(unittest.TestCase):

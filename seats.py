@@ -461,6 +461,93 @@ SEAT_FIELDS = [
 ]
 
 
+# 상영일이 얼마나 남았느냐에 따라 몇 사이클에 한 번 볼지. (남은 날, 주기)를
+# 가까운 것부터 적는다.
+#
+# **왜 차등을 두는가.** 사이클을 11.8초에서 2.2초로 줄였더니 폴링 3초와 겹쳐
+# 요청이 초당 3.4건에서 13.7건이 됐고 CGV가 429로 거절했다. 회차 41건을 매
+# 사이클 보는 한 12초보다 빨리 돌 수 없다 — 우리 쪽이 아니라 상대 쪽이 한계다.
+#
+# 그런데 급한 것과 안 급한 것이 섞여 있다. 내일 상영은 취소표가 초 단위로
+# 나가지만, 닷새 뒤 상영을 3초마다 볼 이유는 없다. 가까운 것에 예산을 몰아준다.
+SEAT_CHECK_CADENCE = ((1, 1), (3, 3))   # 1일 이내 매번 · 3일 이내 3번에 한 번
+SEAT_CHECK_FAR = 6                      # 그보다 멀면 6번에 한 번
+
+# 몇 번째 바퀴인지. 차등 확인의 위상을 정하는 데만 쓴다.
+_tick = 0
+
+# CGV가 거절할 때마다 올라가는 압력. 주기 전체에 곱해져 모든 감시가 함께
+# 느려진다. **한계를 추측하지 않고 맞춰 간다** — 안전한 값을 미리 정해 두면
+# 실제 한계가 그보다 높을 때 공연히 덜 보게 되고, 낮을 때는 계속 거절당한다.
+#
+# 429가 없는 바퀴가 이어지면 다시 내려간다. 상영일이 다가오면 확인이 촘촘해져야
+# 하는데 한 번 눌린 채로 남으면 정작 급할 때 느리다.
+_pressure = 0
+PRESSURE_MAX = 4
+PRESSURE_EASE_AFTER = 40        # 조용한 바퀴가 이만큼 이어지면 한 단계 내린다
+_quiet = 0
+
+
+def _raise_pressure() -> None:
+    """거절당했다 — 모든 확인 주기를 한 단계 늦춘다."""
+    global _pressure, _quiet
+    _quiet = 0
+    if _pressure < PRESSURE_MAX:
+        _pressure += 1
+        import watch
+        watch.log.warning("확인 주기를 %d배로 늦춥니다 (CGV 요청 제한)",
+                          1 + _pressure)
+
+
+def _ease_pressure() -> None:
+    """조용한 바퀴가 이어지면 한 단계 되돌린다."""
+    global _pressure, _quiet
+    if _pressure <= 0:
+        return
+    _quiet += 1
+    if _quiet >= PRESSURE_EASE_AFTER:
+        _quiet = 0
+        _pressure -= 1
+        import watch
+        watch.log.info("확인 주기를 %d배로 되돌립니다", 1 + _pressure)
+
+
+def check_every(scn_ymd: str, today=None) -> int:
+    """이 상영일을 몇 사이클에 한 번 볼지. 1이면 매 사이클.
+
+    날짜를 못 읽으면 1을 준다 — 모르는 것을 덜 보는 쪽으로 기울면 놓친다.
+    """
+    from datetime import date as _date
+
+    digits = "".join(ch for ch in (scn_ymd or "") if ch.isdigit())
+    if len(digits) != 8:
+        return 1
+    try:
+        target = _date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+    except ValueError:
+        return 1
+    days = (target - (today or _date.today())).days
+    base = SEAT_CHECK_FAR
+    for limit, every in SEAT_CHECK_CADENCE:
+        if days <= limit:
+            base = every
+            break
+    return base * (1 + _pressure)
+
+
+def due_this_cycle(w: dict, tick: int, today=None) -> bool:
+    """이번 사이클에 이 감시를 볼 차례인지.
+
+    감시 id로 위상을 흩어 둔다. 안 그러면 같은 주기의 감시가 전부 같은 사이클에
+    몰려, 평균은 낮아도 그 순간의 요청이 그대로 몰린다 — 429를 부른 게 바로
+    그 몰림이었다.
+    """
+    every = check_every(w.get("scn_ymd", ""), today)
+    if every <= 1:
+        return True
+    return (tick + int(w.get("id") or 0)) % every == 0
+
+
 def rows_to_check(w: dict, schedule: list[dict]) -> list[dict]:
     """이 감시가 실제로 좌석을 볼 회차들.
 
@@ -619,9 +706,14 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
     # 같은 경고가 찍혀(35건이면 35줄) 정작 무슨 일인지 안 보인다.
     left = session.throttled_for()
     if left > 0:
+        _raise_pressure()
         watch.log.info("CGV 요청 제한으로 이번 바퀴는 건너뜁니다 (%.0f초 남음)",
                        left)
         return summary
+    _ease_pressure()
+
+    global _tick
+    _tick += 1
 
     catalog = watch.Catalog(session)
     cost = _CycleCost()
@@ -635,11 +727,19 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
     warmed: set[str] = set()
 
     by_owner: dict[int, list[dict]] = {}
+    skipped = 0
     for w in watches:
         if w["owner_id"] is None:
             # 주인 없는 좌석 감시는 로그인할 계정이 없어 확인할 수 없다.
             continue
+        # 상영이 먼 감시는 몇 바퀴에 한 번만 본다. 매 바퀴 전부 보면 요청이
+        # 몰려 CGV가 429로 거절한다 — 급한 것에 예산을 몰아준다.
+        if not due_this_cycle(w, _tick):
+            skipped += 1
+            continue
         by_owner.setdefault(w["owner_id"], []).append(w)
+    if skipped:
+        cost.hit(f"미룸 {skipped}건")
 
     for owner_id, group in by_owner.items():
         # 이 소유자의 공간으로 옮긴다. 컨텍스트가 갈려 있어 로그인도 예매 탭도
