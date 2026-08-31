@@ -540,6 +540,9 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
         by_owner.setdefault(w["owner_id"], []).append(w)
 
     for owner_id, group in by_owner.items():
+        # 이 소유자의 공간으로 옮긴다. 컨텍스트가 갈려 있어 로그인도 예매 탭도
+        # 각자 유지된다 — 예전처럼 쿠키를 비우고 다시 로그인하지 않는다.
+        session.use(owner_id)
         if not cgv_login.ensure_logged_in(owner_id, session):
             for w in group:
                 if not dry_run:

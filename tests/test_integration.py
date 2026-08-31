@@ -722,6 +722,91 @@ class FakeCookieJar:
             self.jar[c["name"]] = c["value"]
 
 
+class TestOwnerSpacesAreIsolated(unittest.TestCase):
+    """소유자마다 BrowserContext를 따로 둔다 — 브라우저 없이 구조만 시험한다.
+
+    예전에는 컨텍스트가 하나뿐이라 사용자가 둘이면 사이클마다 쿠키를 비우고
+    다시 로그인했고, 그때마다 **미리 띄워 둔 예매 탭을 전부 닫아야 했다**
+    (앞사람 화면으로 선점하면 안 되므로). 그래서 사용자가 둘 이상이면
+    프리워밍이 한 번도 살아남지 못하고 선점마다 딥링크 6.2초를 다시 물었다.
+    """
+
+    def make_session(self):
+        """_new_space만 가짜로 바꾼 세션. 나머지 로직은 진짜 것을 쓴다."""
+        session = watch.CgvSession.__new__(watch.CgvSession)
+        session._spaces = watch.OrderedDict()
+        session._current = None
+        session._browser = object()          # 열려 있는 것처럼
+        made = []
+
+        def new_space():
+            page = type("P", (), {"evaluate": lambda self, s: 1})()
+            page.context = FakeCookieJar()
+            space = watch._OwnerSpace(page.context, page)
+            made.append(space)
+            return space
+
+        session._new_space = new_space
+        session._spaces[None] = new_space()
+        return session, made
+
+    def test_each_owner_gets_its_own_space(self):
+        s, made = self.make_session()
+        s.use(1)
+        s.use(2)
+        self.assertEqual(len(s._spaces), 3, "기본 공간 + 소유자 둘")
+        self.assertIsNot(s._spaces[1], s._spaces[2])
+
+    def test_switching_back_keeps_the_prewarmed_tabs(self):
+        """이게 이 변경의 핵심이다 — 전환이 프리워밍을 죽이지 않아야 한다."""
+        s, _ = self.make_session()
+        s.use(1)
+        s._space.booking_pages["a"] = object()
+        s.use(2)
+        self.assertEqual(len(s._space.booking_pages), 0, "새 공간은 비어 있다")
+        s.use(1)
+        self.assertEqual(len(s._space.booking_pages), 1, "돌아오니 탭이 사라졌다")
+
+    def test_the_login_owner_is_per_space(self):
+        s, _ = self.make_session()
+        s.use(1)
+        s.mark_logged_in(1)
+        s.use(2)
+        self.assertIsNone(s.logged_in_owner, "남의 공간 주인이 새어 나왔다")
+        s.use(1)
+        self.assertEqual(s.logged_in_owner, 1)
+
+    def test_marking_the_wrong_owner_is_refused(self):
+        """공간을 안 고르고 로그인하면 남의 계정으로 선점하게 된다 — 막는다."""
+        s, _ = self.make_session()
+        s.use(1)
+        s.mark_logged_in(1)
+        with self.assertRaises(RuntimeError) as caught:
+            s.mark_logged_in(2)          # use(2) 없이
+        self.assertIn("use(2)", str(caught.exception))
+
+    def test_reusing_the_same_owner_costs_nothing(self):
+        s, made = self.make_session()
+        s.use(1)
+        before = len(made)
+        for _ in range(10):
+            s.use(1)
+        self.assertEqual(len(made), before, "같은 공간인데 다시 만들었다")
+
+    def test_spaces_do_not_pile_up_forever(self):
+        s, _ = self.make_session()
+        for owner in range(1, watch.OWNER_SPACE_LIMIT + 4):
+            s.use(owner)
+        self.assertLessEqual(len(s._spaces), watch.OWNER_SPACE_LIMIT)
+
+    def test_the_default_space_is_never_evicted(self):
+        """로그인 없는 일(날짜 감시)이 쓰는 공간이다 — 닫으면 매번 홈부터 연다."""
+        s, _ = self.make_session()
+        for owner in range(1, watch.OWNER_SPACE_LIMIT + 4):
+            s.use(owner)
+        self.assertIn(None, s._spaces)
+
+
 class FakeSession:
     """브라우저 없는 CgvSession.
 
@@ -736,11 +821,17 @@ class FakeSession:
     clear_session_cookies = watch.CgvSession.clear_session_cookies
     session_tokens = watch.CgvSession.session_tokens
     restore_tokens = watch.CgvSession.restore_tokens
+    # 소유자 공간을 거쳐 풀리는 값들도 진짜 것을 빌린다 — 흉내내면 정작
+    # 검증하려던 격리가 테스트에서 빠져나간다.
+    _page = watch.CgvSession._page
+    logged_in_owner = watch.CgvSession.logged_in_owner
 
     def __init__(self) -> None:
-        self.logged_in_owner = None
-        self._page = type("P", (), {})()
-        self._page.context = FakeCookieJar()
+        page = type("P", (), {})()
+        page.context = FakeCookieJar()
+        # 진짜와 같은 모양의 공간 하나. use()를 부르지 않고 들어오는 경로를
+        # 흉내내는 셈이라, cgv_login의 안전망(_detach)이 그대로 시험된다.
+        self._space = watch._OwnerSpace(page.context, page)
         self.logins: list[str] = []
         self.refresh_ok = False
 

@@ -103,6 +103,12 @@ FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 웹훅 경고
 # 예매 화면을 미리 띄워 둘 탭의 최대 개수. 자동 예매를 켠 감시가 날짜별로 여럿이어도
 # 몇 개면 충분하고, 탭마다 CGV 화면 하나가 통째로 살아 있으므로 무한정 늘리지 않는다.
 BOOKING_PAGE_LIMIT = 4
+
+# 동시에 살려 둘 소유자 공간(BrowserContext)의 최대 개수. 컨텍스트는 브라우저
+# 프로세스를 공유하므로 탭 몇 개보다 조금 무거운 정도지만, 사용자가 늘어도
+# 무한정 쌓이면 안 된다. 넘치면 가장 오래 안 쓴 쪽을 닫고, 그 소유자는 다음
+# 차례에 다시 만들어 로그인한다(= 지금과 같은 비용으로 되돌아갈 뿐이다).
+OWNER_SPACE_LIMIT = 4
 WEEKDAYS = "월화수목금토일"
 
 log = logging.getLogger("cgv-watch")
@@ -182,29 +188,57 @@ class AuthRequired(RuntimeError):
     """
 
 
+class _OwnerSpace:
+    """소유자 한 명의 작업 공간 — BrowserContext 하나와 그 안의 탭들.
+
+    **왜 소유자마다 컨텍스트를 따로 두는가.** 예전에는 컨텍스트가 하나뿐이라,
+    사용자가 둘이면 사이클마다 쿠키를 비우고 다시 로그인하기를 반복했다. 값이
+    비싼 건 로그인만이 아니다 — 주인이 바뀔 때마다 **미리 띄워 둔 예매 탭을 전부
+    닫아야 했다**(앞사람 화면으로 선점하면 안 되므로). 그래서 사용자가 둘 이상이면
+    프리워밍이 한 번도 살아남지 못하고, 선점마다 딥링크 6.2초를 다시 물었다.
+
+    컨텍스트는 쿠키 저장소가 서로 분리돼 있다. 그래서 공간을 나누면 로그인이
+    각자 유지되고, 탭도 각자 살아 있고, **남의 계정으로 선점할 여지 자체가
+    구조적으로 없어진다** — 규율이 아니라 격리로 막는다.
+    """
+
+    def __init__(self, context, page):
+        self.context = context
+        self.page = page
+        # 이 공간이 누구의 CGV 계정으로 로그인돼 있는지. 값을 넣는 곳은
+        # cgv_login 하나뿐이다(mark_logged_in).
+        self.logged_in_owner: int | None = None
+        # 예매 화면을 미리 띄워 둔 탭들 (키: 영화·극장·날짜).
+        self.booking_pages: "OrderedDict[str, object]" = OrderedDict()
+
+    def close(self) -> None:
+        try:
+            self.context.close()        # 안의 탭들도 함께 닫힌다
+        except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
+            pass
+        self.booking_pages.clear()
+
+
 class CgvSession:
     """Chromium을 띄워 CGV 내부 API를 호출하는 세션.
 
     Cloudflare 쿠키를 얻기 위해 먼저 홈페이지를 방문하고, 이후 요청은
     페이지 컨텍스트 안에서 same-origin fetch로 보낸다.
+
+    브라우저는 하나지만 **작업 공간은 소유자마다 따로** 둔다(_OwnerSpace).
+    use(owner_id)로 공간을 고르면 그 뒤의 모든 호출이 그 공간에서 일어난다.
     """
 
     def __init__(self, headless: bool = True):
         self._headless = headless
         self._pw = None
         self._browser = None
-        self._page = None
+        # 소유자별 작업 공간. 키는 owner_id(로그인이 필요 없는 일은 None).
+        # 가장 오래 안 쓴 것부터 닫으려고 순서를 지키는 dict를 쓴다.
+        self._spaces: "OrderedDict[int | None, _OwnerSpace]" = OrderedDict()
+        self._current: int | None = None
         self.requests = 0  # 사이클당 CGV 요청 수 — 대시보드에서 부하를 본다
         self.opened_at: datetime | None = None
-        # 지금 이 브라우저가 **누구의** CGV 계정으로 로그인돼 있는지.
-        # 쿠키는 컨텍스트 하나에 얹히고 세션은 수십 분을 상주하는데, 사용자가
-        # 여럿이면 A의 쿠키가 남은 채로 B의 좌석을 보게 된다 — 자동 예매까지
-        # A 계정으로 나간다. 쿠키의 '존재'가 아니라 '주인'을 봐야 한다.
-        # 값을 넣는 곳은 cgv_login 하나뿐이다(mark_logged_in).
-        self.logged_in_owner: int | None = None
-        # 예매 화면을 미리 띄워 둔 탭들 (키: 영화·극장·날짜). 오래된 것부터
-        # 닫으려고 순서를 지키는 dict를 쓴다.
-        self._booking_pages: "OrderedDict[str, object]" = OrderedDict()
 
     def __enter__(self) -> "CgvSession":
         from playwright.sync_api import sync_playwright
@@ -218,19 +252,35 @@ class CgvSession:
             args.insert(0, "--headless=new")
 
         self._browser = self._pw.chromium.launch(headless=False, args=args)
+        try:
+            self._spaces[None] = self._new_space()
+        except Exception as exc:  # noqa: BLE001
+            self.__exit__(None, None, None)
+            raise RuntimeError(f"CGV 접속 실패: {exc}") from exc
+        self._current = None
+        self.opened_at = datetime.now().astimezone()
+        return self
+
+    def _new_space(self) -> "_OwnerSpace":
+        """컨텍스트를 새로 만들고 CGV 홈을 한 번 방문한다.
+
+        **홈 방문을 건너뛸 수 없다.** 컨텍스트는 쿠키가 비어 있어 Cloudflare
+        통과 흔적이 없고, 그 상태로 API를 부르면 403이 떨어진다. 공간을 만들
+        때 딱 한 번 무는 비용이다.
+        """
+        if self._browser is None:
+            raise RuntimeError("세션이 열려 있지 않습니다")
         context = self._browser.new_context(locale="ko-KR", user_agent=CHROME_UA)
-        self._page = context.new_page()
+        page = context.new_page()
 
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                resp = self._page.goto(
-                    BASE_URL, wait_until="domcontentloaded", timeout=45_000
-                )
+                resp = page.goto(BASE_URL, wait_until="domcontentloaded",
+                                 timeout=45_000)
                 if resp and resp.status == 200:
                     log.debug("CGV 홈 접속 성공 (%d번째 시도)", attempt + 1)
-                    self.opened_at = datetime.now().astimezone()
-                    return self
+                    return _OwnerSpace(context, page)
                 last_exc = RuntimeError(
                     f"CGV 홈 응답 코드 {resp.status if resp else 'None'}"
                 )
@@ -239,10 +289,69 @@ class CgvSession:
             log.warning("CGV 홈 접속 실패 (%d/3): %s", attempt + 1, last_exc)
             time.sleep(2 * (attempt + 1))
 
-        self.__exit__(None, None, None)
-        raise RuntimeError(f"CGV 접속 실패: {last_exc}")
+        try:
+            context.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"{last_exc}")
+
+    # ── 소유자별 공간 ────────────────────────────────────────────────────
+    def use(self, owner_id: int | None) -> None:
+        """이 뒤의 호출을 그 소유자의 공간에서 한다. 없으면 만든다.
+
+        이미 그 공간이면 아무 일도 하지 않는다 — 사이클마다 불리는 자리라
+        '바꾸지 않는 전환'이 공짜여야 한다.
+        """
+        if self._current == owner_id and owner_id in self._spaces:
+            return
+        space = self._spaces.get(owner_id)
+        if space is not None:
+            try:
+                space.page.evaluate("() => 1")      # 살아 있는지 확인
+                self._spaces.move_to_end(owner_id)
+                self._current = owner_id
+                return
+            except Exception:  # noqa: BLE001 - 죽었으면 새로 만든다
+                space.close()
+                self._spaces.pop(owner_id, None)
+
+        # 넘치면 가장 오래 안 쓴 것부터 닫는다. 기본 공간(None)은 로그인 없는
+        # 일들이 쓰므로 남긴다 — 이걸 닫으면 날짜 감시가 매번 홈부터 다시 연다.
+        while len(self._spaces) >= OWNER_SPACE_LIMIT:
+            victim = next((k for k in self._spaces if k is not None), None)
+            if victim is None:
+                break
+            log.info("소유자 공간이 가득 차 owner %s의 것을 닫습니다", victim)
+            self._spaces.pop(victim).close()
+
+        self._spaces[owner_id] = self._new_space()
+        self._current = owner_id
+
+    @property
+    def _space(self) -> "_OwnerSpace":
+        space = self._spaces.get(self._current)
+        if space is None:
+            raise RuntimeError("세션이 열려 있지 않습니다")
+        return space
+
+    @property
+    def _page(self):
+        """지금 공간의 기본 페이지. 예전 코드가 그대로 쓰도록 이름을 지킨다."""
+        return self._space.page
+
+    @property
+    def logged_in_owner(self) -> int | None:
+        return self._space.logged_in_owner
+
+    @logged_in_owner.setter
+    def logged_in_owner(self, value: int | None) -> None:
+        self._space.logged_in_owner = value
 
     def __exit__(self, *_exc) -> None:
+        for space in self._spaces.values():
+            space.close()
+        self._spaces.clear()
+        self._current = None
         for closer in (self._browser, self._pw):
             if closer is None:
                 continue
@@ -250,8 +359,7 @@ class CgvSession:
                 closer.close() if closer is self._browser else closer.stop()
             except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
                 pass
-        self._booking_pages.clear()
-        self._browser = self._pw = self._page = None
+        self._browser = self._pw = None
 
     @property
     def page(self):
@@ -271,40 +379,43 @@ class CgvSession:
         좌석 확인은 이 탭이 아니라 기본 페이지에서 fetch로 하므로(get_json), 탭을
         띄워 둬도 감시에는 영향이 없다.
         """
-        if self._browser is None or self._page is None:
-            raise RuntimeError("세션이 열려 있지 않습니다")
-        page = self._booking_pages.get(key)
+        space = self._space
+        tabs = space.booking_pages
+        page = tabs.get(key)
         if page is not None:
             try:
                 page.evaluate("() => 1")           # 살아 있는지 확인
-                self._booking_pages.move_to_end(key)
+                tabs.move_to_end(key)
                 return page
             except Exception:  # noqa: BLE001 - 닫혔으면 새로 연다
-                self._booking_pages.pop(key, None)
+                tabs.pop(key, None)
         # 탭이 무한정 늘지 않게 오래된 것부터 닫는다. 자동 예매를 켠 감시가
-        # 날짜별로 여럿이어도 몇 개면 충분하다.
-        while len(self._booking_pages) >= BOOKING_PAGE_LIMIT:
-            _, old = self._booking_pages.popitem(last=False)
+        # 날짜별로 여럿이어도 몇 개면 충분하다. 이 한도는 **소유자마다** 따로다.
+        while len(tabs) >= BOOKING_PAGE_LIMIT:
+            _, old = tabs.popitem(last=False)
             try:
                 old.close()
             except Exception:  # noqa: BLE001 - 이미 닫혔을 수 있다
                 pass
-        page = self._page.context.new_page()
-        self._booking_pages[key] = page
+        page = space.context.new_page()
+        tabs[key] = page
         return page
 
     def close_booking_pages(self) -> None:
-        """미리 띄워 둔 예매 탭을 모두 닫는다.
+        """지금 공간에 미리 띄워 둔 예매 탭을 모두 닫는다.
 
-        **로그인 주인이 바뀔 때 반드시 부른다.** 그 탭들은 앞사람의 화면이라,
-        그대로 두면 남의 계정으로 선점하게 된다.
+        예전에는 **로그인 주인이 바뀔 때마다** 이걸 불러야 했다 — 컨텍스트가
+        하나뿐이라 그 탭들이 앞사람의 화면이었기 때문이다. 지금은 공간이 소유자
+        단위로 갈려 있어 그럴 일이 없고, 이 함수는 한 소유자의 화면을 일부러
+        버릴 때만 쓴다.
         """
-        for page in self._booking_pages.values():
+        tabs = self._space.booking_pages
+        for page in tabs.values():
             try:
                 page.close()
             except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
                 pass
-        self._booking_pages.clear()
+        tabs.clear()
 
     def is_alive(self) -> bool:
         """페이지가 아직 살아 있는지. 브라우저 상주 중 크래시를 감지하는 데 쓴다."""
@@ -408,14 +519,21 @@ class CgvSession:
         return self.logged_in_owner == owner_id and self.logged_in()
 
     def mark_logged_in(self, owner_id: int) -> None:
-        """지금 얹힌 로그인 쿠키의 주인을 기록한다 (cgv_login 전용).
+        """지금 공간에 얹힌 로그인 쿠키의 주인을 기록한다 (cgv_login 전용).
 
-        주인이 바뀌면 **미리 띄워 둔 예매 탭을 모두 닫는다.** 그 탭들은 앞사람의
-        화면이라, 그대로 두면 남의 계정으로 선점하게 된다.
+        예전에는 여기서 주인이 바뀌면 예매 탭을 전부 닫았다. 컨텍스트가 하나라
+        그 탭들이 앞사람 화면이었기 때문인데, 그 바람에 사용자가 둘 이상이면
+        프리워밍이 한 번도 살아남지 못했다. 지금은 공간이 소유자마다 따로라
+        **남의 화면이 섞일 수 없어** 그럴 필요가 없다.
+
+        공간을 잘못 고른 채 부르는 것만은 막는다 — 그건 격리가 깨졌다는 뜻이다.
         """
-        if self.logged_in_owner is not None and self.logged_in_owner != owner_id:
-            self.close_booking_pages()
-        self.logged_in_owner = owner_id
+        current = self._space.logged_in_owner
+        if current is not None and current != owner_id:
+            raise RuntimeError(
+                f"owner {current}의 공간에 owner {owner_id}로 로그인하려 합니다 "
+                f"— use({owner_id})를 먼저 불러야 합니다")
+        self._space.logged_in_owner = owner_id
 
     def session_tokens(self) -> dict[str, str]:
         """현재 세션 쿠키 중 저장해 둘 값들(accessToken·refresh_token 등)."""

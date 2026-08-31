@@ -31,19 +31,22 @@ log = logging.getLogger("cgv-watch.cgv-login")
 
 
 def _detach(session: CgvSession, owner_id: int) -> None:
-    """다른 계정의 로그인 쿠키가 얹혀 있으면 비운다.
+    """이 공간에 다른 계정의 쿠키가 얹혀 있으면 비운다.
 
-    `logged_in()`은 쿠키가 **있는지**만 보므로, 앞 사용자의 쿠키가 남아 있으면
-    이 소유자의 로그인 절차가 통째로 건너뛰어진다. 좌석은 남의 계정으로 조회되고
-    자동 예매도 남의 계정으로 걸린다 — 그 고리를 여기서 끊는다.
+    공간이 소유자마다 갈린 뒤로 여기 걸릴 일은 사실상 없다 — 호출자가
+    session.use(owner_id)로 그 사람 공간을 고르고 들어오기 때문이다. 그래도
+    남겨 둔다: 공간을 안 고르고 들어오는 경로가 생기면 **남의 계정으로 좌석을
+    보고 남의 계정으로 선점하는** 사고가 되므로, 조용히 통과시키면 안 된다.
     """
     if session.logged_in_owner == owner_id:
         return                      # 같은 사람 — 만료됐어도 되살리면 그만이다
     if session.logged_in_owner is None and not session.logged_in():
-        return                      # 아무도 안 붙은 깨끗한 세션
-    log.info("CGV 세션을 owner %s → %s 로 바꿉니다",
-             session.logged_in_owner, owner_id)
+        return                      # 아무도 안 붙은 깨끗한 공간
+    log.warning("owner %s의 쿠키가 얹힌 공간에서 owner %s 로그인을 시작합니다 "
+                "— use()를 건너뛴 경로가 있는지 확인하세요",
+                session.logged_in_owner, owner_id)
     session.clear_session_cookies()
+    session.logged_in_owner = None
 
 
 def ensure_logged_in(owner_id: int, session: CgvSession) -> bool:
