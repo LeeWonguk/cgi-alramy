@@ -549,108 +549,191 @@ class TestCatalogCacheExpiry(unittest.TestCase):
         self.assertIsNone(watch.Catalog._db_cache("movie"))
 
 
-class TestStaggeredChecking(unittest.TestCase):
-    """상영이 먼 감시는 몇 바퀴에 한 번만 본다.
+class TestSeatPriority(unittest.TestCase):
+    """예산이 빠듯하면 급한 것부터 쓴다.
 
-    사이클을 11.8초에서 2.2초로 줄였더니 폴링 3초와 겹쳐 요청이 초당 3.4건에서
-    13.7건이 됐고 CGV가 429로 거절했다. 회차 41건을 매 바퀴 전부 보는 한
-    12초보다 빨리 돌 수 없다 — 한계가 우리 쪽이 아니라 상대 쪽이다.
-
-    급한 것과 안 급한 것이 섞여 있다. 내일 상영은 취소표가 초 단위로 나가지만
-    닷새 뒤 상영을 3초마다 볼 이유는 없다.
+    예전에는 먼 날짜를 아예 몇 바퀴 건너뛰었다. 지금은 건너뛰지 않고 **순서만**
+    정한다 — 예산이 남으면 먼 날짜도 같은 바퀴에 처리되고, 모자라면 큐에 남아
+    다음 창에서 처리된다. 버리는 게 아니라 미룬다.
     """
 
     TODAY = date(2026, 8, 31)
 
-    def setUp(self):
-        self.addCleanup(setattr, seats, "_pressure", seats._pressure)
-        self.addCleanup(setattr, seats, "_quiet", seats._quiet)
-        seats._pressure = 0
-        seats._quiet = 0
+    def test_nearer_dates_come_first(self):
+        near = seats.seat_priority("20260901", self.TODAY)
+        mid = seats.seat_priority("20260903", self.TODAY)
+        far = seats.seat_priority("20260905", self.TODAY)
+        self.assertLess(near, mid)
+        self.assertLess(mid, far)
 
-    def test_near_dates_are_checked_every_cycle(self):
-        for ymd in ("20260831", "20260901"):
-            self.assertEqual(seats.check_every(ymd, self.TODAY), 1, ymd)
-
-    def test_far_dates_are_checked_less_often(self):
-        self.assertGreater(seats.check_every("20260903", self.TODAY), 1)
-        self.assertGreater(seats.check_every("20260905", self.TODAY),
-                           seats.check_every("20260903", self.TODAY))
-
-    def test_an_unreadable_date_is_checked_every_cycle(self):
-        """모르는 것을 덜 보는 쪽으로 기울면 놓친다."""
-        for bad in ("", "abc", "2026", None):
-            self.assertEqual(seats.check_every(bad, self.TODAY), 1, repr(bad))
+    def test_today_is_the_most_urgent(self):
+        self.assertEqual(seats.seat_priority("20260831", self.TODAY), 0)
 
     def test_a_past_date_is_still_urgent(self):
-        # 지난 날짜는 남은 날이 음수다 — 가장 가까운 칸에 걸려야 한다.
-        self.assertEqual(seats.check_every("20260825", self.TODAY), 1)
+        # 남은 날이 음수다 — 가장 급한 칸에 걸려야 한다.
+        self.assertEqual(seats.seat_priority("20260825", self.TODAY), 0)
 
-    def test_watches_of_the_same_cadence_do_not_bunch_up(self):
-        """같은 주기의 감시가 한 바퀴에 몰리면 평균이 낮아도 그 순간은 몰린다.
-
-        429를 부른 게 바로 그 몰림이었다.
-        """
-        ws = [{"id": i, "scn_ymd": "20260905"} for i in range(1, 13)]
-        per_cycle = [sum(1 for w in ws if seats.due_this_cycle(w, t, self.TODAY))
-                     for t in range(1, 25)]
-        self.assertLess(max(per_cycle), len(ws),
-                        "한 바퀴에 전부 몰렸다 — 위상이 안 흩어졌다")
-
-    def test_every_watch_is_eventually_checked(self):
-        """미루는 것과 빠뜨리는 것은 다르다."""
-        ws = [{"id": i, "scn_ymd": "20260905"} for i in range(1, 13)]
-        seen = set()
-        for t in range(1, 200):
-            seen.update(w["id"] for w in ws
-                        if seats.due_this_cycle(w, t, self.TODAY))
-        self.assertEqual(seen, {w["id"] for w in ws})
+    def test_an_unreadable_date_is_treated_as_urgent(self):
+        """모르는 것을 뒤로 미루면 놓친다."""
+        for bad in ("", "abc", "2026", None):
+            self.assertEqual(seats.seat_priority(bad, self.TODAY), 0, repr(bad))
 
 
-class TestAdaptivePressure(unittest.TestCase):
-    """한계를 추측하지 않고 맞춰 간다.
+class TestPendingQueue(unittest.TestCase):
+    """예산을 넘는 일감은 큐에 남았다가 다음 창에서 처리된다."""
 
-    안전한 값을 미리 정해 두면 실제 한계가 그보다 높을 때 공연히 덜 보게 되고,
-    낮을 때는 계속 거절당한다.
-    """
+    class Sess:
+        def __init__(self, limit):
+            import watch
 
-    TODAY = date(2026, 8, 31)
+            self.budget = watch.RateBudget(limit=limit)
+            self.asked = []
+
+        def allowance(self):
+            return self.budget.allowance()
+
+        def showtimes(self, site_no, mov_no, ymd):
+            return [{"scnsNo": f"S{i}", "scnSseq": str(i), "scnsrtTm": "1800",
+                     "siteNo": site_no, "scnsNm": "IMAX관",
+                     "atktGoodsNm": "IMAX LASER 2D"} for i in range(4)]
+
+        def get_json_many(self, paths, seat_fields=None):
+            self.asked.append(len(paths))
+            got = self.budget.take(len(paths))
+            return ([{"data": {"items": [{"seats": []}]}}] * got
+                    + [None] * (len(paths) - got))
+
+    class Cat:
+        def resolve_movie(self, q):
+            return {"movNo": "M1", "movNm": q}, ""
+
+        def resolve_site(self, q):
+            return {"siteNo": "0013", "siteNm": q}, ""
 
     def setUp(self):
-        self.addCleanup(setattr, seats, "_pressure", seats._pressure)
-        self.addCleanup(setattr, seats, "_quiet", seats._quiet)
-        seats._pressure = 0
-        seats._quiet = 0
+        seats._pending.clear()
+        seats._last_fetched.clear()
+        self.addCleanup(seats._pending.clear)
+        self.addCleanup(seats._last_fetched.clear)
 
-    def test_being_refused_slows_everything_down(self):
-        before = seats.check_every("20260901", self.TODAY)
-        seats._raise_pressure()
-        self.assertGreater(seats.check_every("20260901", self.TODAY), before)
 
-    def test_pressure_has_a_ceiling(self):
-        for _ in range(seats.PRESSURE_MAX + 5):
-            seats._raise_pressure()
-        self.assertEqual(seats._pressure, seats.PRESSURE_MAX)
 
-    def test_quiet_cycles_bring_it_back(self):
-        """눌린 채로 남으면 정작 상영일이 다가왔을 때 느리다."""
-        seats._raise_pressure()
-        raised = seats._pressure
-        for _ in range(seats.PRESSURE_EASE_AFTER):
-            seats._ease_pressure()
-        self.assertLess(seats._pressure, raised)
+    def group(self, dates):
+        return [{"id": i, "owner_id": 7, "movie_query": "오디세이",
+                 "site_query": "용산아이파크몰", "scn_ymd": d,
+                 "screen_types": ["IMAX"], "rows": [], "scn_time": "",
+                 "scn_time_from": "", "scn_time_to": "", "min_consecutive": 2,
+                 "auto_book": False, "seat_num_from": 0, "seat_num_to": 0}
+                for i, d in enumerate(dates, start=1)]
 
-    def test_easing_does_not_go_below_normal(self):
-        for _ in range(seats.PRESSURE_EASE_AFTER * 3):
-            seats._ease_pressure()
-        self.assertEqual(seats._pressure, 0)
+    def test_work_beyond_the_budget_waits_instead_of_vanishing(self):
+        s = self.Sess(limit=5)
+        group = self.group(["20260901", "20260902", "20260903"])   # 회차 12개
+        got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        self.assertEqual(len(got), 5, "예산만큼만 받아야 한다")
+        self.assertEqual(len(seats._pending[7]), 7, "나머지는 큐에 남아야 한다")
 
-    def test_a_refusal_resets_the_quiet_run(self):
-        # 조용했다가 다시 거절당하면 처음부터 세야 한다.
-        for _ in range(seats.PRESSURE_EASE_AFTER - 1):
-            seats._ease_pressure()
-        seats._raise_pressure()
-        self.assertEqual(seats._quiet, 0)
+    def test_the_next_window_picks_up_where_it_left_off(self):
+        s = self.Sess(limit=5)
+        group = self.group(["20260902", "20260903"])   # 둘 다 재확인 간격이 있다
+        first = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        s.budget._sent.clear()          # 창이 지난 것으로
+        second = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        self.assertTrue(second, "다음 창에서 이어서 처리돼야 한다")
+        self.assertFalse(set(first) & set(second),
+                         "간격이 안 지났는데 같은 회차를 또 받았다")
+
+    def test_a_recently_checked_showtime_is_not_requeued(self):
+        """가까운 날짜가 매 창 예산을 채우면 먼 날짜가 영영 밀린다."""
+        s = self.Sess(limit=100)
+        group = self.group(["20260903"])              # 재확인 간격이 있는 순위
+        seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        s.budget._sent.clear()
+        again = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        self.assertEqual(again, {}, "방금 본 회차를 곧바로 또 받았다")
+
+    def test_an_urgent_showtime_is_always_rechecked(self):
+        # 가까운 날짜는 간격이 0이라 매 바퀴 다시 본다.
+        s = self.Sess(limit=100)
+        group = self.group(["20260901"])
+        first = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        s.budget._sent.clear()
+        again = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        self.assertEqual(set(first), set(again), "급한 회차인데 안 봤다")
+
+    def test_far_dates_are_not_starved(self):
+        """급한 것이 계속 예산을 채워도 먼 것이 끝내 차례를 받아야 한다.
+
+        순위만 두면 급한 회차가 매 창을 다 쓰고 먼 회차는 영영 밀린다. 오래
+        기다린 일감을 끌어올려(aging) 반드시 처리되게 한다.
+        """
+        import time as _time
+
+        self.addCleanup(setattr, seats, "AGE_PROMOTE_SECONDS",
+                        seats.AGE_PROMOTE_SECONDS)
+        seats.AGE_PROMOTE_SECONDS = 0.01      # 실제로는 45초
+
+        s = self.Sess(limit=4)                # 급한 회차 4개로 딱 차는 예산
+        group = self.group(["20260901", "20260905"])
+        far = set()
+        for _ in range(8):
+            got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+            far |= {k for k in got if k[2] == "20260905"}
+            s.budget._sent.clear()
+            _time.sleep(0.02)                 # 기다린 시간이 쌓인다
+        self.assertTrue(far, "먼 날짜가 한 번도 처리되지 않았다")
+
+    def test_aging_does_not_starve_the_urgent_either(self):
+        # 오래 기다린 것이 올라와도 급한 것이 아주 밀려나면 안 된다.
+        import time as _time
+
+        self.addCleanup(setattr, seats, "AGE_PROMOTE_SECONDS",
+                        seats.AGE_PROMOTE_SECONDS)
+        seats.AGE_PROMOTE_SECONDS = 0.01
+
+        s = self.Sess(limit=4)
+        group = self.group(["20260901", "20260905"])
+        near = set()
+        for _ in range(8):
+            got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+            near |= {k for k in got if k[2] == "20260901"}
+            s.budget._sent.clear()
+            _time.sleep(0.02)
+        self.assertEqual(len(near), 4, "급한 회차가 처리되지 않았다")
+
+    def test_everything_is_eventually_fetched(self):
+        s = self.Sess(limit=5)
+        group = self.group(["20260902", "20260903"])   # 회차 8개
+        seen = {}
+        for _ in range(4):
+            seen.update(seats._prefetch_seat_maps(s, self.Cat(), group,
+                                                  sched_cache={}))
+            s.budget._sent.clear()
+        self.assertEqual(len(seen), 8, "미룬 것이 끝내 처리되지 않았다")
+        self.assertFalse(seats._pending[7], "큐가 비어야 한다")
+
+    def test_urgent_work_is_taken_first(self):
+        s = self.Sess(limit=4)
+        # 먼 날짜를 먼저 올려도 가까운 날짜가 앞서야 한다.
+        group = self.group(["20260905", "20260901"])
+        got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        self.assertTrue(all(k[2] == "20260901" for k in got),
+                        f"급한 것부터 안 가져갔다: {sorted(k[2] for k in got)}")
+
+    def test_no_budget_means_no_request(self):
+        s = self.Sess(limit=0)
+        group = self.group(["20260901"])
+        self.assertEqual(seats._prefetch_seat_maps(s, self.Cat(), group,
+                                                   sched_cache={}), {})
+        self.assertEqual(s.asked, [], "예산이 없는데 물었다")
+        self.assertTrue(seats._pending[7], "일감은 남아 있어야 한다")
+
+    def test_the_queue_does_not_grow_without_bound(self):
+        s = self.Sess(limit=0)
+        many = [f"202609{d:02d}" for d in range(1, 30)] * 6
+        seats._prefetch_seat_maps(s, self.Cat(), self.group(many),
+                                  sched_cache={})
+        self.assertLessEqual(len(seats._pending[7]), seats.PENDING_LIMIT)
 
 
 class TestSeatFieldsAreEnough(unittest.TestCase):
@@ -743,6 +826,9 @@ class TestPrefetchIsShared(unittest.TestCase):
             self.batched = 0
             self.individual = 0
 
+        def allowance(self):
+            return 1000          # 예산은 여기 관심사가 아니다
+
         def showtimes(self, site_no, mov_no, ymd):
             return [{"scnsNo": f"S{i}", "scnSseq": str(i), "scnsrtTm": "1800",
                      "siteNo": site_no, "scnsNm": "IMAX관",
@@ -762,6 +848,12 @@ class TestPrefetchIsShared(unittest.TestCase):
 
         def resolve_site(self, q):
             return {"siteNo": "0013", "siteNm": q}, ""
+
+    def setUp(self):
+        seats._pending.clear()
+        seats._last_fetched.clear()
+        self.addCleanup(seats._pending.clear)
+        self.addCleanup(seats._last_fetched.clear)
 
     def group(self, n=4):
         return [{"id": i, "owner_id": 1, "movie_query": "오디세이",

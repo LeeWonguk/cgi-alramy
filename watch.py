@@ -14,7 +14,7 @@ CGV는 Cloudflare가 TLS 지문 단위로 봇을 막기 때문에 requests/curl�
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import argparse
 import fcntl
 import json
@@ -129,7 +129,19 @@ OWNER_SPACE_LIMIT = 4
 SEAT_MAP_BATCH = 6
 
 # 429를 받으면 이만큼 쉰다. CGV가 그만하라고 한 것이므로 재시도로 맞서지 않는다.
-THROTTLE_BACKOFF_SECONDS = 60
+# ── 요청 예산 ───────────────────────────────────────────────────────────────
+# CGV가 분당 몇 건까지 받아 주는지는 공개돼 있지 않다. 실측으로는 205/분이
+# 무사했고 820/분에서 429가 났으니 그 사이 어딘가다.
+#
+# 안전한 값을 미리 못박지 않는다 — 실제 한계가 그보다 높으면 공연히 덜 보게
+# 되고, 낮으면 계속 거절당한다. 대신 **429가 날 때까지 올려 보고, 나면 반으로
+# 줄인다**(AIMD). 창을 넘는 일감은 버리지 않고 큐에 남겨 다음 창에서 처리한다.
+RATE_WINDOW_SECONDS = 60.0
+RATE_START = 180          # 처음 한도(분당). 무사했던 205보다 조금 낮게 시작한다
+RATE_FLOOR = 30           # 이 밑으로는 안 내린다 — 감시가 아예 멎으면 의미가 없다
+RATE_CEILING = 900        # 이 위로는 안 올린다
+RATE_STEP = 10            # 조용하면 이만큼씩 올린다
+RATE_PROBE_SECONDS = 30.0  # 이만큼 조용하면 한 번 올려 본다
 WEEKDAYS = "월화수목금토일"
 
 log = logging.getLogger("cgv-watch")
@@ -202,11 +214,84 @@ def normalize(name: str) -> str:
 
 # ── CGV 세션 ────────────────────────────────────────────────────────────────
 class Throttled(RuntimeError):
-    """CGV가 429로 요청을 거절했다 — 잠시 물러나야 한다.
+    """CGV가 429로 요청을 거절했다.
 
     재시도로 맞서면 안 된다. 예전에는 get_json이 2초·4초 백오프로 세 번을 더
     보냈는데, 그건 그만하라는 쪽에 세 배로 때리는 짓이다.
     """
+
+
+class RateLimited(RuntimeError):
+    """이번 창의 예산을 다 썼다 — 거절당한 게 아니라 우리가 아낀 것이다.
+
+    Throttled와 구분한다. 저쪽은 사고이고 이쪽은 정상 동작이라, 남은 일감은
+    큐에 두었다가 다음 창에서 처리하면 된다.
+    """
+
+
+class RateBudget:
+    """60초 창 안에 보낼 수 있는 요청 수. 한도를 스스로 찾는다.
+
+    올릴 때는 조금씩(RATE_STEP), 내릴 때는 반으로. 네트워크 혼잡 제어에서
+    쓰는 방식과 같다 — 한도 근처를 오르내리며 실제 값에 수렴한다.
+    """
+
+    def __init__(self, limit: int = RATE_START):
+        self.limit = limit
+        self._sent: "deque[float]" = deque()
+        self._last_penalty = 0.0
+        self._last_probe = time.monotonic()
+
+    def _prune(self, now: float) -> None:
+        cut = now - RATE_WINDOW_SECONDS
+        while self._sent and self._sent[0] < cut:
+            self._sent.popleft()
+
+    def allowance(self) -> int:
+        """지금 더 보낼 수 있는 건수."""
+        now = time.monotonic()
+        self._prune(now)
+        return max(0, self.limit - len(self._sent))
+
+    def take(self, want: int) -> int:
+        """want건을 쓰겠다고 알린다. 실제로 허용된 수를 돌려준다."""
+        got = min(want, self.allowance())
+        now = time.monotonic()
+        self._sent.extend([now] * got)
+        return got
+
+    def penalize(self) -> None:
+        """429를 받았다 — 한도를 반으로 줄이고 이번 창을 소진한 것으로 본다.
+
+        바닥(RATE_FLOOR)은 **낮출 때만** 하한이다. 이미 그보다 낮은 한도를
+        바닥으로 끌어올리면 거절당했는데 오히려 더 보내게 된다.
+        """
+        before = self.limit
+        self.limit = max(min(RATE_FLOOR, before), before // 2)
+        self._last_penalty = time.monotonic()
+        self._last_probe = self._last_penalty
+        # 창을 가득 채워 둔다. 방금 거절당했으니 남은 예산이 있어도 쉬어야 한다.
+        self._sent.extend([time.monotonic()] * self.allowance())
+        if self.limit != before:
+            log.warning("요청 한도를 분당 %d → %d건으로 낮춥니다 (429)",
+                        before, self.limit)
+
+    def relax(self) -> None:
+        """조용한 동안 조금씩 올려 본다 — 한계가 어디인지는 그렇게만 알 수 있다."""
+        now = time.monotonic()
+        if now - self._last_probe < RATE_PROBE_SECONDS:
+            return
+        self._last_probe = now
+        if self.limit >= RATE_CEILING:
+            return
+        self.limit = min(RATE_CEILING, self.limit + RATE_STEP)
+        log.debug("요청 한도를 분당 %d건으로 올려 봅니다", self.limit)
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        self._prune(now)
+        return {"limit": self.limit, "used": len(self._sent),
+                "left": max(0, self.limit - len(self._sent))}
 
 
 class AuthRequired(RuntimeError):
@@ -268,10 +353,9 @@ class CgvSession:
         self._current: int | None = None
         self.requests = 0  # 사이클당 CGV 요청 수 — 대시보드에서 부하를 본다
         self.opened_at: datetime | None = None
-        # 429를 받으면 이 시각까지 요청을 보내지 않는다. 브라우저 하나를
-        # 공유하므로 소유자와 무관하게 세션 전체가 함께 쉰다 — 상대 쪽에서
-        # 보면 우리는 한 곳이다.
-        self._throttled_until = 0.0
+        # 보낼 수 있는 양. 브라우저 하나를 공유하므로 소유자와 무관하게 세션
+        # 전체가 한 예산을 나눠 쓴다 — 상대 쪽에서 보면 우리는 한 곳이다.
+        self.budget = RateBudget()
 
     def __enter__(self) -> "CgvSession":
         from playwright.sync_api import sync_playwright
@@ -464,20 +548,9 @@ class CgvSession:
         except Exception:  # noqa: BLE001 - 죽었는지 보는 게 목적이다
             return False
 
-    def throttled_for(self) -> float:
-        """지금 쉬어야 하는 남은 초. 0이면 요청해도 된다 (호출자용)."""
-        return self._throttle_left()
-
-    def _throttle_left(self) -> float:
-        """지금 쉬어야 하는 남은 초. 0이면 보내도 된다."""
-        return max(0.0, self._throttled_until - time.monotonic())
-
-    def _start_throttle(self, path: str) -> None:
-        if self._throttle_left() <= 0:
-            log.warning("CGV가 요청을 거절했습니다 (HTTP 429) — %d초 쉽니다. "
-                        "확인 간격을 늘리거나 감시 회차를 줄이는 편이 좋습니다 "
-                        "(%s)", THROTTLE_BACKOFF_SECONDS, path.split("?")[0])
-        self._throttled_until = time.monotonic() + THROTTLE_BACKOFF_SECONDS
+    def allowance(self) -> int:
+        """지금 더 보낼 수 있는 건수 (호출자가 일감을 나눌 때 쓴다)."""
+        return self.budget.allowance()
 
     def get_json(self, path: str, retries: int = 2) -> dict:
         """API를 호출해 JSON을 반환. 실패하면 지수 백오프로 재시도."""
@@ -487,10 +560,9 @@ class CgvSession:
             return {status: res.status, text: text};
         }"""
 
-        left = self._throttle_left()
-        if left > 0:
-            raise Throttled(f"{path.split('?')[0]}: CGV가 요청을 거절해 "
-                            f"{left:.0f}초 더 쉬는 중입니다")
+        if not self.budget.take(1):
+            raise RateLimited(f"{path.split('?')[0]}: 이번 창의 요청 예산을 "
+                              f"다 썼습니다 (분당 {self.budget.limit}건)")
 
         last_error = ""
         for attempt in range(retries + 1):
@@ -510,7 +582,7 @@ class CgvSession:
                     f"{path.split('?')[0]}: 로그인이 필요합니다 (HTTP 401)")
             if out["status"] == 429:
                 # 그만하라는 답이다. 재시도로 맞서면 세 배로 때리는 셈이다.
-                self._start_throttle(path)
+                self.budget.penalize()
                 raise Throttled(f"{path.split('?')[0]}: CGV가 요청을 거절했습니다 "
                                 f"(HTTP 429)")
             if out["status"] != 200:
@@ -554,10 +626,13 @@ class CgvSession:
         """
         if not paths:
             return []
-        if self._throttle_left() > 0:
-            # 쉬는 중이면 아예 보내지 않는다. 전부 None이라 호출자는 "못 받았다"로
-            # 다루고, 개별 폴백도 같은 이유로 즉시 Throttled를 낸다.
+        # 예산만큼만 보낸다. 나머지는 **앞에서부터** 채우고 뒤는 None으로 남겨
+        # 호출자가 큐에 되돌려 둘 수 있게 한다 — 버리는 게 아니라 미루는 것이다.
+        budget = self.budget.take(len(paths))
+        if budget <= 0:
             return [None] * len(paths)
+        deferred = len(paths) - budget
+        paths = paths[:budget]
 
         # eval을 쓰지 않는다 — CGV 페이지의 CSP가 막을 수 있고, 막히면 배치가
         # 통째로 실패한다. 깎는 규칙은 필드 목록으로 넘긴다.
@@ -595,6 +670,7 @@ class CgvSession:
         out: list[dict | None] = []
         for start in range(0, len(paths), SEAT_MAP_BATCH):
             chunk = paths[start:start + SEAT_MAP_BATCH]
+            # 예산은 위에서 이미 챙겼다 — 여기서는 부하 집계만 올린다.
             self.requests += len(chunk)
             try:
                 results = self._page.evaluate(
@@ -607,7 +683,7 @@ class CgvSession:
             throttled = False
             for path, item in zip(chunk, results):
                 if item and item.get("status") == 429:
-                    self._start_throttle(path)
+                    self.budget.penalize()
                     throttled = True
                 payload = self._one_of_many(path, item)
                 if payload is not None and seat_fields:
@@ -618,6 +694,8 @@ class CgvSession:
                 # 그만하라는 쪽을 더 때리는 셈이다.
                 out.extend([None] * (len(paths) - len(out)))
                 break
+        # 예산이 모자라 아예 못 보낸 몫. 호출자가 큐에 되돌린다.
+        out.extend([None] * deferred)
         return out
 
     @staticmethod

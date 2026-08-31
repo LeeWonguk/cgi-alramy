@@ -461,91 +461,58 @@ SEAT_FIELDS = [
 ]
 
 
-# 상영일이 얼마나 남았느냐에 따라 몇 사이클에 한 번 볼지. (남은 날, 주기)를
-# 가까운 것부터 적는다.
+# 상영일이 얼마나 남았느냐로 정하는 **우선순위**. 작을수록 급하다.
 #
-# **왜 차등을 두는가.** 사이클을 11.8초에서 2.2초로 줄였더니 폴링 3초와 겹쳐
-# 요청이 초당 3.4건에서 13.7건이 됐고 CGV가 429로 거절했다. 회차 41건을 매
-# 사이클 보는 한 12초보다 빨리 돌 수 없다 — 우리 쪽이 아니라 상대 쪽이 한계다.
+# 예전에는 이 값으로 "몇 바퀴에 한 번 볼지"를 정해 먼 날짜를 아예 건너뛰었다.
+# 지금은 건너뛰지 않고 **순서만** 정한다 — 예산이 남으면 먼 날짜도 그 바퀴에
+# 처리되고, 모자라면 큐에 남아 다음 창에서 처리된다. 버리는 게 아니라 미룬다.
+SEAT_PRIORITY_BANDS = ((1, 0), (3, 1))   # 1일 이내 0순위 · 3일 이내 1순위
+SEAT_PRIORITY_FAR = 2
+
+# 순위별 **재확인 간격(초)**. 이 시간이 지나기 전에는 큐에 다시 올리지 않는다.
 #
-# 그런데 급한 것과 안 급한 것이 섞여 있다. 내일 상영은 취소표가 초 단위로
-# 나가지만, 닷새 뒤 상영을 3초마다 볼 이유는 없다. 가까운 것에 예산을 몰아준다.
-SEAT_CHECK_CADENCE = ((1, 1), (3, 3))   # 1일 이내 매번 · 3일 이내 3번에 한 번
-SEAT_CHECK_FAR = 6                      # 그보다 멀면 6번에 한 번
+# 우선순위만 두면 가까운 날짜가 매 창 예산을 채워 먼 날짜가 영원히 밀린다
+# (테스트가 이 기아를 잡았다). 간격을 두면 급한 것은 매 바퀴 보면서도 먼 것이
+# 반드시 차례를 받는다. 기본 부하도 이 값으로 정해진다.
+SEAT_RECHECK_SECONDS = (0.0, 20.0, 90.0)
 
-# 몇 번째 바퀴인지. 차등 확인의 위상을 정하는 데만 쓴다.
-_tick = 0
+# 회차별 마지막 조회 시각 {키: monotonic}. 재확인 간격을 재는 데만 쓴다.
+_last_fetched: dict = {}
 
-# CGV가 거절할 때마다 올라가는 압력. 주기 전체에 곱해져 모든 감시가 함께
-# 느려진다. **한계를 추측하지 않고 맞춰 간다** — 안전한 값을 미리 정해 두면
-# 실제 한계가 그보다 높을 때 공연히 덜 보게 되고, 낮을 때는 계속 거절당한다.
+# 큐에서 이만큼 기다릴 때마다 순위가 한 칸 올라간다.
 #
-# 429가 없는 바퀴가 이어지면 다시 내려간다. 상영일이 다가오면 확인이 촘촘해져야
-# 하는데 한 번 눌린 채로 남으면 정작 급할 때 느리다.
-_pressure = 0
-PRESSURE_MAX = 4
-PRESSURE_EASE_AFTER = 40        # 조용한 바퀴가 이만큼 이어지면 한 단계 내린다
-_quiet = 0
+# **순위만으로는 굶는다.** 급한 회차가 매 창 예산을 다 채우면 먼 회차는 영영
+# 차례가 오지 않는다(테스트가 이걸 잡았다). 오래 기다린 일감을 끌어올려
+# 반드시 처리되게 한다.
+AGE_PROMOTE_SECONDS = 45.0
+
+# 아직 못 받은 좌석맵. 소유자별 {키: (우선순위, 경로)}이고, 예산이 허락하는
+# 만큼만 앞에서 꺼내 쓴다. 창이 지나면 예산이 되살아나 나머지가 처리된다.
+_pending: dict = {}
+# 큐가 무한정 자라지 않게. 넘치면 가장 안 급한 것부터 버린다 — 그 회차는
+# 다음 바퀴에 어차피 다시 올라온다.
+PENDING_LIMIT = 400
 
 
-def _raise_pressure() -> None:
-    """거절당했다 — 모든 확인 주기를 한 단계 늦춘다."""
-    global _pressure, _quiet
-    _quiet = 0
-    if _pressure < PRESSURE_MAX:
-        _pressure += 1
-        import watch
-        watch.log.warning("확인 주기를 %d배로 늦춥니다 (CGV 요청 제한)",
-                          1 + _pressure)
+def seat_priority(scn_ymd: str, today=None) -> int:
+    """이 상영일이 얼마나 급한지. 작을수록 먼저 처리한다.
 
-
-def _ease_pressure() -> None:
-    """조용한 바퀴가 이어지면 한 단계 되돌린다."""
-    global _pressure, _quiet
-    if _pressure <= 0:
-        return
-    _quiet += 1
-    if _quiet >= PRESSURE_EASE_AFTER:
-        _quiet = 0
-        _pressure -= 1
-        import watch
-        watch.log.info("확인 주기를 %d배로 되돌립니다", 1 + _pressure)
-
-
-def check_every(scn_ymd: str, today=None) -> int:
-    """이 상영일을 몇 사이클에 한 번 볼지. 1이면 매 사이클.
-
-    날짜를 못 읽으면 1을 준다 — 모르는 것을 덜 보는 쪽으로 기울면 놓친다.
+    날짜를 못 읽으면 가장 급한 것으로 본다 — 모르는 것을 뒤로 미루면 놓친다.
     """
     from datetime import date as _date
 
     digits = "".join(ch for ch in (scn_ymd or "") if ch.isdigit())
     if len(digits) != 8:
-        return 1
+        return 0
     try:
         target = _date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
     except ValueError:
-        return 1
+        return 0
     days = (target - (today or _date.today())).days
-    base = SEAT_CHECK_FAR
-    for limit, every in SEAT_CHECK_CADENCE:
+    for limit, rank in SEAT_PRIORITY_BANDS:
         if days <= limit:
-            base = every
-            break
-    return base * (1 + _pressure)
-
-
-def due_this_cycle(w: dict, tick: int, today=None) -> bool:
-    """이번 사이클에 이 감시를 볼 차례인지.
-
-    감시 id로 위상을 흩어 둔다. 안 그러면 같은 주기의 감시가 전부 같은 사이클에
-    몰려, 평균은 낮아도 그 순간의 요청이 그대로 몰린다 — 429를 부른 게 바로
-    그 몰림이었다.
-    """
-    every = check_every(w.get("scn_ymd", ""), today)
-    if every <= 1:
-        return True
-    return (tick + int(w.get("id") or 0)) % every == 0
+            return rank
+    return SEAT_PRIORITY_FAR
 
 
 def rows_to_check(w: dict, schedule: list[dict]) -> list[dict]:
@@ -626,21 +593,26 @@ class _CycleCost:
 
 def _prefetch_seat_maps(session, catalog, group, *, cost=None,
                         sched_cache=None) -> dict:
-    """이 소유자의 감시들이 볼 좌석맵을 **한 번에** 받아 둔다.
+    """이 소유자가 볼 좌석맵을 큐에 쌓고, **예산만큼만** 받아 온다.
 
-    회차마다 따로 부르면 왕복을 줄줄이 기다린다 — 배포 실측으로 32건에 6.2초였고
-    그게 사이클 11.8초의 절반이었다. 브라우저 안에서 묶으면 서로 다른 URL 8건이
-    642ms → 65ms다(실측 9.8배).
+    예전에는 볼 것을 매 바퀴 전부 받으려 했다. 사이클을 11.8초에서 2.2초로
+    줄이자 폴링 3초와 겹쳐 요청이 초당 3.4건에서 13.7건이 됐고 CGV가 429로
+    거절했다. 물러나기만 해선 멈추지 않았다 — 쉰 뒤에 또 전부 보냈으니까.
 
-    받지 못한 항목은 그냥 빠진다. 본 루프가 없는 것을 개별로 받으므로 결과는
-    같고, 인증 복구나 회차별 실패 처리를 여기서 다시 구현하지 않아도 된다.
+    그래서 **보낼 양을 먼저 정한다.** 이번 창에 남은 예산만큼 큐 앞에서
+    꺼내 처리하고, 나머지는 큐에 그대로 둔다. 창이 지나면 예산이 되살아나
+    이어서 처리된다 — 버리는 게 아니라 미루는 것이다.
 
-    여기서 부르는 이름 해석·상영표는 이미 사이클 캐시에 걸리므로(catalog 캐시와
-    sched_cache) 추가 왕복이 없다.
+    큐 순서는 상영일이 가까운 것부터다(seat_priority). 예산이 빠듯하면 급한
+    것부터 쓰이고, 남으면 먼 날짜도 같은 바퀴에 처리된다.
     """
     import watch
 
-    keys, paths = [], []
+    owner = group[0]["owner_id"] if group else None
+    queue: dict = _pending.setdefault(owner, {})
+
+    # 1) 이번 바퀴에 볼 것을 큐에 올린다. 이미 있으면 그대로 둔다 — 먼저 들어온
+    #    것이 더 오래 기다렸다는 뜻이라 순서를 흔들 이유가 없다.
     for w in group:
         movie, _ = catalog.resolve_movie(w["movie_query"])
         site, _ = catalog.resolve_site(w["site_query"])
@@ -663,25 +635,58 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
             schedule, scn_time=w.get("scn_time") or "",
             scn_time_from=w.get("scn_time_from") or "",
             scn_time_to=w.get("scn_time_to") or "")
+        rank = seat_priority(w["scn_ymd"])
+        gap = SEAT_RECHECK_SECONDS[min(rank, len(SEAT_RECHECK_SECONDS) - 1)]
         for row in rows_to_check(w, schedule):
             key = seat_map_key(w, row, site_no)
-            if key in keys:
-                continue        # 같은 회차를 여러 감시가 보면 한 번만 받는다
-            keys.append(key)
-            paths.append(watch.EP_SEAT.format(
+            if key in queue:
+                continue
+            # 방금 본 회차는 다시 올리지 않는다. 이게 없으면 가까운 날짜가 매 창
+            # 예산을 채워 먼 날짜가 영영 밀린다.
+            seen = _last_fetched.get(key)
+            if seen is not None and time.monotonic() - seen < gap:
+                continue
+            queue[key] = (rank, time.monotonic(), watch.EP_SEAT.format(
                 site_no=key[0], scns_no=key[1], ymd=key[2], scn_sseq=key[3]))
 
-    if not paths:
+    if not queue:
         return {}
+    now = time.monotonic()
+
+    # 2) 큐가 무한정 자라지 않게. 넘치면 가장 안 급한 것부터 버린다 — 그 회차는
+    #    다음 바퀴에 어차피 다시 올라온다.
+    if len(queue) > PENDING_LIMIT:
+        for key in sorted(queue, key=lambda k: -queue[k][0])[
+                :len(queue) - PENDING_LIMIT]:
+            queue.pop(key, None)
+
+    def order(key):
+        rank, since, _ = queue[key]
+        # 기다린 만큼 순위를 끌어올린다. 같은 순위면 오래 기다린 것부터.
+        aged = rank - int((now - since) / AGE_PROMOTE_SECONDS)
+        return (aged, since)
+
+    # 3) 예산만큼만 꺼낸다. 급한 것부터.
+    allowance = session.allowance()
+    if allowance <= 0:
+        if cost:
+            cost.hit(f"예산소진 대기{len(queue)}건")
+        return {}
+    ordered = sorted(queue, key=order)[:allowance]
+    paths = [queue[k][2] for k in ordered]
+
     with cost.call("좌석맵(묶음)") if cost else contextlib.nullcontext():
         results = session.get_json_many(paths, seat_fields=SEAT_FIELDS)
+
     out = {}
-    for key, payload in zip(keys, results):
-        if payload is not None:
-            out[key] = payload.get("data") or {}
-    if len(out) < len(keys):
-        watch.log.debug("좌석맵 묶음: %d건 중 %d건만 받았습니다 — 나머지는 "
-                        "개별로 받습니다", len(keys), len(out))
+    for key, payload in zip(ordered, results):
+        if payload is None:
+            continue            # 못 받았다 — 큐에 남겨 다음 창에 다시 본다
+        out[key] = payload.get("data") or {}
+        queue.pop(key, None)
+        _last_fetched[key] = time.monotonic()
+    if queue and cost:
+        cost.hit(f"대기{len(queue)}건")
     return out
 
 
@@ -704,16 +709,12 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
 
     # CGV가 그만하라고 한 동안은 통째로 쉰다. 여기서 걸러 내지 않으면 회차마다
     # 같은 경고가 찍혀(35건이면 35줄) 정작 무슨 일인지 안 보인다.
-    left = session.throttled_for()
-    if left > 0:
-        _raise_pressure()
-        watch.log.info("CGV 요청 제한으로 이번 바퀴는 건너뜁니다 (%.0f초 남음)",
-                       left)
+    if session.allowance() <= 0:
+        # 창의 예산을 다 썼다. 일감은 큐에 그대로 있으니 다음 바퀴에 이어서 한다.
+        watch.log.info("요청 예산을 다 써 이번 바퀴는 건너뜁니다 "
+                       "(대기 %d건)", sum(len(q) for q in _pending.values()))
         return summary
-    _ease_pressure()
-
-    global _tick
-    _tick += 1
+    session.budget.relax()
 
     catalog = watch.Catalog(session)
     cost = _CycleCost()
@@ -727,19 +728,11 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
     warmed: set[str] = set()
 
     by_owner: dict[int, list[dict]] = {}
-    skipped = 0
     for w in watches:
         if w["owner_id"] is None:
             # 주인 없는 좌석 감시는 로그인할 계정이 없어 확인할 수 없다.
             continue
-        # 상영이 먼 감시는 몇 바퀴에 한 번만 본다. 매 바퀴 전부 보면 요청이
-        # 몰려 CGV가 429로 거절한다 — 급한 것에 예산을 몰아준다.
-        if not due_this_cycle(w, _tick):
-            skipped += 1
-            continue
         by_owner.setdefault(w["owner_id"], []).append(w)
-    if skipped:
-        cost.hit(f"미룸 {skipped}건")
 
     for owner_id, group in by_owner.items():
         # 이 소유자의 공간으로 옮긴다. 컨텍스트가 갈려 있어 로그인도 예매 탭도
