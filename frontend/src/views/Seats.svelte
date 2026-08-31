@@ -45,9 +45,26 @@
   // '선호좌석' 프리셋. 스크린에서 적당히 떨어진 H~O열의, 좌우 끝을 뺀 가운데
   // 구역이다 — IMAX처럼 한 열이 45석까지 가는 관에서는 열만 걸어서는 화면
   // 끝자리가 그대로 후보에 남는다.
-  const PREFERRED = { rows: 'H, I, J, K, L, M, N, O', from: 13, to: 32 }
+  //
+  // **이 좌표는 용산아이파크몰 IMAX관 하나를 보고 정한 값이다**(624석 · A~P열 ·
+  // 열당 최대 45석). 좌석 배치는 관마다 달라서, 열이 H까지밖에 없는 관에 그대로
+  // 걸면 아무 좌석도 안 걸리고 감시가 조용히 멎는다. 그래서 그 관을 고른
+  // 경우에만 쓸 수 있게 한다 — 좌석 번호 범위 자체는 어느 관에서든 손으로
+  // 적을 수 있다.
+  const PREFERRED = {
+    site: '용산아이파크몰',
+    type: 'IMAX',
+    rows: 'H, I, J, K, L, M, N, O',
+    from: 13,
+    to: 32,
+  }
+
+  const preferredOk = $derived(
+    site === PREFERRED.site && types.has(PREFERRED.type),
+  )
 
   function applyPreferred() {
+    if (!preferredOk) return
     rowsText = PREFERRED.rows
     numFrom = String(PREFERRED.from)
     numTo = String(PREFERRED.to)
@@ -62,7 +79,8 @@
   }
 
   const isPreferred = $derived(
-    rowsText.trim() === PREFERRED.rows &&
+    preferredOk &&
+      rowsText.trim() === PREFERRED.rows &&
       Number(numFrom) === PREFERRED.from &&
       Number(numTo) === PREFERRED.to,
   )
@@ -425,6 +443,10 @@
           type="button"
           class="preset"
           class:on={isPreferred}
+          disabled={!preferredOk}
+          title={preferredOk
+            ? `${PREFERRED.site} ${PREFERRED.type}관 기준 — ${PREFERRED.rows} · ${PREFERRED.from}~${PREFERRED.to}번`
+            : `${PREFERRED.site}의 ${PREFERRED.type}관에서만 쓸 수 있습니다 (좌석 배치가 관마다 다릅니다)`}
           onclick={applyPreferred}>
           {isPreferred ? '✓ 선호좌석' : '선호좌석'}
         </button>
@@ -664,9 +686,14 @@
     font-weight: 600;
     line-height: 1.6;
   }
-  button.preset:hover {
+  button.preset:hover:not(:disabled) {
     color: var(--text);
     border-color: var(--muted);
+  }
+  /* 다른 관에서는 쓸 수 없다 — 사라지는 대신 흐려져, 왜 없는지 물을 수 있게 한다. */
+  button.preset:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
   /* 켜져 있으면 지금 그 프리셋이 적용된 상태라는 뜻이다. */
   button.preset.on {
