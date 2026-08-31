@@ -615,6 +615,14 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
     if not watches:
         return summary
 
+    # CGV가 그만하라고 한 동안은 통째로 쉰다. 여기서 걸러 내지 않으면 회차마다
+    # 같은 경고가 찍혀(35건이면 35줄) 정작 무슨 일인지 안 보인다.
+    left = session.throttled_for()
+    if left > 0:
+        watch.log.info("CGV 요청 제한으로 이번 바퀴는 건너뜁니다 (%.0f초 남음)",
+                       left)
+        return summary
+
     catalog = watch.Catalog(session)
     cost = _CycleCost()
     # 이 바퀴 안에서만 사는 캐시. 같은 (극장·영화·날짜)를 여러 감시가 함께 보면

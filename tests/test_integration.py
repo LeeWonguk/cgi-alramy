@@ -734,6 +734,7 @@ class TestBatchedJson(unittest.TestCase):
         """evaluate가 정해진 답을 주는 세션. replies는 경로 → 항목 dict."""
         session = watch.CgvSession.__new__(watch.CgvSession)
         session.requests = 0
+        session._throttled_until = 0.0
         calls = []
 
         def evaluate(script, arg):
@@ -832,6 +833,7 @@ class TestBatchedJson(unittest.TestCase):
     def test_a_dead_batch_falls_back_instead_of_dying(self):
         s = watch.CgvSession.__new__(watch.CgvSession)
         s.requests = 0
+        s._throttled_until = 0.0
 
         def boom(script, arg):
             raise RuntimeError("페이지가 갈아 끼워지는 중")
@@ -841,6 +843,75 @@ class TestBatchedJson(unittest.TestCase):
         s._current = None
         s._spaces[None] = watch._OwnerSpace(object(), page)
         self.assertEqual(s.get_json_many(["/a", "/b"]), [None, None])
+
+
+class TestThrottling(unittest.TestCase):
+    """CGV가 429로 거절하면 물러나야 한다 — 재시도로 맞서면 더 때리는 셈이다.
+
+    2026-08-31 실측: 사이클을 11.8초에서 2.2초로 줄이자 폴링 3초와 겹쳐 요청이
+    초당 3.4건에서 13.7건으로 뛰었고, 묶음 16건이 한꺼번에 나가면서 429를 받았다.
+    빨라진 만큼 상대에게 부담이 간다.
+    """
+
+    def make_session(self, replies):
+        session = watch.CgvSession.__new__(watch.CgvSession)
+        session.requests = 0
+        session._throttled_until = 0.0
+        self.calls = []
+
+        def evaluate(script, arg):
+            if isinstance(arg, dict) and "paths" in arg:
+                self.calls.append(list(arg["paths"]))
+                return [replies.get(p, {"status": 0}) for p in arg["paths"]]
+            self.calls.append([arg])            # get_json 경로
+            return replies.get(arg, {"status": 0, "text": ""})
+
+        page = type("P", (), {"evaluate": staticmethod(evaluate)})()
+        session._spaces = watch.OrderedDict()
+        session._current = None
+        session._spaces[None] = watch._OwnerSpace(object(), page)
+        return session
+
+    def test_a_429_is_not_retried(self):
+        """예전에는 2초·4초 백오프로 세 번을 더 보냈다 — 세 배로 때리는 짓이다."""
+        s = self.make_session({"/a": {"status": 429, "text": ""}})
+        with self.assertRaises(watch.Throttled):
+            s.get_json("/a")
+        self.assertEqual(len(self.calls), 1, "429를 받고도 다시 보냈다")
+
+    def test_a_429_stops_the_rest_of_the_batch(self):
+        s = self.make_session({"/p0": {"status": 429}})
+        paths = [f"/p{i}" for i in range(watch.SEAT_MAP_BATCH * 3)]
+        out = s.get_json_many(paths)
+        self.assertEqual(len(out), len(paths), "결과 길이는 유지돼야 한다")
+        self.assertTrue(all(o is None for o in out))
+        self.assertEqual(len(self.calls), 1, "거절당한 뒤에도 계속 보냈다")
+
+    def test_while_throttled_nothing_is_sent(self):
+        s = self.make_session({"/a": {"status": 429, "text": ""}})
+        with self.assertRaises(watch.Throttled):
+            s.get_json("/a")
+        before = len(self.calls)
+
+        with self.assertRaises(watch.Throttled):
+            s.get_json("/b")
+        self.assertEqual(s.get_json_many(["/c", "/d"]), [None, None])
+        self.assertEqual(len(self.calls), before, "쉬는 중에 요청을 보냈다")
+
+    def test_the_wait_is_reported(self):
+        s = self.make_session({"/a": {"status": 429, "text": ""}})
+        with self.assertRaises(watch.Throttled):
+            s.get_json("/a")
+        self.assertGreater(s.throttled_for(), 0)
+        self.assertLessEqual(s.throttled_for(), watch.THROTTLE_BACKOFF_SECONDS)
+
+    def test_a_healthy_session_is_never_throttled(self):
+        s = self.make_session({})
+        self.assertEqual(s.throttled_for(), 0)
+
+    def test_the_batch_stays_small_enough(self):
+        """묶음을 키웠다가 429를 받고 되돌렸다 — 다시 키우면 같은 일이 난다."""
+        self.assertLessEqual(watch.SEAT_MAP_BATCH, 8)
 
 
 class TestOwnerSpacesAreIsolated(unittest.TestCase):

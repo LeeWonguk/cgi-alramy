@@ -120,9 +120,16 @@ OWNER_SPACE_LIMIT = 4
 # 좌석맵을 한 번에 묶어 받을 개수. 두 가지를 함께 막는다:
 #   · 한 프로토콜 메시지가 커지는 것 — 624석 IMAX 한 건이 깎고도 214KB다
 #   · CGV로 나가는 요청이 한꺼번에 터지는 것 — 부하는 계속 신경 써 왔다
-# 값 배열로 보내면 한 건이 1/3.5로 줄어(6.6MB → 1.9MB) 메시지가 작아지므로,
-# 예전보다 크게 묶어도 안전하다. 묶음이 적을수록 왕복 대기가 준다.
-SEAT_MAP_BATCH = 16
+# 한 번에 묶어 보낼 개수.
+#
+# 16까지 올렸다가 CGV에서 429(Too Many Requests)를 받고 되돌렸다. 사이클을
+# 11.8초에서 2.2초로 줄이면서 폴링 3초와 겹쳐, 요청이 초당 3.4건에서 13.7건으로
+# 뛴 상태였다 — 거기에 16건이 한꺼번에 나갔다. **빨라진 만큼 상대에게 부담이
+# 간다**는 걸 이 숫자로 배웠다.
+SEAT_MAP_BATCH = 6
+
+# 429를 받으면 이만큼 쉰다. CGV가 그만하라고 한 것이므로 재시도로 맞서지 않는다.
+THROTTLE_BACKOFF_SECONDS = 60
 WEEKDAYS = "월화수목금토일"
 
 log = logging.getLogger("cgv-watch")
@@ -194,6 +201,14 @@ def normalize(name: str) -> str:
 
 
 # ── CGV 세션 ────────────────────────────────────────────────────────────────
+class Throttled(RuntimeError):
+    """CGV가 429로 요청을 거절했다 — 잠시 물러나야 한다.
+
+    재시도로 맞서면 안 된다. 예전에는 get_json이 2초·4초 백오프로 세 번을 더
+    보냈는데, 그건 그만하라는 쪽에 세 배로 때리는 짓이다.
+    """
+
+
 class AuthRequired(RuntimeError):
     """CGV가 401을 냈다 — 로그인이 끊겼으니 세션을 되살려야 한다.
 
@@ -253,6 +268,10 @@ class CgvSession:
         self._current: int | None = None
         self.requests = 0  # 사이클당 CGV 요청 수 — 대시보드에서 부하를 본다
         self.opened_at: datetime | None = None
+        # 429를 받으면 이 시각까지 요청을 보내지 않는다. 브라우저 하나를
+        # 공유하므로 소유자와 무관하게 세션 전체가 함께 쉰다 — 상대 쪽에서
+        # 보면 우리는 한 곳이다.
+        self._throttled_until = 0.0
 
     def __enter__(self) -> "CgvSession":
         from playwright.sync_api import sync_playwright
@@ -445,6 +464,21 @@ class CgvSession:
         except Exception:  # noqa: BLE001 - 죽었는지 보는 게 목적이다
             return False
 
+    def throttled_for(self) -> float:
+        """지금 쉬어야 하는 남은 초. 0이면 요청해도 된다 (호출자용)."""
+        return self._throttle_left()
+
+    def _throttle_left(self) -> float:
+        """지금 쉬어야 하는 남은 초. 0이면 보내도 된다."""
+        return max(0.0, self._throttled_until - time.monotonic())
+
+    def _start_throttle(self, path: str) -> None:
+        if self._throttle_left() <= 0:
+            log.warning("CGV가 요청을 거절했습니다 (HTTP 429) — %d초 쉽니다. "
+                        "확인 간격을 늘리거나 감시 회차를 줄이는 편이 좋습니다 "
+                        "(%s)", THROTTLE_BACKOFF_SECONDS, path.split("?")[0])
+        self._throttled_until = time.monotonic() + THROTTLE_BACKOFF_SECONDS
+
     def get_json(self, path: str, retries: int = 2) -> dict:
         """API를 호출해 JSON을 반환. 실패하면 지수 백오프로 재시도."""
         script = """async (path) => {
@@ -452,6 +486,11 @@ class CgvSession:
             const text = await res.text();
             return {status: res.status, text: text};
         }"""
+
+        left = self._throttle_left()
+        if left > 0:
+            raise Throttled(f"{path.split('?')[0]}: CGV가 요청을 거절해 "
+                            f"{left:.0f}초 더 쉬는 중입니다")
 
         last_error = ""
         for attempt in range(retries + 1):
@@ -469,6 +508,11 @@ class CgvSession:
                 # 호출자가 세션을 되살릴 기회를 준다 (cgv_login.recover_session).
                 raise AuthRequired(
                     f"{path.split('?')[0]}: 로그인이 필요합니다 (HTTP 401)")
+            if out["status"] == 429:
+                # 그만하라는 답이다. 재시도로 맞서면 세 배로 때리는 셈이다.
+                self._start_throttle(path)
+                raise Throttled(f"{path.split('?')[0]}: CGV가 요청을 거절했습니다 "
+                                f"(HTTP 429)")
             if out["status"] != 200:
                 last_error = f"HTTP {out['status']}"
                 continue
@@ -510,6 +554,10 @@ class CgvSession:
         """
         if not paths:
             return []
+        if self._throttle_left() > 0:
+            # 쉬는 중이면 아예 보내지 않는다. 전부 None이라 호출자는 "못 받았다"로
+            # 다루고, 개별 폴백도 같은 이유로 즉시 Throttled를 낸다.
+            return [None] * len(paths)
 
         # eval을 쓰지 않는다 — CGV 페이지의 CSP가 막을 수 있고, 막히면 배치가
         # 통째로 실패한다. 깎는 규칙은 필드 목록으로 넘긴다.
@@ -556,11 +604,20 @@ class CgvSession:
                             "하나씩 받습니다", exc)
                 out.extend([None] * len(chunk))
                 continue
+            throttled = False
             for path, item in zip(chunk, results):
+                if item and item.get("status") == 429:
+                    self._start_throttle(path)
+                    throttled = True
                 payload = self._one_of_many(path, item)
                 if payload is not None and seat_fields:
                     payload = self._inflate_seats(payload, seat_fields)
                 out.append(payload)
+            if throttled:
+                # 남은 묶음은 보내지 않는다. 거절당한 뒤에도 계속 보내면
+                # 그만하라는 쪽을 더 때리는 셈이다.
+                out.extend([None] * (len(paths) - len(out)))
+                break
         return out
 
     @staticmethod
