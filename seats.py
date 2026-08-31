@@ -479,6 +479,34 @@ SEAT_RECHECK_SECONDS = (0.0, 20.0, 90.0)
 # 회차별 마지막 조회 시각 {키: monotonic}. 재확인 간격을 재는 데만 쓴다.
 _last_fetched: dict = {}
 
+# 회차별 마지막으로 본 잔여 좌석 수 {키: int}.
+#
+# **상영표가 이미 답을 들고 있다.** searchSchByMov 응답의 frSeatCnt가 그 회차의
+# 빈자리 수고, 좌석맵을 열어 센 것과 정확히 일치한다(2026-08-31 실측: 6/5/6석
+# 세 회차 모두 일치). 상영표 1건이 그 날짜의 **모든 회차**를 덮으므로, 이 값이
+# 그대로면 좌석맵을 열 이유가 없다.
+#
+# 예전에는 회차마다 좌석맵을 받았다 — 사이클당 35건. 이제 상영표 6건으로
+# 판단하고, 숫자가 움직인 회차만 연다.
+_last_count: dict = {}
+
+# 상영표를 언제 다시 받았는지 {(극장,영화,날짜): monotonic}.
+#
+# **좌석맵을 상영표로 대체하고 나니 상영표가 병목이 됐다.** 날짜 5개를 3초마다
+# 받으면 분당 100건이다. 그래서 좌석맵과 같은 우선순위 간격을 상영표에도 건다 —
+# 가까운 날짜는 매 바퀴, 먼 날짜는 드물게. 이 캐시는 **바퀴를 넘겨 산다**(앞의
+# sched_cache는 한 바퀴짜리였다).
+_schedule_at: dict = {}
+_schedule_rows: dict = {}
+
+# 숫자가 그대로여도 이만큼 지나면 한 번은 연다.
+#
+# **왜 필요한가.** frSeatCnt는 총합이라, 우리가 보는 열에서 한 자리가 풀리고
+# 동시에 다른 곳에서 한 자리가 팔리면 숫자가 그대로다 — 그 사이에 난 자리를
+# 놓친다. 3초 간격에서 그런 동시 교차는 드물지만 0은 아니므로, 주기적으로
+# 실제 좌석맵을 확인해 놓칠 수 있는 시간을 이 값으로 묶어 둔다.
+FULL_REFRESH_SECONDS = 120.0
+
 # 큐에서 이만큼 기다릴 때마다 순위가 한 칸 올라간다.
 #
 # **순위만으로는 굶는다.** 급한 회차가 매 창 예산을 다 채우면 먼 회차는 영영
@@ -591,8 +619,47 @@ class _CycleCost:
         return f"합계 {total:.1f}s ({parts})"
 
 
+def _seat_count(row: dict) -> int | None:
+    """상영표 한 회차의 잔여 좌석 수. 못 읽으면 None.
+
+    frSeatCnt는 좌석맵을 열어 센 것과 일치한다(실측). frtmpSeatCnt는 임시
+    선점분까지 더한 값이라 다르다 — 이쪽을 쓰면 안 된다.
+    """
+    try:
+        return int(row["frSeatCnt"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _schedule(session, key, rank, *, cost=None, sched_cache=None):
+    """상영표를 받는다. 최근에 받았으면 그걸 쓴다. 실패하면 None.
+
+    상영표에는 회차별 잔여 좌석 수가 들어 있어(frSeatCnt) 좌석맵을 열지 말지를
+    이걸로 판단한다 — 그래서 이 호출의 빈도가 곧 감지 주기다. 급한 날짜는 매
+    바퀴, 먼 날짜는 드물게 받는다.
+    """
+    if sched_cache is not None and key in sched_cache:
+        return sched_cache[key]     # 같은 바퀴 안에서는 한 번만
+
+    gap = SEAT_RECHECK_SECONDS[min(rank, len(SEAT_RECHECK_SECONDS) - 1)]
+    seen = _schedule_at.get(key)
+    if seen is not None and time.monotonic() - seen < gap and key in _schedule_rows:
+        rows = _schedule_rows[key]
+    else:
+        try:
+            with cost.call("상영표") if cost else contextlib.nullcontext():
+                rows = session.showtimes(key[0], key[1], key[2])
+        except RuntimeError:
+            return None
+        _schedule_at[key] = time.monotonic()
+        _schedule_rows[key] = rows
+    if sched_cache is not None:
+        sched_cache[key] = rows
+    return rows
+
+
 def _prefetch_seat_maps(session, catalog, group, *, cost=None,
-                        sched_cache=None) -> dict:
+                        sched_cache=None, unchanged: set | None = None) -> dict:
     """이 소유자가 볼 좌석맵을 큐에 쌓고, **예산만큼만** 받아 온다.
 
     예전에는 볼 것을 매 바퀴 전부 받으려 했다. 사이클을 11.8초에서 2.2초로
@@ -610,6 +677,8 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
 
     owner = group[0]["owner_id"] if group else None
     queue: dict = _pending.setdefault(owner, {})
+    if unchanged is None:
+        unchanged = set()
 
     # 1) 이번 바퀴에 볼 것을 큐에 올린다. 이미 있으면 그대로 둔다 — 먼저 들어온
     #    것이 더 오래 기다렸다는 뜻이라 순서를 흔들 이유가 없다.
@@ -620,27 +689,33 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
             continue
         site_no, mov_no = site["siteNo"], movie["movNo"]
         sched_key = (site_no, mov_no, w["scn_ymd"])
-        if sched_cache is not None and sched_key in sched_cache:
-            schedule = sched_cache[sched_key]
-        else:
-            try:
-                with cost.call("상영표") if cost else contextlib.nullcontext():
-                    schedule = session.showtimes(site_no, mov_no, w["scn_ymd"])
-            except RuntimeError:
-                continue        # 본 루프가 같은 실패를 만나 사유를 기록한다
-            if sched_cache is not None:
-                sched_cache[sched_key] = schedule
+        rank = seat_priority(w["scn_ymd"])
+        schedule = _schedule(session, sched_key, rank, cost=cost,
+                             sched_cache=sched_cache)
+        if schedule is None:
+            continue            # 본 루프가 같은 실패를 만나 사유를 기록한다
 
         schedule = select_showtimes(
             schedule, scn_time=w.get("scn_time") or "",
             scn_time_from=w.get("scn_time_from") or "",
             scn_time_to=w.get("scn_time_to") or "")
-        rank = seat_priority(w["scn_ymd"])
         gap = SEAT_RECHECK_SECONDS[min(rank, len(SEAT_RECHECK_SECONDS) - 1)]
         for row in rows_to_check(w, schedule):
             key = seat_map_key(w, row, site_no)
             if key in queue:
                 continue
+            # **상영표가 이미 잔여 좌석 수를 알려 줬다.** 그 값이 그대로면 이
+            # 회차의 좌석 배치는 바뀌지 않았으므로 좌석맵을 열 이유가 없다.
+            count = _seat_count(row)
+            if count is not None:
+                before = _last_count.get(key)
+                _last_count[key] = count
+                fetched = _last_fetched.get(key)
+                stale = (fetched is None
+                         or time.monotonic() - fetched >= FULL_REFRESH_SECONDS)
+                if before == count and not stale:
+                    unchanged.add(key)
+                    continue
             # 방금 본 회차는 다시 올리지 않는다. 이게 없으면 가까운 날짜가 매 창
             # 예산을 채워 먼 날짜가 영영 밀린다.
             seen = _last_fetched.get(key)
@@ -755,9 +830,11 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
         guard = _AuthGuard(owner_id)
         # 좌석맵을 미리 묶어 받는다. 실패해도 본 루프가 개별로 받으므로
         # 여기서 예외를 밖으로 내지 않는다.
+        unchanged: set = set()
         try:
             prefetched = _prefetch_seat_maps(session, catalog, group, cost=cost,
-                                             sched_cache=sched_cache)
+                                             sched_cache=sched_cache,
+                                             unchanged=unchanged)
         except Exception as exc:  # noqa: BLE001 - 미리 받기는 부가 기능이다
             watch.log.warning("좌석맵을 미리 받지 못했습니다 (%s) — "
                               "하나씩 받습니다", exc)
@@ -767,7 +844,7 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
             sent = _check_one_seat_watch(
                 session, catalog, w, webhook, webhook_kind, guard=guard,
                 dry_run=dry_run, cost=cost, sched_cache=sched_cache,
-                warmed=warmed, prefetched=prefetched)
+                warmed=warmed, prefetched=prefetched, unchanged=unchanged)
             summary["alerts_sent"] += sent
 
     # 사이클이 폴링 간격을 넘으면 다음 슬롯을 통째로 놓친다 — 그 사실이 로그에
@@ -810,7 +887,8 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                           dry_run: bool, cost: "_CycleCost | None" = None,
                           sched_cache: dict | None = None,
                           warmed: set | None = None,
-                          prefetched: dict | None = None) -> int:
+                          prefetched: dict | None = None,
+                          unchanged: set | None = None) -> int:
     """좌석 감시 하나를 확인하고 보낸 알림 수를 돌려준다.
 
     cost·sched_cache·warmed는 한 바퀴를 함께 도는 감시들이 나눠 쓴다. 안 넘겨도
@@ -899,6 +977,15 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
 
     for row in rows_to_check(w, schedule):
         key = showtime_key(row)
+        # 상영표의 잔여 좌석 수가 그대로였다 — 좌석 배치가 안 바뀌었으므로
+        # 직전 상태를 그대로 쓴다. **확인한 것이지 건너뛴 게 아니다**(checked).
+        if unchanged and seat_map_key(w, row, site_no) in unchanged:
+            if key in prev:
+                fresh_state[key] = prev[key]
+            checked += 1
+            if cost:
+                cost.hit("좌석맵(변화없음)")
+            continue
         try:
             # 사이클 앞에서 묶어 받아 둔 것이 있으면 쓴다. 없으면(그 항목만
             # 실패했거나 프리페치가 통째로 안 됐으면) 지금처럼 개별로 받는다 —

@@ -611,10 +611,10 @@ class TestPendingQueue(unittest.TestCase):
             return {"siteNo": "0013", "siteNm": q}, ""
 
     def setUp(self):
-        seats._pending.clear()
-        seats._last_fetched.clear()
-        self.addCleanup(seats._pending.clear)
-        self.addCleanup(seats._last_fetched.clear)
+        for cache in (seats._pending, seats._last_fetched, seats._last_count,
+                      seats._schedule_at, seats._schedule_rows):
+            cache.clear()
+            self.addCleanup(cache.clear)
 
 
 
@@ -736,6 +736,28 @@ class TestPendingQueue(unittest.TestCase):
         self.assertLessEqual(len(seats._pending[7]), seats.PENDING_LIMIT)
 
 
+class TestScheduleCarriesTheAnswer(unittest.TestCase):
+    """상영표가 이미 잔여 좌석 수를 들고 있다 — 좌석맵을 열 이유가 대개 없다.
+
+    2026-08-31 실측: searchSchByMov의 frSeatCnt가 좌석맵을 열어 센 것과 정확히
+    일치했다(6/5/6석 세 회차). 상영표 1건이 그 날짜의 **모든 회차**를 덮으므로,
+    이 값이 그대로면 좌석 배치도 그대로다.
+    """
+
+    def test_it_reads_the_free_seat_count(self):
+        self.assertEqual(seats._seat_count({"frSeatCnt": "6"}), 6)
+
+    def test_the_temp_held_count_is_not_used(self):
+        """frtmpSeatCnt는 임시 선점분까지 더한 값이라 좌석맵과 다르다."""
+        row = {"frSeatCnt": "6", "frtmpSeatCnt": "12"}
+        self.assertEqual(seats._seat_count(row), 6)
+
+    def test_a_missing_count_is_unknown_not_zero(self):
+        """못 읽으면 좌석맵을 열어야 한다 — 0으로 보면 '자리 없음'이 된다."""
+        for row in ({}, {"frSeatCnt": None}, {"frSeatCnt": "?"}):
+            self.assertIsNone(seats._seat_count(row), row)
+
+
 class TestSeatFieldsAreEnough(unittest.TestCase):
     """좌석맵을 묶어 받을 때 브라우저에서 필드를 깎는다 — 그래도 결과가 같아야 한다.
 
@@ -850,10 +872,10 @@ class TestPrefetchIsShared(unittest.TestCase):
             return {"siteNo": "0013", "siteNm": q}, ""
 
     def setUp(self):
-        seats._pending.clear()
-        seats._last_fetched.clear()
-        self.addCleanup(seats._pending.clear)
-        self.addCleanup(seats._last_fetched.clear)
+        for cache in (seats._pending, seats._last_fetched, seats._last_count,
+                      seats._schedule_at, seats._schedule_rows):
+            cache.clear()
+            self.addCleanup(cache.clear)
 
     def group(self, n=4):
         return [{"id": i, "owner_id": 1, "movie_query": "오디세이",
