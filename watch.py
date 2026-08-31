@@ -100,9 +100,16 @@ LOG_PATH = ROOT / "logs" / "watch.log"
 
 FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 웹훅 경고
 
-# 예매 화면을 미리 띄워 둘 탭의 최대 개수. 자동 예매를 켠 감시가 날짜별로 여럿이어도
-# 몇 개면 충분하고, 탭마다 CGV 화면 하나가 통째로 살아 있으므로 무한정 늘리지 않는다.
-BOOKING_PAGE_LIMIT = 4
+# 예매 화면을 미리 띄워 둘 탭의 최대 개수.
+#
+# **모자라면 조용히 손해가 난다.** 감시하는 (영화·극장·날짜) 조합이 이 수를 넘으면
+# LRU가 매 사이클 탭을 갈아치우고, 그때마다 딥링크를 다시 연다 — 실측으로 6개
+# 조합에 상한이 4일 때 사이클마다 5번을 다시 열어 4.2초를 썼다. 프리워밍은
+# "이미 열려 있으면 0초"라서 하는 것인데, 정확히 그 이득이 사라진다.
+#
+# 그래서 넉넉히 잡고, 그래도 넘치면 로그로 알린다(_evict_booking_page).
+# 날짜를 2주치 걸어도 덮을 만한 수다.
+BOOKING_PAGE_LIMIT = 12
 
 # 동시에 살려 둘 소유자 공간(BrowserContext)의 최대 개수. 컨텍스트는 브라우저
 # 프로세스를 공유하므로 탭 몇 개보다 조금 무거운 정도지만, 사용자가 늘어도
@@ -113,7 +120,9 @@ OWNER_SPACE_LIMIT = 4
 # 좌석맵을 한 번에 묶어 받을 개수. 두 가지를 함께 막는다:
 #   · 한 프로토콜 메시지가 커지는 것 — 624석 IMAX 한 건이 깎고도 214KB다
 #   · CGV로 나가는 요청이 한꺼번에 터지는 것 — 부하는 계속 신경 써 왔다
-SEAT_MAP_BATCH = 8
+# 값 배열로 보내면 한 건이 1/3.5로 줄어(6.6MB → 1.9MB) 메시지가 작아지므로,
+# 예전보다 크게 묶어도 안전하다. 묶음이 적을수록 왕복 대기가 준다.
+SEAT_MAP_BATCH = 16
 WEEKDAYS = "월화수목금토일"
 
 log = logging.getLogger("cgv-watch")
@@ -394,10 +403,15 @@ class CgvSession:
                 return page
             except Exception:  # noqa: BLE001 - 닫혔으면 새로 연다
                 tabs.pop(key, None)
-        # 탭이 무한정 늘지 않게 오래된 것부터 닫는다. 자동 예매를 켠 감시가
-        # 날짜별로 여럿이어도 몇 개면 충분하다. 이 한도는 **소유자마다** 따로다.
+        # 탭이 무한정 늘지 않게 오래된 것부터 닫는다. 이 한도는 **소유자마다** 따로다.
         while len(tabs) >= BOOKING_PAGE_LIMIT:
-            _, old = tabs.popitem(last=False)
+            victim, old = tabs.popitem(last=False)
+            # 조용히 넘어가면 안 된다. 여기 걸린다는 건 매 사이클 탭을 갈아치우고
+            # 있다는 뜻이고, 그러면 프리워밍이 통째로 무의미해진다.
+            log.warning("예매 화면 탭이 가득 차 %s를 닫습니다 — 감시하는 조합이 "
+                        "%d개를 넘었습니다. 매 사이클 화면을 다시 열게 되니 "
+                        "BOOKING_PAGE_LIMIT을 올리는 편이 좋습니다.",
+                        victim, BOOKING_PAGE_LIMIT)
             try:
                 old.close()
             except Exception:  # noqa: BLE001 - 이미 닫혔을 수 있다
@@ -501,17 +515,17 @@ class CgvSession:
         # 통째로 실패한다. 깎는 규칙은 필드 목록으로 넘긴다.
         script = """async (arg) => {
             const keep = arg.seatFields;
+            // 좌석을 **값 배열로** 보낸다. 키 이름이 좌석마다(624석 × 회차 수)
+            // 반복되는 게 전송 비용의 대부분이었다 — 실측 6.6MB → 1.9MB,
+            // 전송 1760ms → 829ms. 파이썬 쪽에서 같은 순서로 되돌린다.
             const slim = (data) => {
                 if (!keep || !data || !data.data) return data;
                 const items = data.data.items;
                 if (!Array.isArray(items)) return data;
                 for (const item of items) {
                     if (!Array.isArray(item.seats)) continue;
-                    item.seats = item.seats.map((s) => {
-                        const out = {};
-                        for (const k of keep) if (k in s) out[k] = s[k];
-                        return out;
-                    });
+                    item.seats = item.seats.map(
+                        (s) => keep.map((k) => (k in s ? s[k] : null)));
                 }
                 return data;
             };
@@ -543,8 +557,29 @@ class CgvSession:
                 out.extend([None] * len(chunk))
                 continue
             for path, item in zip(chunk, results):
-                out.append(self._one_of_many(path, item))
+                payload = self._one_of_many(path, item)
+                if payload is not None and seat_fields:
+                    payload = self._inflate_seats(payload, seat_fields)
+                out.append(payload)
         return out
+
+    @staticmethod
+    def _inflate_seats(payload: dict, fields: list[str]) -> dict:
+        """값 배열로 온 좌석을 원래 모양(dict)으로 되돌린다.
+
+        브라우저가 키 이름을 떼고 보냈으므로 같은 순서로 다시 붙인다. 되돌린
+        결과는 원본에서 그 필드만 남긴 것과 **똑같다** — seats.parse_seats가
+        그대로 읽는다.
+        """
+        for item in (payload.get("data") or {}).get("items") or []:
+            rows = item.get("seats")
+            if not isinstance(rows, list):
+                continue
+            item["seats"] = [
+                dict(zip(fields, row)) if isinstance(row, list) else row
+                for row in rows
+            ]
+        return payload
 
     @staticmethod
     def _one_of_many(path: str, item: dict | None) -> dict | None:

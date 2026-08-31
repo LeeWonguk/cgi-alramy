@@ -750,6 +750,37 @@ class TestBatchedJson(unittest.TestCase):
         return {"status": 200, "json": {"statusCode": 0,
                                         "data": payload or {"items": []}}}
 
+    def test_compact_seats_are_inflated_back(self):
+        """좌석을 값 배열로 받아 원래 모양으로 되돌린다.
+
+        키 이름이 좌석마다(624석 × 회차 수) 반복되는 게 전송 비용의 대부분이라
+        브라우저에서 떼고 보낸다 — 실측 6.6MB → 1.9MB, 전송 1760ms → 829ms.
+        되돌린 결과가 원본과 다르면 감시가 조용히 틀린 좌석을 본다.
+        """
+        import seats as seats_mod
+
+        fields = seats_mod.SEAT_FIELDS
+        values = ["H", "13", "Y", "일반", "일반존", "일반", 1, 3, "N", "N",
+                  "L1", "1", "1", "1", "27", "01", "01"]
+        s, _ = self.make_session({
+            "/a": self.ok({"items": [{"seats": [values, values]}]})})
+        out = s.get_json_many(["/a"], seat_fields=fields)[0]
+        seats_back = out["data"]["items"][0]["seats"]
+        self.assertEqual(seats_back, [dict(zip(fields, values))] * 2)
+        # parse_seats가 그대로 읽을 수 있어야 한다
+        self.assertEqual(len(seats_mod.parse_seats(out["data"])), 2)
+
+    def test_without_seat_fields_the_payload_is_untouched(self):
+        s, _ = self.make_session({"/a": self.ok({"items": [{"seats": [{"x": 1}]}]})})
+        out = s.get_json_many(["/a"])[0]
+        self.assertEqual(out["data"]["items"][0]["seats"], [{"x": 1}])
+
+    def test_an_odd_shape_is_left_alone(self):
+        """모양이 예상과 다르면 건드리지 않는다 — 조용히 뭉개면 안 된다."""
+        s, _ = self.make_session({"/a": self.ok({"items": [{"seats": "이상함"}]})})
+        out = s.get_json_many(["/a"], seat_fields=["a"])[0]
+        self.assertEqual(out["data"]["items"][0]["seats"], "이상함")
+
     def test_good_items_come_back_in_order(self):
         s, _ = self.make_session({
             "/a": self.ok({"items": ["A"]}), "/b": self.ok({"items": ["B"]})})
