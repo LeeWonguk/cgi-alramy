@@ -890,6 +890,56 @@ class TestAlertDedupeIsPerSeatWatch(DbCase):
         self.assertIsNone(rows[0]["seat_watch_id"])
 
 
+class TestSchemaStaysIdempotent(DbCase):
+    """schema.sql은 서버가 뜰 때마다 통째로 실행된다 — 두 번째부터 깨지면 안 된다.
+
+    2026-08-31 배포에서 이렇게 죽었다:
+
+        ERROR: could not create unique index "seat_watches_uniq_idx"
+        DETAIL: Key (…, scn_time, screen_types, rows)=(…) is duplicated.
+
+    '만들고 → 나중에 DROP'을 한 파일에 같이 두면, 다음 기동에서 또 만들려 든다.
+    그때는 새 인덱스 기준으로만 구별되는 행이 이미 들어와 있어 좁은 인덱스가
+    만들어지지 않는다. 전체가 한 트랜잭션이라 **스키마가 통째로 롤백되고**,
+    앱은 db_error를 안은 채 떠서 모든 API가 401을 냈다.
+    """
+
+    def test_rerunning_the_schema_survives_rows_only_a_new_index_can_tell_apart(self):
+        uid = self.make_user("schema")["id"]
+        # 좌석 번호 범위만 다른 두 행 — 예전 좁은 인덱스로는 '중복'이다.
+        a = store.add_seat_watch(uid, "오디세이", "용산", "20260905",
+                                 screen_types=["IMAX"], rows=["H", "I"],
+                                 seat_num_from=13, seat_num_to=32)
+        b = store.add_seat_watch(uid, "오디세이", "용산", "20260905",
+                                 screen_types=["IMAX"], rows=["H", "I"])
+        self.assertNotEqual(a["id"], b["id"], "새 인덱스라면 두 행이어야 한다")
+
+        store.init_db()      # 재기동 — 여기서 터지면 로그인이 통째로 죽는다
+        self.assertIsNotNone(store.seat_watch(a["id"]), "롤백되면 안 된다")
+
+    def test_only_the_current_unique_index_is_created(self):
+        """지나간 이름을 다시 만들면 같은 사고가 반복된다."""
+        store.init_db()
+        with store.pool().connection() as conn:
+            names = {r["indexname"] for r in conn.execute(
+                "select indexname from pg_indexes "
+                "where tablename = 'seat_watches'").fetchall()}
+        self.assertIn("seat_watches_uniq_seatnum_idx", names)
+        for gone in ("seat_watches_uniq_idx", "seat_watches_uniq_range_idx"):
+            self.assertNotIn(gone, names, f"{gone}가 되살아났다")
+
+    def test_the_schema_file_never_creates_a_superseded_index(self):
+        """소스 차원에서 못박는다 — DROP되는 이름을 CREATE하면 안 된다."""
+        import re
+
+        sql = (ROOT / "schema.sql").read_text(encoding="utf-8")
+        created = set(re.findall(r"^CREATE UNIQUE INDEX IF NOT EXISTS (\w+)",
+                                 sql, re.M))
+        dropped = set(re.findall(r"^DROP INDEX IF EXISTS (\w+)", sql, re.M))
+        both = created & dropped
+        self.assertFalse(both, f"같은 파일에서 만들고 지우는 인덱스: {both}")
+
+
 class TestDbErrorRecovers(DbCase):
     """DB가 늦게 뜨면 앱이 '떠 있지만 아무도 로그인 못 하는' 상태로 굳었다.
 

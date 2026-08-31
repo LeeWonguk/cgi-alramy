@@ -296,9 +296,20 @@ BEGIN
     END LOOP;
 END $$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_idx
-    ON seat_watches (owner_id, movie_query, site_query, scn_ymd, scn_time,
-                     screen_types, rows);
+-- 여기 있던 seat_watches_uniq_idx CREATE는 지웠다. 유일성은 아래에서 컬럼을
+-- 더 넣은 인덱스로 이어지고, 이 이름은 파일 끝에서 DROP된다.
+--
+-- **왜 지웠는지가 중요하다.** 이 파일은 서버가 뜰 때마다 통째로 실행되는데,
+-- '만들고 → 나중에 DROP'을 한 파일에 같이 두면 다음 기동에서 또 만들려 든다.
+-- 그런데 그때는 새 인덱스 기준으로만 구별되는 행이 이미 들어와 있어서, 좁은
+-- 인덱스는 더 이상 만들어지지 않는다:
+--
+--   ERROR: could not create unique index "seat_watches_uniq_idx"
+--   DETAIL: Key (…, scn_time, screen_types, rows)=(…) is duplicated.
+--
+-- 전체가 한 트랜잭션이라(store.init_db) **스키마가 통째로 롤백된다.** 그러면
+-- init_db()가 예외를 내고 앱은 db_error를 안은 채 뜬다 — 로그인은 되는데 모든
+-- API가 401을 내는, 원인을 짚기 어려운 상태다(2026-08-31 실측).
 
 
 -- ── 좌석 감시에 상영 시간 '범위' 지정 ────────────────────────────────────────
@@ -316,14 +327,8 @@ ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
     scn_time_to   text NOT NULL DEFAULT '';
 
 -- 같은 날짜에 시간대만 다른 감시를 따로 둘 수 있어야 한다 — 유일성에도 넣는다.
---
--- 이 파일은 서버가 뜰 때마다 통째로 실행된다(store.init_db). 그래서 예전 인덱스를
--- DROP하고 다시 만드는 대신 **이름을 새로 쓴다** — IF NOT EXISTS가 두 번째
--- 기동부터 통째로 건너뛰므로 매번 인덱스를 다시 세우지 않는다. 컬럼이 늘기만 한
--- 인덱스라 기존 행이 새 조건을 어길 일은 없다.
-CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_range_idx
-    ON seat_watches (owner_id, movie_query, site_query, scn_ymd, scn_time,
-                     scn_time_from, scn_time_to, screen_types, rows);
+-- 이 단계의 seat_watches_uniq_range_idx도 위와 같은 이유로 만들지 않는다.
+-- 지금 쓰는 인덱스는 파일 끝의 seat_watches_uniq_seatnum_idx 하나뿐이다.
 
 DROP INDEX IF EXISTS seat_watches_uniq_idx;
 
