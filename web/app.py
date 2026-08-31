@@ -17,6 +17,8 @@ import argparse
 import logging
 import os
 import sys
+import threading
+import time
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -104,8 +106,14 @@ def create_app(start_background: bool = True) -> Flask:
 
     worker = BrowserWorker()
     poller = Poller(worker)
-    app.extensions["cgv"] = {"worker": worker, "poller": poller,
-                             "db_error": db_error}
+    app.extensions["cgv"] = {
+        "worker": worker, "poller": poller,
+        "db_error": db_error,
+        # DB가 늦게 뜬 경우 되살리기 위한 상태. db_ready()만 건드린다.
+        "db_lock": threading.Lock(),
+        "db_next_try": 0.0,
+        "start_background": start_background,
+    }
 
     if start_background and db_error is None:
         worker.start()
@@ -119,6 +127,60 @@ def create_app(start_background: bool = True) -> Flask:
 
 def parts(app: Flask) -> dict:
     return app.extensions["cgv"]
+
+
+# DB가 죽어 있을 때 다시 붙어 보는 간격. 매 요청마다 시도하면 DB가 정말 죽은
+# 동안 모든 요청이 접속 타임아웃만큼 느려진다.
+DB_RETRY_COOLDOWN = 5.0
+
+
+def db_ready(app: Flask) -> str | None:
+    """지금 DB를 쓸 수 있으면 None, 못 쓰면 그 사유.
+
+    **시작할 때 본 값을 계속 들고 있으면 안 된다.** compose에서 Postgres가 몇 초
+    늦게 뜨는 것만으로 앱이 "떠 있지만 아무도 로그인 못 하는" 상태로 굳었다 —
+    세션을 읽는 곳이 이 값을 보고 있어서, 쿠키는 멀쩡한데 모든 API가 401을 냈다.
+    로그에는 401만 남아 원인을 짚기도 어려웠다.
+
+    그래서 실패해 있는 동안에는 요청이 올 때마다(쿨다운을 두고) 다시 붙어 본다.
+    되살아나면 그때 세션 키를 제자리로 돌리고 배경 작업을 띄운다.
+    """
+    info = parts(app)
+    if info["db_error"] is None:
+        return None                     # 정상 경로 — dict 조회 한 번이 전부다
+
+    now = time.monotonic()
+    if now < info["db_next_try"]:
+        return info["db_error"]         # 아직 기다릴 때다
+    if not info["db_lock"].acquire(blocking=False):
+        return info["db_error"]         # 다른 스레드가 시도 중
+    try:
+        if info["db_error"] is None:    # 기다리는 사이 다른 스레드가 살렸다
+            return None
+        info["db_next_try"] = now + DB_RETRY_COOLDOWN
+        try:
+            store.init_db()
+            secret = store.session_secret()
+        except Exception as exc:  # noqa: BLE001 - 접속 실패 종류가 여러 가지다
+            info["db_error"] = f"{exc}"
+            return info["db_error"]
+
+        # 세션 키를 DB의 값으로 되돌린다. 지금까지 쓰던 임시 키로 서명된 쿠키는
+        # 무효가 되지만, 그건 어차피 재기동하면 날아갈 키였다 — 여기서 바꿔 두지
+        # 않으면 다음 재기동 때 또 모두 로그아웃된다.
+        if app.secret_key != secret:
+            app.secret_key = secret
+            log.warning("DB가 살아나 세션 키를 제자리로 돌렸습니다 — 그 사이 "
+                        "로그인한 세션은 다시 로그인해야 합니다")
+        info["db_error"] = None
+        log.info("DB에 다시 접속했습니다")
+        if info["start_background"]:
+            # start()는 둘 다 멱등이라 이미 떠 있으면 아무 일도 하지 않는다.
+            info["worker"].start()
+            info["poller"].start()
+        return None
+    finally:
+        info["db_lock"].release()
 
 
 # ── 헬퍼 ────────────────────────────────────────────────────────────────────
@@ -273,7 +335,7 @@ def register_auth(app: Flask) -> None:
         게이트를 여기 한 곳에 두어 새 API를 추가할 때 인증을 빠뜨릴 수 없게 한다.
         """
         g.user = None
-        if parts(app)["db_error"] is None:
+        if db_ready(app) is None:
             user_id = session.get("user_id")
             if user_id:
                 g.user = store.user(user_id)
@@ -314,8 +376,9 @@ def register_auth(app: Flask) -> None:
         state = auth.local_login_state()
         if not state["enabled"]:
             return fail(f"로컬 계정 로그인이 꺼져 있습니다 — {state['reason']}", 403)
-        if parts(app)["db_error"]:
-            return fail(f"DB 접속 실패: {parts(app)['db_error']}", 503)
+        db_err = db_ready(app)
+        if db_err:
+            return fail(f"DB 접속 실패: {db_err}", 503)
 
         try:
             profile = auth.local_profile(str(body().get("name", "")))
@@ -435,14 +498,17 @@ def register_api(app: Flask) -> None:
         접속 문자열·워커 내부 상태·서버 버전은 소유자에게만 보낸다.
         """
         info = parts(app)
-        ok = info["db_error"] is None
+        # 헬스체크가 복구의 계기가 되게 한다 — compose가 이걸 주기적으로 부르므로,
+        # DB가 늦게 떠도 사람이 손대지 않고 되살아난다.
+        db_err = db_ready(app)
+        ok = db_err is None
         user = me()
         if not (user and user["is_owner"]):
             return jsonify({"ok": ok}), (200 if ok else 503)
 
         payload = {
             "ok": ok,
-            "db_error": info["db_error"],
+            "db_error": db_err,
             "worker": info["worker"].snapshot(),
             "poller": info["poller"].snapshot(),
         }
@@ -455,8 +521,9 @@ def register_api(app: Flask) -> None:
     @app.get("/api/dashboard")
     def dashboard():
         info = parts(app)
-        if info["db_error"]:
-            return fail(f"DB 접속 실패: {info['db_error']}", 503)
+        db_err = db_ready(app)
+        if db_err:
+            return fail(f"DB 접속 실패: {db_err}", 503)
 
         user = me()
         rows = store.targets(owner_id=user["id"])

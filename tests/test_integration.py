@@ -890,6 +890,116 @@ class TestAlertDedupeIsPerSeatWatch(DbCase):
         self.assertIsNone(rows[0]["seat_watch_id"])
 
 
+class TestDbErrorRecovers(DbCase):
+    """DB가 늦게 뜨면 앱이 '떠 있지만 아무도 로그인 못 하는' 상태로 굳었다.
+
+    2026-08-31 실측: 네이버 로그인이 끝까지 성공하고(state 검증까지 통과) 세션
+    쿠키도 멀쩡한데 /api/me가 계속 401이었다. before_request가 **시작할 때 한 번
+    정해진** db_error를 보고 세션을 아예 읽지 않았기 때문이다. compose에서
+    Postgres가 몇 초 늦게 뜨는 것만으로 이 상태가 되고, 로그에는 401만 남는다.
+    """
+
+    def make_app(self, *, fail_until: int, background=False):
+        """앞의 fail_until번은 DB 접속이 실패하는 앱을 만든다."""
+        import web.app
+
+        self.web = web.app
+        calls = {"n": 0}
+        real_init, real_secret = store.init_db, store.session_secret
+
+        def fake_init():
+            calls["n"] += 1
+            if calls["n"] <= fail_until:
+                raise RuntimeError("connection refused")
+            return real_init()
+
+        store.init_db = fake_init
+        self.addCleanup(setattr, store, "init_db", real_init)
+        try:
+            app = self.web.create_app(start_background=background)
+        finally:
+            store.init_db = fake_init      # create_app 밖에서도 계속 가짜를 쓴다
+        return app, calls
+
+    def test_a_late_database_is_picked_up(self):
+        app, _ = self.make_app(fail_until=1)
+        self.assertIsNotNone(self.web.parts(app)["db_error"], "실패가 기록돼야 한다")
+
+        self.web.parts(app)["db_next_try"] = 0.0        # 쿨다운을 지난 것으로
+        self.assertIsNone(self.web.db_ready(app), "DB가 살았는데 못 붙었다")
+        self.assertIsNone(self.web.parts(app)["db_error"])
+
+    def test_the_session_key_returns_to_the_stored_one(self):
+        """임시 랜덤 키를 그대로 두면 다음 재기동 때 또 전원 로그아웃된다."""
+        app, _ = self.make_app(fail_until=1)
+        temp_key = app.secret_key
+        self.web.parts(app)["db_next_try"] = 0.0
+        self.web.db_ready(app)
+        self.assertNotEqual(app.secret_key, temp_key)
+        self.assertEqual(app.secret_key, store.session_secret())
+
+    def test_a_still_dead_database_is_reported_not_hidden(self):
+        app, _ = self.make_app(fail_until=99)
+        self.web.parts(app)["db_next_try"] = 0.0
+        err = self.web.db_ready(app)
+        self.assertIsNotNone(err)
+        self.assertIn("connection refused", err)
+
+    def test_the_first_request_retries_right_away(self):
+        """DB가 1초 뒤에 떴다면 첫 요청에서 바로 되살아나야 한다."""
+        app, calls = self.make_app(fail_until=99)
+        before = calls["n"]
+        self.web.db_ready(app)
+        self.assertEqual(calls["n"], before + 1, "첫 요청이 시도조차 안 했다")
+
+    def test_retries_are_rate_limited(self):
+        """정말 죽어 있는 동안 매 요청마다 붙어 보면 전 요청이 느려진다."""
+        app, calls = self.make_app(fail_until=99)
+        self.web.db_ready(app)          # 첫 시도는 바로 나간다(위 테스트)
+        after_first = calls["n"]
+        for _ in range(50):
+            self.web.db_ready(app)
+        self.assertEqual(calls["n"], after_first, "쿨다운 안에서 또 시도했다")
+
+        self.web.parts(app)["db_next_try"] = 0.0
+        self.web.db_ready(app)
+        self.assertEqual(calls["n"], after_first + 1,
+                         "쿨다운이 지나면 한 번은 시도해야 한다")
+
+    def test_a_healthy_app_never_retries(self):
+        app, calls = self.make_app(fail_until=0)
+        self.assertIsNone(self.web.parts(app)["db_error"])
+        before = calls["n"]
+        for _ in range(100):
+            self.assertIsNone(self.web.db_ready(app))
+        self.assertEqual(calls["n"], before, "멀쩡한데 다시 붙어 봤다")
+
+    def test_background_work_starts_on_recovery(self):
+        """되살아나도 감시가 안 돌면 반쪽이다 — 화면만 열리고 알림은 안 온다."""
+        app, _ = self.make_app(fail_until=1, background=True)
+        info = self.web.parts(app)
+        started = []
+        info["worker"].start = lambda: started.append("worker")
+        info["poller"].start = lambda: started.append("poller")
+
+        info["db_next_try"] = 0.0
+        self.web.db_ready(app)
+        self.assertEqual(started, ["worker", "poller"])
+
+    def test_the_session_is_read_again_after_recovery(self):
+        """이게 원래 증상이다 — 쿠키는 멀쩡한데 401만 나오던 것."""
+        app, _ = self.make_app(fail_until=1)
+        uid = self.make_user("late-db")["id"]
+        client = app.test_client()
+        with client.session_transaction() as sess:
+            sess["user_id"] = uid
+
+        self.web.parts(app)["db_next_try"] = 0.0
+        res = client.get("/api/me")
+        self.assertEqual(res.status_code, 200, "복구 뒤에도 401이면 고쳐진 게 없다")
+        self.assertEqual(res.get_json()["user"]["id"], uid)
+
+
 class TestHealthIsReachableWithoutLogin(DbCase):
     """헬스체크는 로그인할 수 없는 쪽이 부른다 — 대신 내용을 권한에 따라 자른다."""
 
