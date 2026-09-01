@@ -183,12 +183,57 @@ class TestDiffAndSort(unittest.TestCase):
         )
 
 
-def _seat(row, no, x_start, x_end, available, *, left=False, right=False):
+def _seat(row, no, x_start, x_end, available, *, left=False, right=False,
+          salfrm="01"):
     """테스트용 좌석 하나. parse_seats가 내는 모양과 같게 만든다."""
     return {"row": row, "no": str(no), "label": f"{row}{no}",
             "available": available, "kind": "", "zone": "",
             "x_start": x_start, "x_end": x_end,
-            "left_pway": left, "right_pway": right}
+            "left_pway": left, "right_pway": right,
+            "seat_salfrm_cd": salfrm}
+
+
+class TestWheelchairSeats(unittest.TestCase):
+    """휠체어 전용석(seatSalfrmCd=04)은 어디에서도 후보가 되면 안 된다.
+
+    실제로 있었던 일: 매진에 가까운 IMAX 회차에서 624석 중 판매 가능한 것이
+    A17~A24의 6석뿐이었는데 그게 전부 휠체어석이었다. 좌석맵은 이 자리를
+    일반석과 똑같이 "판매 가능"으로 내려주므로, 자동 예매가 A17·A18을 잡으러
+    갔다가 "장애인 좌석 예매 제한" 팝업에 걸려 죽었다.
+    """
+
+    def _hall(self):
+        """A열은 휠체어석, H열은 일반석. 둘 다 비어 있다."""
+        return ([_seat("A", i, i * 2, i * 2 + 2, True, salfrm="04")
+                 for i in range(17, 25)]
+                + [_seat("H", i, i * 2, i * 2 + 2, True)
+                   for i in range(1, 21)])
+
+    def test_not_in_scope_even_without_a_row_filter(self):
+        chair = _seat("A", 17, 34, 36, True, salfrm="04")
+        self.assertFalse(seats.in_scope(chair))
+        self.assertFalse(seats.in_scope(chair, ["A"]))
+
+    def test_never_reported_as_available(self):
+        labels = seats.available_labels(self._hall())
+        self.assertTrue(all(l.startswith("H") for l in labels), labels)
+
+    def test_pick_block_skips_them(self):
+        block = seats.pick_block(self._hall(), 2)
+        self.assertTrue(all(s["row"] == "H" for s in block), block)
+
+    def test_no_seats_when_only_wheelchair_seats_are_left(self):
+        """그 6석만 남은 회차 — 잡을 자리가 없다고 해야 한다."""
+        only_chairs = [_seat("A", i, i * 2, i * 2 + 2, True, salfrm="04")
+                       for i in range(17, 25)]
+        self.assertEqual(seats.available_labels(only_chairs), set())
+        self.assertEqual(seats.pick_block(only_chairs, 2), [])
+        self.assertEqual(seats.max_consecutive(only_chairs), 0)
+
+    def test_not_counted_in_the_summary(self):
+        summary = seats.summarize(self._hall())
+        self.assertEqual(summary["total"], 20)
+        self.assertEqual(summary["rows"], ["H"])
 
 
 class TestConsecutive(unittest.TestCase):

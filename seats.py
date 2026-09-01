@@ -53,9 +53,25 @@ def parse_seats(seat_data: dict) -> list[dict]:
             "szone_no": s.get("szoneNo") or "",
             "stknd_cd": s.get("stkndCd") or "",
             "szone_kind_cd": s.get("szoneKindCd") or "",
+            # 판매형태 — 선점 바디에도 실리지만, 휠체어 전용석을 가려내는
+            # 유일한 단서이기도 하다(is_restricted).
             "seat_salfrm_cd": s.get("seatSalfrmCd") or "",
         })
     return out
+
+
+# 좌석의 판매형태(seatSalfrmCd). 04는 **휠체어 전용(장애인)석**이다.
+# 좌석맵 응답은 이 자리를 일반석과 똑같이 내려준다 — stkndNm도 "일반석",
+# szoneKindNm도 옆자리와 같고, 다른 것은 이 코드 하나뿐이다. 그래 놓고 실제로
+# 누르면 "장애인 좌석 예매 제한" 팝업으로 막는다. 매진이 가까운 회차에서는
+# 이 자리만 남는 일이 흔해서(실측: 624석 중 판매 가능 6석이 전부 여기였다),
+# 걸러 내지 않으면 자동 예매가 매번 그 팝업에 걸려 죽는다.
+WHEELCHAIR_SALFRM_CD = "04"
+
+
+def is_restricted(seat: dict) -> bool:
+    """일반 고객이 살 수 없는 좌석인지 — 지금은 휠체어 전용석."""
+    return (seat.get("seat_salfrm_cd") or "") == WHEELCHAIR_SALFRM_CD
 
 
 def _to_int(v) -> int | None:
@@ -106,7 +122,12 @@ def in_scope(seat: dict, rows=None, num_from=0, num_to=0) -> bool:
 
     번호를 못 읽는 좌석은 **범위를 걸었으면 뺀다.** 번호로 고른다고 해 놓고
     번호를 모르는 자리를 끼워 주면 범위 밖 좌석을 잡게 된다.
+
+    휠체어 전용석은 열·번호를 따지기 전에 뺀다. 열 필터를 안 건 감시라도 그
+    자리는 우리가 살 수 있는 좌석이 아니다.
     """
+    if is_restricted(seat):
+        return False
     wanted = normalize_rows(rows)
     if wanted and seat["row"].upper() not in wanted:
         return False
