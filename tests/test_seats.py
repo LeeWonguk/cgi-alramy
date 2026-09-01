@@ -656,8 +656,7 @@ class TestPendingQueue(unittest.TestCase):
             return {"siteNo": "0013", "siteNm": q}, ""
 
     def setUp(self):
-        for cache in (seats._pending, seats._last_fetched, seats._last_count,
-                      seats._schedule_at, seats._schedule_rows):
+        for cache in (seats._pending, seats._last_fetched, seats._last_count):
             cache.clear()
             self.addCleanup(cache.clear)
 
@@ -780,6 +779,110 @@ class TestPendingQueue(unittest.TestCase):
                                   sched_cache={})
         self.assertLessEqual(len(seats._pending[7]), seats.PENDING_LIMIT)
 
+
+class TestCancelledSeatDetection(unittest.TestCase):
+    """취소표는 몇 초만 떠 있다 — 잔여 좌석 수를 늦게 보면 통째로 놓친다.
+
+    실측(2026-09-01, 용산 IMAX 9/4 21:30)으로 취소표 한 석이 떠 있던 시간은
+    33·45·37·4초였다. 그런데 상영표에 좌석맵과 같은 우선순위 간격(0·20·90초)이
+    걸려 있어, 3일 뒤 상영은 20초마다·4일 뒤는 90초마다만 그 숫자를 봤다.
+    """
+
+    class Sess:
+        def __init__(self, count=6):
+            import watch
+
+            self.budget = watch.RateBudget(limit=10000)
+            self.count = count
+            self.sched_calls = 0
+            self.map_calls = 0
+
+        def allowance(self):
+            return self.budget.allowance()
+
+        def showtimes(self, site_no, mov_no, ymd):
+            self.sched_calls += 1
+            return [{"scnsNo": "018", "scnSseq": "5", "scnsrtTm": "2130",
+                     "siteNo": site_no, "scnsNm": "IMAX관",
+                     "atktGoodsNm": "IMAX LASER 2D",
+                     "frSeatCnt": str(self.count)}]
+
+        def get_json_many(self, paths, seat_fields=None):
+            self.map_calls += len(paths)
+            self.budget.take(len(paths))
+            return [{"data": {"items": [{"seats": []}]}}] * len(paths)
+
+    class Cat:
+        def resolve_movie(self, q):
+            return {"movNo": "M1", "movNm": q}, ""
+
+        def resolve_site(self, q):
+            return {"siteNo": "0013", "siteNm": q}, ""
+
+    def setUp(self):
+        for cache in (seats._pending, seats._last_fetched, seats._last_count):
+            cache.clear()
+            self.addCleanup(cache.clear)
+
+    def group(self, date):
+        return [{"id": 1, "owner_id": 7, "movie_query": "오디세이",
+                 "site_query": "용산아이파크몰", "scn_ymd": date,
+                 "screen_types": ["IMAX"], "rows": [], "scn_time": "",
+                 "scn_time_from": "", "scn_time_to": "", "min_consecutive": 2,
+                 "auto_book": False, "seat_num_from": 0, "seat_num_to": 0}]
+
+    def cycle(self, s, date):
+        """한 바퀴. sched_cache는 바퀴마다 새로 난다."""
+        return seats._prefetch_seat_maps(s, self.Cat(), self.group(date),
+                                         sched_cache={})
+
+    # 4일 뒤 = 예전 90초 간격, 3일 뒤 = 예전 20초 간격
+    FAR, MID = "20260905", "20260904"
+
+    def test_the_schedule_is_read_every_cycle_even_for_far_dates(self):
+        """상영표 호출 빈도가 곧 감지 주기다 — 상영일이 멀어도 매 바퀴 본다.
+
+        좌석맵은 회차 수만큼(회차당 214KB) 나가지만 상영표는 날짜 수만큼이다.
+        간격을 걸어 아낄 것이 없는 자리에 감지 지연만 생겼다.
+        """
+        for date in (self.FAR, self.MID):
+            with self.subTest(date=date):
+                self.setUp()
+                s = self.Sess()
+                for _ in range(10):
+                    self.cycle(s, date)
+                self.assertEqual(s.sched_calls, 10,
+                                 "먼 날짜라고 상영표를 건너뛰었다")
+
+    def test_a_freed_seat_opens_the_seat_map_right_away(self):
+        """잔여 좌석 수가 움직이면 재확인 간격을 기다리지 않는다.
+
+        간격은 알아낼 게 없는 재확인을 막으려고 있는 것이고, 숫자가 변한 회차는
+        알아낼 게 있다는 뜻 그 자체다. 여기서 걸러 내면 _last_count는 이미 새
+        값이라 다음 바퀴엔 '변화 없음'이 되어 그 취소표를 영영 못 본다.
+        """
+        for date in (self.FAR, self.MID):
+            with self.subTest(date=date):
+                self.setUp()
+                s = self.Sess(count=6)
+                self.cycle(s, date)                 # 기준선
+                before = s.map_calls
+                s.count = 7                         # 취소표 한 석
+                self.assertTrue(self.cycle(s, date),
+                                "취소표가 났는데 좌석맵을 안 열었다")
+                self.assertEqual(s.map_calls, before + 1)
+
+    def test_an_unchanged_count_still_costs_no_seat_map(self):
+        """숫자가 그대로면 좌석맵을 열지 않는다 — 95% 절감이 이것이다."""
+        s = self.Sess()
+        self.cycle(s, self.FAR)
+        before = s.map_calls
+        self.assertEqual(self.cycle(s, self.FAR), {})
+        self.assertEqual(s.map_calls, before, "변화가 없는데 좌석맵을 열었다")
+
+    def test_the_full_refresh_is_shorter_than_a_cancelled_seat_lives(self):
+        """놓칠 수 있는 시간의 상한이 취소표 수명(실측 4~45초)보다 길면 안 된다."""
+        self.assertLessEqual(seats.FULL_REFRESH_SECONDS, 45.0)
 
 class TestScheduleCarriesTheAnswer(unittest.TestCase):
     """상영표가 이미 잔여 좌석 수를 들고 있다 — 좌석맵을 열 이유가 대개 없다.
@@ -917,8 +1020,7 @@ class TestPrefetchIsShared(unittest.TestCase):
             return {"siteNo": "0013", "siteNm": q}, ""
 
     def setUp(self):
-        for cache in (seats._pending, seats._last_fetched, seats._last_count,
-                      seats._schedule_at, seats._schedule_rows):
+        for cache in (seats._pending, seats._last_fetched, seats._last_count):
             cache.clear()
             self.addCleanup(cache.clear)
 

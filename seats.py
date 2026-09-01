@@ -511,22 +511,17 @@ _last_fetched: dict = {}
 # 판단하고, 숫자가 움직인 회차만 연다.
 _last_count: dict = {}
 
-# 상영표를 언제 다시 받았는지 {(극장,영화,날짜): monotonic}.
-#
-# **좌석맵을 상영표로 대체하고 나니 상영표가 병목이 됐다.** 날짜 5개를 3초마다
-# 받으면 분당 100건이다. 그래서 좌석맵과 같은 우선순위 간격을 상영표에도 건다 —
-# 가까운 날짜는 매 바퀴, 먼 날짜는 드물게. 이 캐시는 **바퀴를 넘겨 산다**(앞의
-# sched_cache는 한 바퀴짜리였다).
-_schedule_at: dict = {}
-_schedule_rows: dict = {}
-
 # 숫자가 그대로여도 이만큼 지나면 한 번은 연다.
 #
 # **왜 필요한가.** frSeatCnt는 총합이라, 우리가 보는 열에서 한 자리가 풀리고
 # 동시에 다른 곳에서 한 자리가 팔리면 숫자가 그대로다 — 그 사이에 난 자리를
 # 놓친다. 3초 간격에서 그런 동시 교차는 드물지만 0은 아니므로, 주기적으로
 # 실제 좌석맵을 확인해 놓칠 수 있는 시간을 이 값으로 묶어 둔다.
-FULL_REFRESH_SECONDS = 120.0
+#
+# **120초는 취소표보다 느렸다.** 실측(2026-09-01, 용산 IMAX 9/4 21:30)으로 취소표
+# 한 석이 떠 있던 시간은 33·45·37·4초였다. 놓칠 수 있는 시간의 상한이 그보다
+# 길면 상한이라는 말에 뜻이 없다 — 그 안에 자리가 나고 팔리는 일이 끝난다.
+FULL_REFRESH_SECONDS = 30.0
 
 # 큐에서 이만큼 기다릴 때마다 순위가 한 칸 올라간다.
 #
@@ -652,28 +647,31 @@ def _seat_count(row: dict) -> int | None:
         return None
 
 
-def _schedule(session, key, rank, *, cost=None, sched_cache=None):
-    """상영표를 받는다. 최근에 받았으면 그걸 쓴다. 실패하면 None.
+def _schedule(session, key, *, cost=None, sched_cache=None):
+    """상영표를 받는다. 같은 바퀴에 이미 받았으면 그걸 쓴다. 실패하면 None.
 
     상영표에는 회차별 잔여 좌석 수가 들어 있어(frSeatCnt) 좌석맵을 열지 말지를
-    이걸로 판단한다 — 그래서 이 호출의 빈도가 곧 감지 주기다. 급한 날짜는 매
-    바퀴, 먼 날짜는 드물게 받는다.
+    이걸로 판단한다 — **이 호출의 빈도가 곧 감지 주기다.** 그래서 상영일이
+    멀어도 매 바퀴 받는다.
+
+    한때는 좌석맵과 같은 우선순위 간격(0·20·90초)을 여기에도 걸었다. 그러자
+    3일 뒤 상영은 20초마다, 4일 뒤는 90초마다만 잔여 좌석 수를 보게 됐는데,
+    실측한 취소표 수명이 4~45초였다(2026-09-01, 용산 IMAX 9/4 21:30). 자리가
+    나고 팔리는 일이 두 샘플 사이에서 끝나면 숫자가 그대로라 좌석맵을 열지도
+    않는다 — 90초 간격은 취소표를 구조적으로 못 본다.
+
+    **간격을 걸 이유도 없었다.** 좌석맵은 회차 수만큼(회차당 214KB) 나가지만
+    상영표는 **날짜 수**만큼이다. 상영표 1건이 그 날짜의 모든 회차를 덮으므로,
+    3초마다 날짜 3개를 받아도 분당 60건이다.
     """
     if sched_cache is not None and key in sched_cache:
         return sched_cache[key]     # 같은 바퀴 안에서는 한 번만
 
-    gap = SEAT_RECHECK_SECONDS[min(rank, len(SEAT_RECHECK_SECONDS) - 1)]
-    seen = _schedule_at.get(key)
-    if seen is not None and time.monotonic() - seen < gap and key in _schedule_rows:
-        rows = _schedule_rows[key]
-    else:
-        try:
-            with cost.call("상영표") if cost else contextlib.nullcontext():
-                rows = session.showtimes(key[0], key[1], key[2])
-        except RuntimeError:
-            return None
-        _schedule_at[key] = time.monotonic()
-        _schedule_rows[key] = rows
+    try:
+        with cost.call("상영표") if cost else contextlib.nullcontext():
+            rows = session.showtimes(key[0], key[1], key[2])
+    except RuntimeError:
+        return None
     if sched_cache is not None:
         sched_cache[key] = rows
     return rows
@@ -711,7 +709,7 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
         site_no, mov_no = site["siteNo"], movie["movNo"]
         sched_key = (site_no, mov_no, w["scn_ymd"])
         rank = seat_priority(w["scn_ymd"])
-        schedule = _schedule(session, sched_key, rank, cost=cost,
+        schedule = _schedule(session, sched_key, cost=cost,
                              sched_cache=sched_cache)
         if schedule is None:
             continue            # 본 루프가 같은 실패를 만나 사유를 기록한다
@@ -728,6 +726,7 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
             # **상영표가 이미 잔여 좌석 수를 알려 줬다.** 그 값이 그대로면 이
             # 회차의 좌석 배치는 바뀌지 않았으므로 좌석맵을 열 이유가 없다.
             count = _seat_count(row)
+            moved = False
             if count is not None:
                 before = _last_count.get(key)
                 _last_count[key] = count
@@ -737,10 +736,16 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
                 if before == count and not stale:
                     unchanged.add(key)
                     continue
+                moved = before is not None and before != count
             # 방금 본 회차는 다시 올리지 않는다. 이게 없으면 가까운 날짜가 매 창
             # 예산을 채워 먼 날짜가 영영 밀린다.
+            #
+            # **숫자가 움직였으면 간격을 무시한다.** 간격은 알아낼 게 없는 재확인을
+            # 막으려고 있는 것인데, 잔여 좌석 수가 변한 회차는 알아낼 게 있다는 뜻
+            # 그 자체다. 여기서 걸러 내면 _last_count는 이미 새 값으로 갱신된 뒤라
+            # 다음 바퀴엔 '변화 없음'이 되어 **그 취소표를 영영 못 본다.**
             seen = _last_fetched.get(key)
-            if seen is not None and time.monotonic() - seen < gap:
+            if not moved and seen is not None and time.monotonic() - seen < gap:
                 continue
             queue[key] = (rank, time.monotonic(), watch.EP_SEAT.format(
                 site_no=key[0], scns_no=key[1], ymd=key[2], scn_sseq=key[3]))
