@@ -289,8 +289,13 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
         return {"action": "skip", "reason": "auto_book off"}
 
     watch_id = watch["id"]
-    # 이미 유효한 선점이 있으면 다시 잡지 않는다.
-    if not dry_run and store.active_hold(watch_id):
+    showtime_key = seats_mod.showtime_key(row)
+    # 이미 유효한 선점이 있으면 다시 잡지 않는다. 이 감시가 잡은 것뿐 아니라
+    # **같은 회차를 보는 다른 감시가 잡은 것도** 막아야 한다 — 열만 다르게 건
+    # 감시 둘이 같은 회차에서 각각 선점하면 한 사람이 두 번 결제하게 된다.
+    if not dry_run and store.active_hold(
+            watch_id, owner_id=watch.get("owner_id"), showtime_key=showtime_key,
+            scn_ymd=watch["scn_ymd"], site_nm=site_nm):
         return {"action": "skip", "reason": "already held"}
 
     party = max(1, int(watch.get("party_size") or 1))
@@ -301,7 +306,6 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
 
     labels = [s["label"] for s in chosen]
     loc_nos = [s["seat_loc_no"] for s in chosen]
-    showtime_key = seats_mod.showtime_key(row)
     start_hhmm = _fmt_hhmm(row.get("scnsrtTm"))
 
     if dry_run:

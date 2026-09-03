@@ -509,6 +509,54 @@ class TestAutoBookOrchestration(DbCase):
         self.assertFalse(store.seat_watch(w["id"])["enabled"])
         self.assertIsNotNone(store.active_hold(w["id"]))
 
+    def test_another_watch_on_the_same_showtime_does_not_hold_again(self):
+        """같은 회차를 보는 감시가 둘이면 선점도 둘 나간다 — 결제도 두 번이다.
+
+        감시 유일성이 rows·seat_num_from/to까지 포함해서, 같은 (영화·극장·날짜·
+        시각)에 열만 다르게 건 감시 쌍이 실제로 만들어진다. 감시 id로만 중복을
+        보면 서로를 못 보고 둘 다 통과한다.
+        """
+        import booking
+        uid = self.make_user("owner")["id"]
+        first = self._watch(uid, auto_book=True, party_size=2, rows=["A"])
+        second = self._watch(uid, auto_book=True, party_size=2, rows=["A"],
+                             seat_num_from=1, seat_num_to=6)
+        self.assertNotEqual(first["id"], second["id"])
+
+        held = booking.try_auto_book(
+            None, first, self._row(), self._seats(set(range(1, 9))),
+            mov_nm="오디세이", site_nm="용산",
+            hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"})
+        self.assertEqual(held["action"], "held")
+
+        def must_not_run(session, ctx):
+            self.fail("같은 회차인데 두 번째 선점이 나갔습니다")
+
+        out = booking.try_auto_book(
+            None, second, self._row(), self._seats(set(range(1, 9))),
+            mov_nm="오디세이", site_nm="용산", hold_fn=must_not_run)
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["reason"], "already held")
+
+    def test_a_live_hold_outlives_the_watch_that_made_it(self):
+        """감시를 지우면 seat_watch_id가 NULL이 된다(이력은 남긴다) — 그래도 찾아야 한다."""
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2, rows=["A"])
+        booking.try_auto_book(
+            None, w, self._row(), self._seats(set(range(1, 9))),
+            mov_nm="오디세이", site_nm="용산",
+            hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"})
+        self.assertTrue(store.delete_seat_watch(w["id"], owner_id=uid))
+        self.assertIsNone(store.booking_attempts(owner_id=uid)[0]["seat_watch_id"])
+
+        ident = {"owner_id": uid, "showtime_key": "001|5",
+                 "scn_ymd": "20260825", "site_nm": "용산"}
+        self.assertIsNotNone(store.active_hold(w["id"], **ident))
+        # showtime_key는 하루 안에서만 유일하다 — 날짜·극장이 다르면 남의 선점이다.
+        self.assertIsNone(store.active_hold(w["id"], **{**ident, "scn_ymd": "20260826"}))
+        self.assertIsNone(store.active_hold(w["id"], **{**ident, "site_nm": "왕십리"}))
+
     def test_failed_records_failure_keeps_watch(self):
         import booking
         uid = self.make_user("owner")["id"]

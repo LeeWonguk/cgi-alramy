@@ -1091,14 +1091,37 @@ def booking_attempts(*, owner_id: int | None = None, limit: int = 20) -> list[di
     return [dict(r) for r in rows]
 
 
-def active_hold(seat_watch_id: int) -> dict | None:
-    """아직 유효한(held, 만료 전) 선점이 있으면 돌려준다 — 중복 선점을 막는 데 쓴다."""
+def active_hold(seat_watch_id: int, *, owner_id: int | None = None,
+                showtime_key: str = "", scn_ymd: str = "",
+                site_nm: str = "") -> dict | None:
+    """아직 유효한(held, 만료 전) 선점이 있으면 돌려준다 — 중복 선점을 막는 데 쓴다.
+
+    감시 id만으로는 못 막는 경우가 둘 있다.
+
+    **하나, 같은 회차를 보는 감시가 여럿일 수 있다.** 유일성 인덱스가 rows·
+    seat_num_from/to까지 포함해서, 같은 (영화·극장·날짜·시각)에 열만 다르게 건
+    감시 둘이 나란히 산다. 그 회차에 자리가 나면 감시마다 따로 선점이 걸려
+    **한 사람이 같은 회차를 두 번 잡고 두 번 결제한다.**
+
+    **둘, seat_watch_id는 사라질 수 있다.** 감시를 지우면 FK가 SET NULL이라
+    (이력은 남기고 연결만 끊는다) 그 선점이 아직 유효해도 이 조회에 안 걸린다.
+
+    그래서 회차 신원(소유자·극장·날짜·회차)으로도 함께 찾는다. showtime_key는
+    scnsNo|scnSseq라 **하루 안에서만** 유일하므로 날짜와 극장을 반드시 같이 건다
+    — 그것만으로 찾으면 다른 날 같은 상영관의 선점을 이 회차 것으로 오인한다.
+    """
+    where = ["seat_watch_id = %s"]
+    params: list[Any] = [seat_watch_id]
+    if owner_id is not None and showtime_key and scn_ymd and site_nm:
+        where.append("(owner_id = %s and showtime_key = %s and scn_ymd = %s"
+                     "  and site_nm = %s)")
+        params += [owner_id, showtime_key, scn_ymd, site_nm]
     with pool().connection() as conn:
         row = conn.execute(
             f"select {BOOKING_COLUMNS} from booking_attempts"
-            " where seat_watch_id = %s and status = 'held'"
+            f" where ({' or '.join(where)}) and status = 'held'"
             "   and (hold_expires_at is null or hold_expires_at > now())"
-            " order by created_at desc limit 1", (seat_watch_id,)).fetchone()
+            " order by created_at desc limit 1", params).fetchone()
     return dict(row) if row else None
 
 
