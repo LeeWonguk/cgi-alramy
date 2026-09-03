@@ -1148,6 +1148,27 @@ class TestThePayingTabLeavesTheWarmPool(unittest.TestCase):
             s.detach_booking_page(f"K{i}", 600)
         self.assertLessEqual(len(space.paying_pages), watch.PAYING_PAGE_LIMIT)
 
+    def test_a_live_payment_is_visible_across_every_space(self):
+        """재활용은 컨텍스트를 통째로 닫는다 — 남의 공간 결제창까지 죽는다."""
+        s, space, _ = self.make_session()
+        self.assertFalse(s.has_live_payment(), "지키는 탭이 없는데 있다고 한다")
+
+        s.booking_page("K")
+        s.detach_booking_page("K", 600)
+        self.assertTrue(s.has_live_payment())
+
+        # 다른 소유자 공간으로 옮겨도 보여야 한다.
+        other = watch._OwnerSpace(space.context, None)
+        s._spaces[7] = other
+        s._current = 7
+        self.assertTrue(s.has_live_payment(), "남의 공간 결제창을 못 봤다")
+
+    def test_a_payment_whose_time_is_up_is_not_live(self):
+        s, _, _ = self.make_session()
+        s.booking_page("K")
+        s.detach_booking_page("K", -1)
+        self.assertFalse(s.has_live_payment())
+
     def test_a_deliberate_teardown_takes_the_kept_tabs_too(self):
         """일부러 버리는 자리에서 이것만 남기면 아무도 정리하지 않는 탭이 된다."""
         s, space, _ = self.make_session()
@@ -1156,6 +1177,67 @@ class TestThePayingTabLeavesTheWarmPool(unittest.TestCase):
         s.close_booking_pages()
         self.assertTrue(paying.closed)
         self.assertEqual(space.paying_pages, [])
+
+
+class TestTheRecycleWaitsForThePayment(unittest.TestCase):
+    """정기 브라우저 재활용이 결제 진행 중인 세션을 갈아버리면 안 된다.
+
+    재활용은 메모리 누적을 끊으려고 30분마다 브라우저를 통째로 다시 띄운다. 그런데
+    결제 시한은 15분이라 두 창이 겹치는 일이 흔하다 — 실측(2026-09-03)으로 결제
+    링크를 보낸 뒤 10분 39초와 **45초** 뒤에 각각 재활용이 돌아 두 건을 잃었다.
+    결제창이 죽으면 카카오페이 승인이 CGV까지 가지 않아 돈만 나간다.
+    """
+
+    class Session:
+        def __init__(self, live):
+            self.live = live
+
+        def has_live_payment(self):
+            return self.live
+
+    def worker(self, *, age_minutes, live_payment):
+        import browser_worker
+        from datetime import datetime, timedelta
+
+        w = browser_worker.BrowserWorker.__new__(browser_worker.BrowserWorker)
+        w._session = self.Session(live_payment)
+        w._session_started = (datetime.now().astimezone()
+                              - timedelta(minutes=age_minutes))
+        w._recycle_deferred = False
+
+        real = browser_worker.store.get_setting
+        browser_worker.store.get_setting = lambda key, default=None: (
+            30 if key == "session_recycle_minutes" else real(key, default))
+        self.addCleanup(setattr, browser_worker.store, "get_setting", real)
+        return w
+
+    def test_an_old_session_with_nothing_in_flight_is_recycled(self):
+        self.assertTrue(self.worker(age_minutes=31, live_payment=False)
+                        ._session_expired())
+
+    def test_a_young_session_is_left_alone(self):
+        self.assertFalse(self.worker(age_minutes=1, live_payment=False)
+                         ._session_expired())
+
+    def test_a_payment_in_flight_defers_the_recycle(self):
+        w = self.worker(age_minutes=31, live_payment=True)
+        self.assertFalse(w._session_expired(), "결제 중인데 브라우저를 갈았다")
+        self.assertTrue(w._recycle_deferred)
+        # 판정은 작업마다 돈다 — 두 번째부터는 로그를 다시 남기지 않는다.
+        self.assertFalse(w._session_expired())
+
+    def test_the_recycle_happens_once_the_payment_window_closes(self):
+        """미루기가 영구적이면 안 된다 — 시한이 지나면 갈려야 한다."""
+        w = self.worker(age_minutes=31, live_payment=True)
+        self.assertFalse(w._session_expired())
+        w._session.live = False
+        self.assertTrue(w._session_expired())
+        self.assertFalse(w._recycle_deferred)
+
+    def test_a_session_that_never_started_is_not_expired(self):
+        w = self.worker(age_minutes=31, live_payment=False)
+        w._session_started = None
+        self.assertFalse(w._session_expired())
 
 
 class TestOwnerSpacesAreIsolated(unittest.TestCase):
