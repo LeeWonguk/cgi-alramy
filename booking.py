@@ -191,6 +191,17 @@ SEATMAP_READY_MS = 5000      # 좌석맵 모달이 열려 좌석이 눌릴 수 �
 PAY_BUTTON_READY_MS = 6000   # 좌석 선택완료 → '결제하기'가 뜰 때까지
 HOLD_RESPONSE_MS = 12000     # '결제하기' → seatTempPrmp 응답이 올 때까지
 
+# 결제창이 뜬 탭을 얼마나 지켜 줄지 (_keep_paying_page).
+#
+# 기준은 카카오가 준 결제 만료 시각이다. 거기에 여유를 더하는 이유는, 사람이 시한
+# 직전에 승인을 눌러도 CGV가 그 결과를 받아 예매를 확정할 틈이 있어야 하기 때문이다.
+PAY_PAGE_GRACE_SECONDS = 120
+# 만료 시각을 못 읽었을 때. 결제창 수명은 실측 15분이었다.
+PAY_PAGE_KEEP_SECONDS = 20 * 60
+# 만료가 이미 지났다고 나와도 이만큼은 지킨다 — 시계가 조금 어긋났을 뿐인데
+# 방금 띄운 결제창을 바로 닫아 버리는 것이 더 나쁘다.
+PAY_PAGE_MIN_KEEP_SECONDS = 60
+
 # 좌석맵에 좌석이 그려졌는지 보는 표식.
 #
 # **미니맵과 헷갈리면 안 된다.** 화면 아래쪽 작은 좌석 그림(`seatMainMap_seatNumber`)은
@@ -384,7 +395,44 @@ def _try_pay(session, watch: dict, ctx: dict, pay_fn=None) -> dict:
         return {"method": method, "error": str(exc)}
     if not out.get("ok"):
         log.warning("자동 결제 요청 실패: %s", out.get("error"))
+    elif out.get("pay_url"):
+        _keep_paying_page(session, ctx, out.get("pay_expires_at"))
     return out
+
+
+def _keep_paying_page(session, ctx: dict, pay_expires_at) -> None:
+    """결제창이 뜬 탭을 워밍 풀에서 빼 둔다. 실패해도 결제는 그대로 둔다.
+
+    **이걸 안 하면 그 탭이 다음 사이클에 예매 화면으로 되돌아간다.** 예매 탭은
+    (영화·극장·날짜) 하나당 한 장을 공유하는데, 선점에 성공한 감시는 꺼져도 같은
+    날짜를 보는 다른 감시는 살아 있어서 그쪽 프리워밍이 같은 탭을 집어 간다.
+    실측(2026-09-03): 결제 링크가 나간 13:36:34의 4초 뒤 13:36:38에 그 탭이
+    `예매 화면을 20260904로 바로 열었습니다`로 덮였다. 카카오페이 승인은 그 창이
+    받아 CGV에 넘겨야 예매가 확정되므로, 덮이면 **돈은 나가고 좌석은 안 잡힌다.**
+
+    지켜 주는 시간은 카카오가 준 결제 만료 시각까지 + 여유다. 그 시각을 못 읽었을
+    때만 고정값을 쓴다.
+    """
+    page = ctx.get("_page")
+    if page is None:
+        return                  # 주입된 hold_fn으로 돈 경우 — 지킬 탭이 없다
+    keep = PAY_PAGE_KEEP_SECONDS
+    if pay_expires_at is not None:
+        try:
+            # 시간대가 없으면 KST로 본다 — 카카오·CGV가 주는 시각은 전부 한국 시간이다.
+            exp = (pay_expires_at if pay_expires_at.tzinfo
+                   else pay_expires_at.replace(tzinfo=KST))
+            left = (exp - datetime.now(KST)).total_seconds()
+            keep = max(PAY_PAGE_MIN_KEEP_SECONDS, left + PAY_PAGE_GRACE_SECONDS)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass                # 시각을 못 빼면 고정값으로 간다
+    try:
+        if session.detach_booking_page(warm_key(ctx), keep):
+            log.info("결제창이 뜬 탭을 %d초간 지킵니다 — 다른 감시의 프리워밍이 "
+                     "덮지 못하게 워밍 풀에서 뺐습니다.", int(keep))
+    except Exception as exc:  # noqa: BLE001 - 못 빼도 결제 링크는 이미 나갔다
+        log.warning("결제창 탭을 지키지 못했습니다 (%s) — 다른 감시가 그 화면을 "
+                    "덮으면 승인이 CGV까지 가지 않습니다.", exc)
 
 
 def _earliest(*values):
