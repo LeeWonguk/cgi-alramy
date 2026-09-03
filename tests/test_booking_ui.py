@@ -1961,5 +1961,78 @@ class TestHoldAlertWithPayLink(unittest.TestCase):
         self.assertIn("CGV", msg)
 
 
+class TestTheTabWithThePaymentWindowIsKept(unittest.TestCase):
+    """결제창이 뜬 탭을 워밍 풀에서 빼는 부분 (booking._keep_paying_page).
+
+    예매 탭은 warm_key, 곧 (영화·극장·날짜) 하나당 한 장을 공유한다. 선점에
+    성공한 감시는 꺼지지만 **같은 날짜를 보는 다른 감시는 살아 있어서** 그쪽
+    프리워밍이 다음 사이클에 같은 탭을 집어 간다. 실측(2026-09-03)으로 결제
+    링크가 나간 4초 뒤 그 탭이 예매 화면으로 되돌아갔고, 카카오페이 승인은 그
+    창이 받아 CGV에 넘겨야 하므로 **돈만 나가고 좌석은 안 잡혔다.**
+    """
+
+    CTX = {"mov_no": "30001323", "site_no": "0013", "scn_ymd": "20260904",
+           "_page": "결제탭"}
+
+    class Session:
+        def __init__(self):
+            self.detached = []
+
+        def detach_booking_page(self, key, keep_seconds):
+            self.detached.append((key, keep_seconds))
+            return True
+
+    def test_it_keeps_the_tab_until_the_link_dies(self):
+        from datetime import datetime, timedelta
+
+        session = self.Session()
+        booking._keep_paying_page(
+            session, self.CTX, datetime.now(booking.KST) + timedelta(minutes=15))
+        key, keep = session.detached[0]
+        self.assertEqual(key, booking.warm_key(self.CTX))
+        # 만료까지 + 여유. 여유는 시한 직전 승인이 CGV까지 갈 틈이다.
+        self.assertAlmostEqual(keep, 15 * 60 + booking.PAY_PAGE_GRACE_SECONDS,
+                               delta=5)
+
+    def test_without_an_expiry_it_falls_back_to_a_fixed_window(self):
+        session = self.Session()
+        booking._keep_paying_page(session, self.CTX, None)
+        self.assertEqual(session.detached[0][1], booking.PAY_PAGE_KEEP_SECONDS)
+
+    def test_an_expiry_already_past_still_gets_a_floor(self):
+        """시계가 조금 어긋났다고 방금 띄운 결제창을 닫아 버리면 안 된다."""
+        from datetime import datetime, timedelta
+
+        session = self.Session()
+        booking._keep_paying_page(
+            session, self.CTX, datetime.now(booking.KST) - timedelta(hours=1))
+        self.assertEqual(session.detached[0][1],
+                         booking.PAY_PAGE_MIN_KEEP_SECONDS)
+
+    def test_a_naive_expiry_is_read_as_kst(self):
+        """카카오·CGV가 주는 시각은 전부 한국 시간이다 — 9시간 어긋나면 안 된다."""
+        from datetime import datetime, timedelta
+
+        session = self.Session()
+        naive = (datetime.now(booking.KST) + timedelta(minutes=15)).replace(tzinfo=None)
+        booking._keep_paying_page(session, self.CTX, naive)
+        self.assertAlmostEqual(session.detached[0][1],
+                               15 * 60 + booking.PAY_PAGE_GRACE_SECONDS, delta=5)
+
+    def test_no_tab_means_nothing_to_keep(self):
+        session = self.Session()
+        booking._keep_paying_page(
+            session, {k: v for k, v in self.CTX.items() if k != "_page"}, None)
+        self.assertEqual(session.detached, [], "지킬 탭이 없는데 뺐다")
+
+    def test_a_failing_session_does_not_break_the_payment(self):
+        """탭을 못 빼도 결제 링크는 이미 나갔다 — 여기서 터지면 안 된다."""
+        class Bad:
+            def detach_booking_page(self, key, keep_seconds):
+                raise RuntimeError("세션이 죽었다")
+
+        booking._keep_paying_page(Bad(), self.CTX, None)
+
+
 if __name__ == "__main__":
     unittest.main()

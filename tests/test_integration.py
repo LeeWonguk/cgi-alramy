@@ -509,6 +509,111 @@ class TestAutoBookOrchestration(DbCase):
         self.assertFalse(store.seat_watch(w["id"])["enabled"])
         self.assertIsNotNone(store.active_hold(w["id"]))
 
+    def test_another_watch_on_the_same_showtime_does_not_hold_again(self):
+        """같은 회차를 보는 감시가 둘이면 선점도 둘 나간다 — 결제도 두 번이다.
+
+        감시 유일성이 rows·seat_num_from/to까지 포함해서, 같은 (영화·극장·날짜·
+        시각)에 열만 다르게 건 감시 쌍이 실제로 만들어진다. 감시 id로만 중복을
+        보면 서로를 못 보고 둘 다 통과한다.
+        """
+        import booking
+        uid = self.make_user("owner")["id"]
+        first = self._watch(uid, auto_book=True, party_size=2, rows=["A"])
+        second = self._watch(uid, auto_book=True, party_size=2, rows=["A"],
+                             seat_num_from=1, seat_num_to=6)
+        self.assertNotEqual(first["id"], second["id"])
+
+        held = booking.try_auto_book(
+            None, first, self._row(), self._seats(set(range(1, 9))),
+            mov_nm="오디세이", site_nm="용산",
+            hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"})
+        self.assertEqual(held["action"], "held")
+
+        def must_not_run(session, ctx):
+            self.fail("같은 회차인데 두 번째 선점이 나갔습니다")
+
+        out = booking.try_auto_book(
+            None, second, self._row(), self._seats(set(range(1, 9))),
+            mov_nm="오디세이", site_nm="용산", hold_fn=must_not_run)
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["reason"], "already held")
+
+    def test_a_live_hold_outlives_the_watch_that_made_it(self):
+        """감시를 지우면 seat_watch_id가 NULL이 된다(이력은 남긴다) — 그래도 찾아야 한다."""
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2, rows=["A"])
+        booking.try_auto_book(
+            None, w, self._row(), self._seats(set(range(1, 9))),
+            mov_nm="오디세이", site_nm="용산",
+            hold_fn=lambda s, c: {"ok": True, "mov_atkt_no": "P1"})
+        self.assertTrue(store.delete_seat_watch(w["id"], owner_id=uid))
+        self.assertIsNone(store.booking_attempts(owner_id=uid)[0]["seat_watch_id"])
+
+        ident = {"owner_id": uid, "showtime_key": "001|5",
+                 "scn_ymd": "20260825", "site_nm": "용산"}
+        self.assertIsNotNone(store.active_hold(w["id"], **ident))
+        # showtime_key는 하루 안에서만 유일하다 — 날짜·극장이 다르면 남의 선점이다.
+        self.assertIsNone(store.active_hold(w["id"], **{**ident, "scn_ymd": "20260826"}))
+        self.assertIsNone(store.active_hold(w["id"], **{**ident, "site_nm": "왕십리"}))
+
+    def test_a_successful_payment_protects_the_tab_it_opened(self):
+        """결제창이 뜬 탭을 워밍 풀에 남겨 두면 같은 날짜의 다른 감시가 덮는다."""
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, auto_pay=True, party_size=1)
+        detached = []
+
+        class Sess:
+            def detach_booking_page(self, key, keep_seconds):
+                detached.append((key, keep_seconds))
+                return True
+
+        def fake_hold(session, ctx):
+            ctx["_page"] = "결제탭"           # hold_block이 하는 일
+            return {"ok": True, "mov_atkt_no": "P1"}
+
+        def fake_pay(session, ctx, *, method):
+            return {"ok": True, "method": method, "pay_url": "https://kakao/1",
+                    "pay_expires_at": None, "amount": 15000, "error": ""}
+
+        out = booking.try_auto_book(
+            Sess(), w, self._row(), self._seats({4}), mov_nm="오디세이",
+            site_nm="용산", mov_no="30001323", site_no="0013",
+            hold_fn=fake_hold, pay_fn=fake_pay)
+
+        self.assertEqual(out["action"], "held")
+        self.assertEqual(detached, [("30001323|0013|20260825",
+                                     booking.PAY_PAGE_KEEP_SECONDS)])
+
+    def test_a_failed_payment_leaves_the_warm_pool_alone(self):
+        """결제창이 안 떴으면 지킬 것도 없다 — 괜히 탭만 버리면 프리워밍이 죽는다."""
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, auto_pay=True, party_size=1)
+        detached = []
+
+        class Sess:
+            def detach_booking_page(self, key, keep_seconds):
+                detached.append(key)
+                return True
+
+        def fake_hold(session, ctx):
+            ctx["_page"] = "결제탭"
+            return {"ok": True, "mov_atkt_no": "P1"}
+
+        def fake_pay(session, ctx, *, method):
+            return {"ok": False, "method": method, "pay_url": None,
+                    "pay_expires_at": None, "amount": None,
+                    "error": "카카오페이 결제창이 뜨지 않았습니다"}
+
+        out = booking.try_auto_book(
+            Sess(), w, self._row(), self._seats({4}), mov_nm="오디세이",
+            site_nm="용산", hold_fn=fake_hold, pay_fn=fake_pay)
+
+        self.assertEqual(out["action"], "held")   # 선점은 유효하다
+        self.assertEqual(detached, [])
+
     def test_failed_records_failure_keeps_watch(self):
         import booking
         uid = self.make_user("owner")["id"]
@@ -967,6 +1072,90 @@ class TestThrottling(unittest.TestCase):
     def test_the_batch_stays_small_enough(self):
         """묶음을 키웠다가 429를 받고 되돌렸다 — 다시 키우면 같은 일이 난다."""
         self.assertLessEqual(watch.SEAT_MAP_BATCH, 8)
+
+
+class TestThePayingTabLeavesTheWarmPool(unittest.TestCase):
+    """CgvSession.detach_booking_page — 결제창이 뜬 탭을 지키는 부분.
+
+    실측(2026-09-03 13:36): 결제 링크가 나간 4초 뒤 같은 탭이
+    `예매 화면을 20260904로 바로 열었습니다`로 덮였다. 9/4 감시가 셋이었고
+    warm_key는 (영화·극장·날짜)라 셋이 한 탭을 공유했다 — 선점에 성공한 감시만
+    꺼지고, 남은 둘의 프리워밍이 그 탭을 집어 간 것이다.
+    """
+
+    class Tab:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def evaluate(self, _script):
+            if self.closed:
+                raise RuntimeError("닫힌 탭이다")
+            return 1
+
+        def close(self):
+            self.closed = True
+
+    def make_session(self):
+        opened: list = []
+        Tab = self.Tab
+
+        class Ctx:
+            def new_page(self):
+                tab = Tab(f"탭{len(opened)}")
+                opened.append(tab)
+                return tab
+
+        session = watch.CgvSession.__new__(watch.CgvSession)
+        session._spaces = watch.OrderedDict()
+        session._current = None
+        session._browser = object()
+        space = watch._OwnerSpace(Ctx(), None)
+        session._spaces[None] = space
+        return session, space, opened
+
+    def test_the_kept_tab_is_not_closed_and_not_handed_out_again(self):
+        s, space, opened = self.make_session()
+        paying = s.booking_page("K")
+
+        self.assertTrue(s.detach_booking_page("K", 600))
+        self.assertNotIn("K", space.booking_pages, "풀에 남아 있으면 또 집어 간다")
+        self.assertFalse(paying.closed, "지켜야 할 결제 탭을 닫아 버렸다")
+
+        # 같은 키로 다시 부르면 **새 탭**이 열려야 한다 — 남은 감시의 프리워밍은
+        # 계속 돌아야 하고, 그렇다고 결제창을 줘서는 안 된다.
+        again = s.booking_page("K")
+        self.assertIsNot(again, paying)
+        self.assertFalse(paying.closed)
+        self.assertEqual(len(opened), 2)
+
+    def test_the_kept_tab_is_closed_once_its_time_is_up(self):
+        s, space, _ = self.make_session()
+        paying = s.booking_page("K")
+        s.detach_booking_page("K", -1)          # 시한이 이미 지난 것으로
+        s.booking_page("다른키")                 # 이때 정리된다
+        self.assertTrue(paying.closed, "시한이 지난 결제 탭이 남았다")
+        self.assertEqual(space.paying_pages, [])
+
+    def test_detaching_what_is_not_there_is_not_an_error(self):
+        s, _, _ = self.make_session()
+        self.assertFalse(s.detach_booking_page("없는키", 600))
+
+    def test_kept_tabs_do_not_pile_up_forever(self):
+        s, space, _ = self.make_session()
+        for i in range(watch.PAYING_PAGE_LIMIT + 2):
+            s.booking_page(f"K{i}")
+            s.detach_booking_page(f"K{i}", 600)
+        self.assertLessEqual(len(space.paying_pages), watch.PAYING_PAGE_LIMIT)
+
+    def test_a_deliberate_teardown_takes_the_kept_tabs_too(self):
+        """일부러 버리는 자리에서 이것만 남기면 아무도 정리하지 않는 탭이 된다."""
+        s, space, _ = self.make_session()
+        paying = s.booking_page("K")
+        s.detach_booking_page("K", 600)
+        s.close_booking_pages()
+        self.assertTrue(paying.closed)
+        self.assertEqual(space.paying_pages, [])
 
 
 class TestOwnerSpacesAreIsolated(unittest.TestCase):

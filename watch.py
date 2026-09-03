@@ -111,6 +111,11 @@ FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 웹훅 경고
 # 날짜를 2주치 걸어도 덮을 만한 수다.
 BOOKING_PAGE_LIMIT = 12
 
+# 결제창이 떠 있어 워밍 풀에서 빼 둔 탭을 한 소유자당 몇 장까지 지킬지.
+# 선점은 감시 하나가 성공하면 그 감시를 끄므로 여러 장이 동시에 뜨는 일은
+# 드물지만, 시한 안에 정리가 안 되는 경우까지 생각해 한도를 둔다.
+PAYING_PAGE_LIMIT = 4
+
 # 동시에 살려 둘 소유자 공간(BrowserContext)의 최대 개수. 컨텍스트는 브라우저
 # 프로세스를 공유하므로 탭 몇 개보다 조금 무거운 정도지만, 사용자가 늘어도
 # 무한정 쌓이면 안 된다. 넘치면 가장 오래 안 쓴 쪽을 닫고, 그 소유자는 다음
@@ -305,6 +310,14 @@ class AuthRequired(RuntimeError):
     """
 
 
+def _close_quietly(page) -> None:
+    """탭을 닫는다. 이미 닫혔으면 그냥 넘어간다 — 정리는 실패해도 되는 일이다."""
+    try:
+        page.close()
+    except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
+        pass
+
+
 class _OwnerSpace:
     """소유자 한 명의 작업 공간 — BrowserContext 하나와 그 안의 탭들.
 
@@ -327,6 +340,9 @@ class _OwnerSpace:
         self.logged_in_owner: int | None = None
         # 예매 화면을 미리 띄워 둔 탭들 (키: 영화·극장·날짜).
         self.booking_pages: "OrderedDict[str, object]" = OrderedDict()
+        # 결제창이 떠 있어 워밍 풀에서 빼 둔 탭들 — (탭, 언제까지 지킬지).
+        # 키가 없다: 지키는 동안 그 조합의 프리워밍은 새 탭에서 돌아야 한다.
+        self.paying_pages: "list[tuple[object, float]]" = []
 
     def close(self) -> None:
         try:
@@ -334,6 +350,7 @@ class _OwnerSpace:
         except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
             pass
         self.booking_pages.clear()
+        self.paying_pages.clear()
 
 
 class CgvSession:
@@ -500,6 +517,7 @@ class CgvSession:
         띄워 둬도 감시에는 영향이 없다.
         """
         space = self._space
+        self._sweep_paying_pages()
         tabs = space.booking_pages
         page = tabs.get(key)
         if page is not None:
@@ -518,13 +536,54 @@ class CgvSession:
                         "%d개를 넘었습니다. 매 사이클 화면을 다시 열게 되니 "
                         "BOOKING_PAGE_LIMIT을 올리는 편이 좋습니다.",
                         victim, BOOKING_PAGE_LIMIT)
-            try:
-                old.close()
-            except Exception:  # noqa: BLE001 - 이미 닫혔을 수 있다
-                pass
+            _close_quietly(old)
         page = space.context.new_page()
         tabs[key] = page
         return page
+
+    def detach_booking_page(self, key: str, keep_seconds: float) -> bool:
+        """그 조합의 예매 탭을 워밍 풀에서 뺀다. 실제로 뺐으면 True.
+
+        **결제창이 뜬 탭을 지키는 데 쓴다.** 워밍 풀에 그대로 두면 같은
+        (영화·극장·날짜)를 보는 **다른 감시**의 프리워밍이 다음 사이클에 그 탭을
+        예매 화면으로 되돌린다 — 실측으로 결제 링크가 나간 4초 뒤였다. 카카오페이
+        승인은 그 창이 받아 CGV에 넘겨야 예매가 확정되므로, 덮이면 **돈은 나가고
+        좌석은 안 잡힌다.**
+
+        빼기만 하고 닫지는 않는다. 그 키로 다시 부르면 새 탭이 열리므로 남은
+        감시의 프리워밍은 그대로 돌아간다. 뺀 탭은 keep_seconds가 지나면
+        _sweep_paying_pages가 닫는다.
+        """
+        space = self._space
+        page = space.booking_pages.pop(key, None)
+        if page is None:
+            return False
+        # 지켜 주는 탭도 무한정 쌓이면 안 된다. 넘치면 가장 오래된 것부터 닫는다 —
+        # 그쪽은 결제 시한이 이미 지났을 가능성이 높다.
+        while len(space.paying_pages) >= PAYING_PAGE_LIMIT:
+            old, _ = space.paying_pages.pop(0)
+            log.warning("결제 중으로 지키던 탭이 %d장을 넘어 가장 오래된 것을 "
+                        "닫습니다.", PAYING_PAGE_LIMIT)
+            _close_quietly(old)
+        space.paying_pages.append((page, time.monotonic() + keep_seconds))
+        return True
+
+    def _sweep_paying_pages(self) -> None:
+        """지킬 시한이 지난 결제 탭을 닫는다.
+
+        결제 시한이 지나면 그 창은 아무것도 확정할 수 없다 — 남겨 둘 이유가 없다.
+        """
+        space = self._space
+        if not space.paying_pages:
+            return
+        now = time.monotonic()
+        alive = []
+        for page, until in space.paying_pages:
+            if now < until:
+                alive.append((page, until))
+            else:
+                _close_quietly(page)
+        space.paying_pages = alive
 
     def close_booking_pages(self) -> None:
         """지금 공간에 미리 띄워 둔 예매 탭을 모두 닫는다.
@@ -532,15 +591,16 @@ class CgvSession:
         예전에는 **로그인 주인이 바뀔 때마다** 이걸 불러야 했다 — 컨텍스트가
         하나뿐이라 그 탭들이 앞사람의 화면이었기 때문이다. 지금은 공간이 소유자
         단위로 갈려 있어 그럴 일이 없고, 이 함수는 한 소유자의 화면을 일부러
-        버릴 때만 쓴다.
+        버릴 때만 쓴다. **결제 중으로 지키던 탭까지 닫는다** — 일부러 버리는
+        자리에서 그것만 남겨 두면 아무도 정리하지 않는 탭이 된다.
         """
-        tabs = self._space.booking_pages
-        for page in tabs.values():
-            try:
-                page.close()
-            except Exception:  # noqa: BLE001 - 정리 중 실패는 무시
-                pass
-        tabs.clear()
+        space = self._space
+        for page in space.booking_pages.values():
+            _close_quietly(page)
+        space.booking_pages.clear()
+        for page, _ in space.paying_pages:
+            _close_quietly(page)
+        space.paying_pages.clear()
 
     def is_alive(self) -> bool:
         """페이지가 아직 살아 있는지. 브라우저 상주 중 크래시를 감지하는 데 쓴다."""
