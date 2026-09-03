@@ -55,6 +55,9 @@ class BrowserWorker:
         self._session_started: datetime | None = None
         self._session_jobs = 0
         self._last_error: str | None = None
+        # 결제 때문에 재활용을 미루는 중인지. 로그를 한 번만 남기려고 든다 —
+        # 판정은 작업마다 도니까(3초에 한 번) 매번 찍으면 그것만 수백 줄이 된다.
+        self._recycle_deferred = False
 
     # ── 수명 관리 ──
     def start(self) -> None:
@@ -164,12 +167,35 @@ class BrowserWorker:
         return self._session
 
     def _session_expired(self) -> bool:
-        """오래 떠 있던 세션은 갈아준다 — 메모리 누적과 좀비 프로세스를 끊는다."""
+        """오래 떠 있던 세션은 갈아준다 — 메모리 누적과 좀비 프로세스를 끊는다.
+
+        **결제가 진행 중이면 미룬다.** 재활용은 브라우저를 통째로 닫으므로 결제창을
+        띄워 둔 탭도 함께 죽는다. 카카오페이 승인은 그 창이 받아 CGV에 넘겨야 예매가
+        확정되니, 닫히면 **돈은 나가고 좌석은 안 잡힌다.**
+
+        실측(2026-09-03)으로 두 번 그렇게 잃었다. 결제 링크를 보낸 뒤 15:19:18 →
+        15:29:57(10분 39초 뒤), 16:59:21 → 17:00:06(**45초 뒤**)에 재활용이 돌았다.
+        30분 주기와 결제 시한(15분)이 겹치는 건 우연이 아니라 흔한 일이다.
+
+        미루는 시간은 결제 시한까지로 묶여 있다(paying_pages의 deadline). 그 시각이
+        지나면 has_live_payment가 False가 되어 다음 판정에서 정상적으로 갈린다.
+        """
         if self._session_started is None:
             return False
         minutes = int(store.get_setting("session_recycle_minutes", 30))
         age = (datetime.now().astimezone() - self._session_started).total_seconds()
-        return age >= minutes * 60
+        if age < minutes * 60:
+            return False
+        if self._session is not None and self._session.has_live_payment():
+            if not self._recycle_deferred:
+                self._recycle_deferred = True
+                log.info("결제가 진행 중이라 브라우저 세션 재활용을 미룹니다 — "
+                         "지금 닫으면 카카오페이 승인이 CGV까지 가지 않습니다.")
+            return False
+        if self._recycle_deferred:
+            self._recycle_deferred = False
+            log.info("결제 시한이 지나 미뤄 둔 브라우저 세션 재활용을 진행합니다.")
+        return True
 
     def _close_session(self) -> None:
         session = self._session

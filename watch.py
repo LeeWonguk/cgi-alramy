@@ -568,6 +568,18 @@ class CgvSession:
         space.paying_pages.append((page, time.monotonic() + keep_seconds))
         return True
 
+    def has_live_payment(self) -> bool:
+        """어느 공간에든 시한이 남은 결제 탭이 있는지.
+
+        **공간 하나가 아니라 전부를 본다.** 이걸 보고 미루는 것은 브라우저 세션
+        재활용인데(browser_worker._session_expired), 그건 컨텍스트를 통째로 닫아서
+        지금 쓰고 있지 않은 소유자의 결제창까지 함께 죽인다.
+        """
+        now = time.monotonic()
+        return any(now < until
+                   for space in self._spaces.values()
+                   for _, until in space.paying_pages)
+
     def _sweep_paying_pages(self) -> None:
         """지킬 시한이 지난 결제 탭을 닫는다.
 
