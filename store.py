@@ -953,6 +953,24 @@ def delete_seat_watch(seat_watch_id: int, owner_id: int | None = None) -> bool:
         return conn.execute(sql_txt, params).rowcount > 0
 
 
+# 좌석 감시를 가리키는 행을 쓸 때, 그 감시가 **사이클 도중 지워졌을 수 있다.**
+#
+# 사이클은 시작할 때 감시 목록을 한 번 읽고(store.seat_watches) 그 스냅샷으로 3초간
+# 돈다. 그동안 사용자가 웹에서 감시를 지우면 뒤이은 쓰기가 없는 id를 가리켜 FK
+# 위반이 된다. 실측(2026-09-02 10:10, 지난 날짜 감시를 정리하던 중):
+#
+#   ForeignKeyViolation: insert or update on table "booking_attempts" violates
+#     foreign key constraint "booking_attempts_seat_watch_id_fkey"
+#   DETAIL:  Key (seat_watch_id)=(65) is not present in table "seat_watches".
+#
+# 예외가 사이클 밖으로 나가 **그 바퀴가 통째로 죽었다.** 남은 감시들은 확인조차
+# 되지 않았다. 이건 고장이 아니라 정상적인 경합이므로, 조용히 넘어가는 게 맞다.
+def watch_was_deleted(exc: Exception) -> bool:
+    """이 예외가 "그 좌석 감시가 이미 지워졌다"는 뜻인지."""
+    return isinstance(exc, psycopg.errors.ForeignKeyViolation) and \
+        "seat_watch_id" in str(exc)
+
+
 def prev_seat_state(seat_watch_id: int) -> dict:
     """직전 관측의 회차별 빈좌석 집합. 없으면 빈 dict(= 첫 관측)."""
     with pool().connection() as conn:
@@ -964,21 +982,35 @@ def prev_seat_state(seat_watch_id: int) -> dict:
 
 
 def save_seat_state(seat_watch_id: int, available: dict,
-                    *, error: str | None = None) -> None:
-    """회차별 빈좌석 집합을 저장한다. error를 주면 last_error에 남긴다."""
+                    *, error: str | None = None) -> bool:
+    """회차별 빈좌석 집합을 저장한다. error를 주면 last_error에 남긴다.
+
+    감시가 그새 지워졌으면 False를 돌려준다 — 남길 곳이 없는 것이지 고장이
+    아니다(watch_was_deleted).
+    """
     stamp = _now()
-    with pool().connection() as conn:
-        conn.execute(
-            "insert into seat_watch_state"
-            "   (seat_watch_id, available, last_ok, last_error, updated_at)"
-            " values (%s, %s, %s, %s, %s)"
-            " on conflict (seat_watch_id) do update set"
-            "   available = excluded.available,"
-            "   last_ok = coalesce(excluded.last_ok, seat_watch_state.last_ok),"
-            "   last_error = excluded.last_error, updated_at = excluded.updated_at",
-            (seat_watch_id, Json(available), None if error else stamp,
-             error, stamp),
-        )
+    try:
+        with pool().connection() as conn:
+            conn.execute(
+                "insert into seat_watch_state"
+                "   (seat_watch_id, available, last_ok, last_error, updated_at)"
+                " values (%s, %s, %s, %s, %s)"
+                " on conflict (seat_watch_id) do update set"
+                "   available = excluded.available,"
+                "   last_ok = coalesce(excluded.last_ok,"
+                "                      seat_watch_state.last_ok),"
+                "   last_error = excluded.last_error,"
+                "   updated_at = excluded.updated_at",
+                (seat_watch_id, Json(available), None if error else stamp,
+                 error, stamp),
+            )
+    except psycopg.errors.ForeignKeyViolation as exc:
+        if not watch_was_deleted(exc):
+            raise
+        log.debug("좌석 감시 %s는 그새 지워졌습니다 — 상태를 남기지 않습니다",
+                  seat_watch_id)
+        return False
+    return True
 
 
 def normalize_seat_nums(num_from, num_to) -> tuple[int, int]:
@@ -1027,17 +1059,30 @@ BOOKING_COLUMNS = """
 def create_booking_attempt(*, seat_watch_id: int | None, owner_id: int | None,
                            showtime_key: str, mov_nm: str, site_nm: str,
                            scn_ymd: str, start_hhmm: str, seat_labels: list[str],
-                           seat_loc_nos: list[str]) -> int:
-    """선점 시도를 pending으로 남기고 id를 돌려준다. 결과는 finish로 확정한다."""
-    with pool().connection() as conn:
-        row = conn.execute(
-            "insert into booking_attempts"
-            "  (seat_watch_id, owner_id, showtime_key, mov_nm, site_nm, scn_ymd,"
-            "   start_hhmm, seat_labels, seat_loc_nos, status)"
-            " values (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending') returning id",
-            (seat_watch_id, owner_id, showtime_key, mov_nm, site_nm, scn_ymd,
-             start_hhmm, list(seat_labels or []), list(seat_loc_nos or [])),
-        ).fetchone()
+                           seat_loc_nos: list[str]) -> int | None:
+    """선점 시도를 pending으로 남기고 id를 돌려준다. 결과는 finish로 확정한다.
+
+    **감시가 그새 지워졌으면 None이다.** 그러면 호출자는 선점을 하지 않아야 한다 —
+    사용자가 그 감시를 지웠다는 건 그 좌석을 원하지 않는다는 뜻이고, 그런데도
+    잡으면 결제까지 이어져 돈이 나간다(watch_was_deleted).
+    """
+    try:
+        with pool().connection() as conn:
+            row = conn.execute(
+                "insert into booking_attempts"
+                "  (seat_watch_id, owner_id, showtime_key, mov_nm, site_nm,"
+                "   scn_ymd, start_hhmm, seat_labels, seat_loc_nos, status)"
+                " values (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending') returning id",
+                (seat_watch_id, owner_id, showtime_key, mov_nm, site_nm,
+                 scn_ymd, start_hhmm, list(seat_labels or []),
+                 list(seat_loc_nos or [])),
+            ).fetchone()
+    except psycopg.errors.ForeignKeyViolation as exc:
+        if not watch_was_deleted(exc):
+            raise
+        log.info("좌석 감시 %s가 그새 지워져 자동 예매를 하지 않습니다",
+                 seat_watch_id)
+        return None
     return row["id"]
 
 
@@ -1373,6 +1418,26 @@ def record_alert(kind: str, body: str, *, target_id: int | None = None,
     하나뿐이라, 같은 사람이 같은 날짜에 감시를 둘 걸면 서로를 덮어쓴다.
     """
     dates = list(dates or [])
+    try:
+        return _record_alert(kind, body, target_id=target_id, owner_id=owner_id,
+                             mov_nm=mov_nm, site_nm=site_nm, dates=dates,
+                             seat_watch_id=seat_watch_id)
+    except psycopg.errors.ForeignKeyViolation as exc:
+        if not watch_was_deleted(exc):
+            raise
+    # 감시가 그새 지워졌다. **알림은 그대로 남기고 보낸다** — 선점 성공처럼 돈과
+    # 좌석이 걸린 알림을 감시가 없어졌다는 이유로 버리면 안 된다. FK가 삭제 시
+    # SET NULL인 것과 같은 취지로, 이력은 남기고 연결만 끊는다.
+    log.info("좌석 감시 %s가 그새 지워져 알림의 감시 연결만 비웁니다",
+             seat_watch_id)
+    return _record_alert(kind, body, target_id=target_id, owner_id=owner_id,
+                         mov_nm=mov_nm, site_nm=site_nm, dates=dates,
+                         seat_watch_id=None)
+
+
+def _record_alert(kind: str, body: str, *, target_id, owner_id, mov_nm,
+                  site_nm, dates, seat_watch_id) -> int:
+    """record_alert의 실제 쓰기. 감시 연결을 비워 다시 부를 수 있게 갈라 뒀다."""
     with pool().connection() as conn:
         pending = conn.execute(
             "update alerts set attempts = attempts + 1, body = %s, created_at = %s"
