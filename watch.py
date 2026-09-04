@@ -109,7 +109,18 @@ FAIL_ALERT_THRESHOLD = 3  # 연속 실패 이 횟수부터 웹훅 경고
 #
 # 그래서 넉넉히 잡고, 그래도 넘치면 로그로 알린다(_evict_booking_page).
 # 날짜를 2주치 걸어도 덮을 만한 수다.
-BOOKING_PAGE_LIMIT = 12
+BOOKING_PAGE_LIMIT = 20
+
+# 미리 **진행해 둔** 예매 탭(회차·대기열까지 넘어간 것)을 한 소유자당 몇 장까지 둘지.
+#
+# 1층(날짜 단위) 탭과 따로 센다. 섞어서 한 LRU에 두면 회차 수만큼 늘어나는 2층이
+# 1층을 축출하는데, 1층은 **무효가 됐을 때 돌아갈 폴백**이라 그게 사라지면 선점마다
+# 딥링크 6.2초를 다시 문다.
+#
+# 왜 전부가 아니라 4장인가. 자리가 넉넉한 회차는 첫 사이클에 이미 잡히므로 속도가
+# 무의미하다. 값이 있는 건 `frSeatCnt < party`인 회차 — 취소표를 기다리는 그
+# 회차다(실측 4~45초 창). 그런 회차만 골라 담으면 12~13장이 아니라 4장이면 된다.
+ADVANCED_PAGE_LIMIT = 4
 
 # 결제창이 떠 있어 워밍 풀에서 빼 둔 탭을 한 소유자당 몇 장까지 지킬지.
 # 선점은 감시 하나가 성공하면 그 감시를 끄므로 여러 장이 동시에 뜨는 일은
@@ -343,6 +354,14 @@ class _OwnerSpace:
         # 결제창이 떠 있어 워밍 풀에서 빼 둔 탭들 — (탭, 언제까지 지킬지).
         # 키가 없다: 지키는 동안 그 조합의 프리워밍은 새 탭에서 돌아야 한다.
         self.paying_pages: "list[tuple[object, float]]" = []
+        # 미리 진행해 둔 탭들 (키: 영화·극장·날짜·회차·인원). 1층과 따로 둔다 —
+        # 섞으면 2층 churn이 1층 폴백을 축출한다.
+        self.advanced_pages: "OrderedDict[str, object]" = OrderedDict()
+        # 그 탭들이 어디까지 갔는지: {키: {"state": ..., "at": monotonic}}.
+        # **공간에 얹어 두는 이유가 있다** — 30분 브라우저 재활용이 컨텍스트를
+        # 닫을 때 이 기록도 함께 사라져야 한다. 탭이 없는데 "PARTY_SET"이라고
+        # 우기는 기록이 남으면 그게 곧 엉뚱한 회차 선점이다.
+        self.advance_state: dict = {}
 
     def close(self) -> None:
         try:
@@ -351,6 +370,8 @@ class _OwnerSpace:
             pass
         self.booking_pages.clear()
         self.paying_pages.clear()
+        self.advanced_pages.clear()
+        self.advance_state.clear()
 
 
 class CgvSession:
@@ -541,6 +562,66 @@ class CgvSession:
         tabs[key] = page
         return page
 
+    def advanced_page(self, key: str):
+        """미리 진행해 둔 탭. 없으면 새로 연다 (2층 풀).
+
+        1층(booking_page)과 **따로 센다.** 1층은 상영표가 그려진 채 쉬는 폴백이고,
+        2층은 회차·인원까지 넘어간 탭이다. 한 풀에 두면 회차 수만큼 늘어나는 2층이
+        1층을 축출해, 무효가 됐을 때 돌아갈 따뜻한 화면이 사라진다.
+        """
+        space = self._space
+        self._sweep_paying_pages()
+        tabs = space.advanced_pages
+        page = tabs.get(key)
+        if page is not None:
+            try:
+                page.evaluate("() => 1")           # 살아 있는지 확인
+                tabs.move_to_end(key)
+                return page
+            except Exception:  # noqa: BLE001 - 닫혔으면 새로 연다
+                tabs.pop(key, None)
+                space.advance_state.pop(key, None)
+        while len(tabs) >= ADVANCED_PAGE_LIMIT:
+            victim, old = tabs.popitem(last=False)
+            space.advance_state.pop(victim, None)
+            log.info("미리 진행해 둔 탭이 %d장을 넘어 %s를 닫습니다 — 그 회차는 "
+                     "선점할 때 처음부터 갑니다.", ADVANCED_PAGE_LIMIT, victim)
+            _close_quietly(old)
+        page = space.context.new_page()
+        tabs[key] = page
+        return page
+
+    def advanced_stage(self, key: str) -> dict | None:
+        """그 키의 탭이 어디까지 갔다고 기록돼 있는지. 없으면 None."""
+        return self._space.advance_state.get(key)
+
+    def set_advanced_stage(self, key: str, stage: str) -> None:
+        """진행 단계를 기록한다. 탭이 없으면 기록도 두지 않는다."""
+        space = self._space
+        if key not in space.advanced_pages:
+            space.advance_state.pop(key, None)
+            return
+        space.advance_state[key] = {"state": stage, "at": time.monotonic()}
+
+    def drop_advanced_page(self, key: str, *, close: bool = True) -> bool:
+        """2층에서 그 탭을 뺀다. 뺐으면 True.
+
+        진행해 둔 상태가 더는 못 믿을 것이 됐을 때 쓴다 — 다음 패스가 처음부터
+        다시 세운다.
+        """
+        space = self._space
+        space.advance_state.pop(key, None)
+        page = space.advanced_pages.pop(key, None)
+        if page is None:
+            return False
+        if close:
+            _close_quietly(page)
+        return True
+
+    def advanced_count(self) -> int:
+        """지금 이 공간에 미리 진행해 둔 탭 수."""
+        return len(self._space.advanced_pages)
+
     def detach_booking_page(self, key: str, keep_seconds: float) -> bool:
         """그 조합의 예매 탭을 워밍 풀에서 뺀다. 실제로 뺐으면 True.
 
@@ -555,7 +636,13 @@ class CgvSession:
         _sweep_paying_pages가 닫는다.
         """
         space = self._space
+        # **두 풀 모두에서 찾는다.** 선점이 1층 탭에서 났는지 2층 탭에서 났는지에
+        # 따라 결제창이 있는 곳이 다르다. 여기서 엉뚱한 풀을 보면 결제창이 그대로
+        # 남아 다음 프리워밍에 덮이고, 그건 돈이 나가고 좌석은 안 잡히는 일이다.
+        space.advance_state.pop(key, None)
         page = space.booking_pages.pop(key, None)
+        if page is None:
+            page = space.advanced_pages.pop(key, None)
         if page is None:
             return False
         # 지켜 주는 탭도 무한정 쌓이면 안 된다. 넘치면 가장 오래된 것부터 닫는다 —
@@ -610,6 +697,10 @@ class CgvSession:
         for page in space.booking_pages.values():
             _close_quietly(page)
         space.booking_pages.clear()
+        for page in space.advanced_pages.values():
+            _close_quietly(page)
+        space.advanced_pages.clear()
+        space.advance_state.clear()
         for page, _ in space.paying_pages:
             _close_quietly(page)
         space.paying_pages.clear()

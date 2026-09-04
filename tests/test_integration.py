@@ -1398,6 +1398,111 @@ class TestTheRecycleWaitsForThePayment(unittest.TestCase):
         self.assertFalse(w._session_expired())
 
 
+class TestTheTwoTabPoolsStayApart(unittest.TestCase):
+    """미리 진행해 둔 탭(2층)은 1층 폴백과 따로 센다.
+
+    1층(날짜 단위)은 상영표가 그려진 채 쉬는 **폴백**이다. 2층이 무효가 되면
+    거기로 돌아가 0.2초에 회차를 누른다. 한 LRU에 섞으면 회차 수만큼 늘어나는
+    2층이 1층을 축출해, 그 폴백이 사라지고 선점마다 딥링크 6.2초를 다시 문다
+    (커밋 ad83cbb가 기록한 절벽과 같은 모양이다).
+    """
+
+    class Tab:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def evaluate(self, _script):
+            if self.closed:
+                raise RuntimeError("닫힌 탭이다")
+            return 1
+
+        def close(self):
+            self.closed = True
+
+    def make_session(self):
+        opened = []
+        Tab = self.Tab
+
+        class Ctx:
+            def new_page(self):
+                tab = Tab(f"탭{len(opened)}")
+                opened.append(tab)
+                return tab
+
+        s = watch.CgvSession.__new__(watch.CgvSession)
+        s._spaces = watch.OrderedDict()
+        s._current = None
+        s._browser = object()
+        space = watch._OwnerSpace(Ctx(), None)
+        s._spaces[None] = space
+        return s, space, opened
+
+    def test_the_same_key_gives_different_tabs_per_pool(self):
+        s, _, _ = self.make_session()
+        self.assertIsNot(s.booking_page("K"), s.advanced_page("K"))
+
+    def test_second_tier_churn_does_not_evict_the_fallback(self):
+        """이게 두 풀로 나눈 이유 전부다."""
+        s, space, _ = self.make_session()
+        fallback = s.booking_page("날짜키")
+        for i in range(watch.ADVANCED_PAGE_LIMIT + 3):
+            s.advanced_page(f"회차{i}")
+        self.assertIs(s.booking_page("날짜키"), fallback, "폴백이 쫓겨났다")
+        self.assertFalse(fallback.closed)
+        self.assertLessEqual(len(space.advanced_pages),
+                             watch.ADVANCED_PAGE_LIMIT)
+
+    def test_dropping_an_advanced_tab_clears_its_record(self):
+        s, space, _ = self.make_session()
+        page = s.advanced_page("K")
+        s.set_advanced_stage("K", "VISITOR")
+        self.assertEqual(s.advanced_stage("K")["state"], "VISITOR")
+
+        self.assertTrue(s.drop_advanced_page("K"))
+        self.assertTrue(page.closed)
+        self.assertIsNone(s.advanced_stage("K"))
+        self.assertNotIn("K", space.advanced_pages)
+        self.assertFalse(s.drop_advanced_page("K"))
+
+    def test_a_stage_without_a_tab_is_never_recorded(self):
+        """탭이 없는데 "준비됐다"고 우기는 기록이 남으면 그게 엉뚱한 선점이 된다."""
+        s, _, _ = self.make_session()
+        s.set_advanced_stage("없는키", "PARTY_SET")
+        self.assertIsNone(s.advanced_stage("없는키"))
+
+    def test_the_payment_tab_is_found_in_either_pool(self):
+        """선점이 2층 탭에서 났으면 결제창도 거기 있다 — 여기서 키를 틀리면 돈이 나간다."""
+        s, space, _ = self.make_session()
+        paying = s.advanced_page("진행키")
+        s.set_advanced_stage("진행키", "VISITOR")
+
+        self.assertTrue(s.detach_booking_page("진행키", 600))
+        self.assertFalse(paying.closed, "지켜야 할 결제 탭을 닫아 버렸다")
+        self.assertNotIn("진행키", space.advanced_pages)
+        self.assertIsNone(s.advanced_stage("진행키"))
+        self.assertIsNot(s.advanced_page("진행키"), paying)
+
+    def test_a_deliberate_teardown_closes_both_pools(self):
+        s, space, _ = self.make_session()
+        first = s.booking_page("날짜키")
+        second = s.advanced_page("진행키")
+        s.set_advanced_stage("진행키", "VISITOR")
+
+        s.close_booking_pages()
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertEqual(space.advance_state, {})
+
+    def test_a_dead_advanced_tab_is_replaced_and_forgotten(self):
+        s, _, _ = self.make_session()
+        page = s.advanced_page("K")
+        s.set_advanced_stage("K", "VISITOR")
+        page.closed = True                     # 브라우저가 탭을 잃었다
+        self.assertIsNot(s.advanced_page("K"), page)
+        self.assertIsNone(s.advanced_stage("K"), "죽은 탭의 기록이 남았다")
+
+
 class TestOwnerSpacesAreIsolated(unittest.TestCase):
     """소유자마다 BrowserContext를 따로 둔다 — 브라우저 없이 구조만 시험한다.
 

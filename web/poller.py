@@ -14,10 +14,16 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+import booking
 import seats
 import store
 import watch
 from browser_worker import BrowserWorker
+
+# 다음 슬롯 전에 남겨 둘 여유. 진행이 여기까지 쓰면 사이클이 밀린다.
+ADVANCE_MARGIN_MS = 600
+# 이만큼도 안 남았으면 시작하지 않는다 — 한 걸음도 못 떼고 끝난다.
+ADVANCE_MIN_MS = 800
 
 log = logging.getLogger("cgv-watch.poller")
 
@@ -102,6 +108,7 @@ class Poller:
         # 좌석 감시는 로그인이 필요해 무거우므로, 대상이 있을 때만 이어서 돈다.
         # 여기서 새는 예외로 방금 성공한 사이클을 실패로 만들지 않는다.
         self._run_seat_cycle(trigger)
+        self._run_advance(trigger)
         with self._lock:
             self._last_summary = summary
         return summary
@@ -117,6 +124,31 @@ class Poller:
                      result.get("watches_checked"), result.get("alerts_sent"))
         except Exception:  # noqa: BLE001 - 좌석 감시 실패로 메인 사이클을 망치지 않는다
             log.exception("좌석 감시 사이클에서 오류가 났습니다")
+
+    def _run_advance(self, trigger: str) -> None:
+        """예매 화면을 미리 **진행해** 둔다. 다음 슬롯까지 남는 시간 안에서만.
+
+        좌석 사이클은 3초 간격 중 1초대만 쓴다 — 그 남는 시간에 회차·대기열을
+        미리 넘어가 두면, 좌석이 난 순간 할 일이 그만큼 줄어든다.
+
+        **다음 슬롯을 밀지 않는 것이 이 함수의 유일한 규율이다.** 남은 시간에서
+        여유를 떼고 그만큼만 주며, 진행 쪽은 걸음마다 데드라인을 본다. 여기서
+        새는 예외로 방금 성공한 사이클을 실패로 만들지도 않는다.
+        """
+        try:
+            left = self._delay_until_next_slot(self.interval())
+            budget_ms = left * 1000 - ADVANCE_MARGIN_MS
+            if budget_ms < ADVANCE_MIN_MS:
+                return
+            out = self._worker.run(
+                lambda s: booking.advance_pending(s, budget_ms=budget_ms),
+                label=f"advance:{trigger}")
+            if out and any(out.get(k) for k in ("advanced", "reset", "stale")):
+                log.info("사전진행 — 진행 %s · 되돌림 %s · 시한지남 %s · 준비 %s",
+                         out.get("advanced"), out.get("reset"),
+                         out.get("stale"), out.get("ready"))
+        except Exception:  # noqa: BLE001 - 미리 하는 일이 사이클을 망치면 안 된다
+            log.exception("사전진행에서 오류가 났습니다")
 
     # ── 내부 ──
     def _loop(self) -> None:

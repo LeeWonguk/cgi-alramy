@@ -2353,5 +2353,341 @@ class TestModalCloseWaitsForTheModalNotTheClock(unittest.TestCase):
         self.assertEqual(btn.clicks, 0)
 
 
+class TestAdvanceKeySplitsWhereItMatters(unittest.TestCase):
+    """미리 진행해 둔 탭을 가르는 키 (booking.advance_key).
+
+    1층 키(warm_key)는 **그대로 둔다.** 1층은 상영표가 그려진 채 쉬는 폴백이고
+    그 값은 회차와 무관하다 — 회차별로 갈라 버리면 첫 진입(딥링크 6.2초)이 회차
+    수만큼 늘어나는데, 상영표에서 회차를 누르는 건 0.2초밖에 안 든다.
+    """
+
+    CTX = {"mov_no": "M", "site_no": "S", "scn_ymd": "20260908", "party": 2,
+           "row": {"scnsNo": "012", "scnSseq": "1"}}
+
+    def test_the_first_tier_key_is_unchanged(self):
+        self.assertEqual(booking.warm_key(self.CTX), "M|S|20260908")
+
+    def test_the_advance_key_splits_by_showtime(self):
+        other = dict(self.CTX, row={"scnsNo": "012", "scnSseq": "5"})
+        self.assertNotEqual(booking.advance_key(self.CTX),
+                            booking.advance_key(other))
+
+    def test_the_advance_key_splits_by_screen(self):
+        """같은 시각에 상영관이 여럿일 수 있다 — 시각만으로는 못 가린다."""
+        other = dict(self.CTX, row={"scnsNo": "018", "scnSseq": "1"})
+        self.assertNotEqual(booking.advance_key(self.CTX),
+                            booking.advance_key(other))
+
+    def test_the_advance_key_splits_by_party(self):
+        """인원을 눌러 두면 그 탭은 그 인원으로 굳는다."""
+        self.assertNotEqual(booking.advance_key(self.CTX),
+                            booking.advance_key(dict(self.CTX, party=3)))
+
+    def test_it_contains_the_first_tier_key(self):
+        self.assertTrue(
+            booking.advance_key(self.CTX).startswith(booking.warm_key(self.CTX)))
+
+
+class TestStageClassification(unittest.TestCase):
+    """deep 스냅샷을 진행 단계로 읽는 판정 (booking.classify_stage).
+
+    **주소로는 판정할 수 없다.** 인원 선택부터 결제까지 주소가
+    `/cnm/selectVisitorCnt`로 고정이다(README '결제하기 두 번'). 그 구간 안에서는
+    DOM 표식만이 근거다.
+    """
+
+    CTX = {"scn_ymd": "20260908"}
+
+    def state(self, **over):
+        base = {"url": booking.BOOKING_PAGE, "showtimes": 0, "days": 7,
+                "actives": [], "loading": 0, "seatOpen": 0, "seatMap": 0,
+                "pay": 0, "modals": 0}
+        return {**base, **over}
+
+    def cls(self, **over):
+        return booking.classify_stage(self.state(**over), self.CTX)
+
+    def test_an_unreadable_screen_is_dirty(self):
+        self.assertEqual(booking.classify_stage(None, self.CTX),
+                         booking.STAGE_DIRTY)
+
+    def test_the_booking_screen_with_our_date_is_dated(self):
+        self.assertEqual(self.cls(showtimes=12, actives=["8"]),
+                         booking.STAGE_DATED)
+
+    def test_the_booking_screen_on_another_date_is_blank(self):
+        """다른 날짜를 보고 있으면 다시 열어야 한다 — 준비된 게 아니다."""
+        self.assertEqual(self.cls(showtimes=12, actives=["9"]),
+                         booking.STAGE_BLANK)
+
+    def test_the_booking_screen_without_showtimes_is_blank(self):
+        self.assertEqual(self.cls(showtimes=0, actives=["8"]),
+                         booking.STAGE_BLANK)
+
+    def test_the_visitor_screen_is_visitor(self):
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url), booking.STAGE_VISITOR)
+
+    def test_the_visitor_screen_with_the_seat_button_is_party_set(self):
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url, seatOpen=1),
+                         booking.STAGE_PARTY_SET)
+
+    def test_a_screen_still_loading_is_dirty(self):
+        """아직 그리는 중이면 준비됐다고 볼 수 없다 — 다음 패스가 다시 본다."""
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url, seatOpen=1, loading=1),
+                         booking.STAGE_DIRTY)
+
+    def test_an_open_seat_map_is_dirty(self):
+        """좌석맵은 미리 열어 두지 않는다 — 열려 있으면 우리가 아는 자리가 아니다."""
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url, seatOpen=1, seatMap=40),
+                         booking.STAGE_DIRTY)
+
+    def test_a_payment_screen_is_dirty(self):
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url, pay=1), booking.STAGE_DIRTY)
+
+    def test_somewhere_else_entirely_is_blank(self):
+        self.assertEqual(self.cls(url="https://cgv.co.kr/mem/login"),
+                         booking.STAGE_BLANK)
+
+
+class TestHoldPagePicksTheRightTab(unittest.TestCase):
+    """선점이 어느 탭을 쓰는지 (booking.hold_page)."""
+
+    CTX = {"mov_no": "M", "site_no": "S", "scn_ymd": "20260908", "party": 2,
+           "row": {"scnsNo": "012", "scnSseq": "1"}}
+
+    class Session:
+        def __init__(self, stage=None, age=0.0):
+            self.page = "기본페이지"
+            self.stage = stage
+            self.age = age
+            self.asked_advanced = []
+            self.asked_warm = []
+
+        def advanced_stage(self, key):
+            import time as _t
+            if self.stage is None:
+                return None
+            return {"state": self.stage, "at": _t.monotonic() - self.age}
+
+        def advanced_page(self, key):
+            self.asked_advanced.append(key)
+            return "진행탭"
+
+        def booking_page(self, key):
+            self.asked_warm.append(key)
+            return "예매탭"
+
+    def test_an_advanced_tab_is_used_when_fresh(self):
+        s = self.Session(stage=booking.STAGE_VISITOR)
+        ctx = dict(self.CTX)
+        page, key, stage = booking.hold_page(s, ctx)
+        self.assertEqual(page, "진행탭")
+        self.assertEqual(stage, booking.STAGE_VISITOR)
+        self.assertEqual(key, booking.advance_key(ctx))
+        self.assertEqual(ctx["_warm_key"], key)
+        self.assertEqual(ctx["_advance_key"], key)
+        self.assertEqual(s.asked_warm, [], "1층 탭을 괜히 건드렸다")
+
+    def test_a_stale_advanced_tab_is_not_used(self):
+        """시한이 지난 것은 더 못 믿는다 — CGV가 세션을 만료시켰을 수 있다."""
+        s = self.Session(stage=booking.STAGE_VISITOR,
+                         age=booking.PREADVANCE_MAX_AGE + 1)
+        ctx = dict(self.CTX)
+        page, key, stage = booking.hold_page(s, ctx)
+        self.assertEqual(page, "예매탭")
+        self.assertIsNone(stage)
+        self.assertEqual(key, booking.warm_key(ctx))
+        self.assertNotIn("_advance_key", ctx)
+
+    def test_a_dirty_advanced_tab_is_not_used(self):
+        s = self.Session(stage=booking.STAGE_DIRTY)
+        page, key, stage = booking.hold_page(s, dict(self.CTX))
+        self.assertEqual(page, "예매탭")
+        self.assertIsNone(stage)
+
+    def test_no_record_means_the_first_tier_tab(self):
+        s = self.Session(stage=None)
+        page, key, stage = booking.hold_page(s, dict(self.CTX))
+        self.assertEqual(page, "예매탭")
+        self.assertIsNone(stage)
+
+    def test_a_session_without_the_second_tier_still_works(self):
+        """2층을 모르는 세션(예전 코드·테스트 더블)에서도 선점은 돌아야 한다."""
+        class Old:
+            page = "기본페이지"
+
+            def booking_page(self, key):
+                return "예매탭"
+
+        page, key, stage = booking.hold_page(Old(), dict(self.CTX))
+        self.assertEqual(page, "예매탭")
+        self.assertIsNone(stage)
+
+
+class TestAdvanceRegistrationTouchesNothing(unittest.TestCase):
+    """등록은 사이클 안에서 도니 **브라우저를 건드려선 안 된다**.
+
+    왕복이 하나라도 있으면 그게 곧 사이클 길이가 된다 — `55c59d5`가 "미리 열 때
+    회차 목록까지 기다리지는 않는다. 6초를 쓰면 그 사이클이 통째로 느려진다"로
+    정한 원칙이다.
+    """
+
+    def setUp(self):
+        booking.forget_advance()
+        self.addCleanup(booking.forget_advance)
+
+    class Explode:
+        """무엇이든 만지면 터지는 세션."""
+
+        def __getattr__(self, name):
+            raise AssertionError(f"등록이 세션을 건드렸다: {name}")
+
+    def watch_row(self, **over):
+        base = {"id": 1, "owner_id": 7, "scn_ymd": "20260908",
+                "auto_book": True, "party_size": 2}
+        return {**base, **over}
+
+    def row(self, sseq, free, tm="2130"):
+        return {"scnsNo": "012", "scnSseq": sseq, "scnsrtTm": tm,
+                "frSeatCnt": free}
+
+    def test_registering_does_not_touch_the_session(self):
+        n = booking.register_advance(
+            self.Explode(), self.watch_row(), [self.row("1", 40)],
+            mov_no="M", site_no="S", site_nm="용산")
+        self.assertEqual(n, 1)
+
+    def test_a_watch_without_auto_book_is_not_registered(self):
+        n = booking.register_advance(
+            self.Explode(), self.watch_row(auto_book=False),
+            [self.row("1", 40)], mov_no="M", site_no="S", site_nm="용산")
+        self.assertEqual(n, 0)
+
+    def test_a_showtime_short_on_seats_comes_first(self):
+        """자리가 넉넉한 회차는 첫 사이클에 이미 잡힌다 — 값은 취소표 쪽에 있다."""
+        booking.register_advance(
+            self.Explode(), self.watch_row(),
+            [self.row("1", 40), self.row("2", 1), self.row("3", 9)],
+            mov_no="M", site_no="S", site_nm="용산")
+        ranks = booking._advance_wanted[7]
+        order = sorted(ranks, key=lambda k: ranks[k]["rank"])
+        seqs = [ranks[k]["ctx"]["row"]["scnSseq"] for k in order]
+        # 2번이 party(2)보다 적어 0순위, 그다음 여유석 적은 순.
+        self.assertEqual(seqs, ["2", "3", "1"])
+
+    def test_an_unknown_seat_count_goes_last(self):
+        booking.register_advance(
+            self.Explode(), self.watch_row(),
+            [{"scnsNo": "012", "scnSseq": "9", "scnsrtTm": "2130"},
+             self.row("2", 1)],
+            mov_no="M", site_no="S", site_nm="용산")
+        ranks = booking._advance_wanted[7]
+        order = sorted(ranks, key=lambda k: ranks[k]["rank"])
+        self.assertEqual(ranks[order[0]]["ctx"]["row"]["scnSseq"], "2")
+
+    def test_the_screen_name_is_carried(self):
+        """같은 시각에 상영관이 여럿일 때 어느 쪽인지 가려야 한다."""
+        booking.register_advance(
+            self.Explode(), self.watch_row(),
+            [{"scnsNo": "012", "scnSseq": "1", "scnsrtTm": "2130",
+              "frSeatCnt": 1, "expoScnsNm": "IMAX관"}],
+            mov_no="M", site_no="S", site_nm="용산")
+        spec = next(iter(booking._advance_wanted[7].values()))
+        self.assertEqual(spec["ctx"]["scns_nm"], "IMAX관")
+        self.assertEqual(spec["ctx"]["start_hhmm"], "21:30")
+
+    def test_the_wanted_set_is_rebuilt_not_accumulated(self):
+        """감시가 바뀌면 사라진 회차가 남아선 안 된다 — 사이클마다 새로 쌓는다."""
+        booking.register_advance(self.Explode(), self.watch_row(),
+                                 [self.row("1", 1), self.row("2", 1)],
+                                 mov_no="M", site_no="S", site_nm="용산")
+        self.assertEqual(len(booking._advance_wanted[7]), 2)
+        booking.forget_advance()
+        booking.register_advance(self.Explode(), self.watch_row(),
+                                 [self.row("1", 1)],
+                                 mov_no="M", site_no="S", site_nm="용산")
+        self.assertEqual(len(booking._advance_wanted[7]), 1,
+                         "지워진 회차가 남았다")
+
+    def test_forgetting_one_owner_leaves_the_others(self):
+        booking.register_advance(self.Explode(), self.watch_row(),
+                                 [self.row("1", 1)], mov_no="M", site_no="S",
+                                 site_nm="용산")
+        booking.register_advance(self.Explode(), self.watch_row(owner_id=8),
+                                 [self.row("1", 1)], mov_no="M", site_no="S",
+                                 site_nm="용산")
+        booking.forget_advance(7)
+        self.assertNotIn(7, booking._advance_wanted)
+        self.assertIn(8, booking._advance_wanted)
+
+
+class TestAdvancePassStaysInsideItsBudget(unittest.TestCase):
+    """진행 패스는 다음 슬롯을 밀지 않는 것이 유일한 규율이다."""
+
+    def setUp(self):
+        booking.forget_advance()
+        self.addCleanup(booking.forget_advance)
+
+    class Session:
+        def __init__(self, *, logged_in=7, allowance=100):
+            self.logged_in_owner = logged_in
+            self._allowance = allowance
+            self.used = []
+            self.pages = []
+            self.budget = type("B", (), {
+                "take": lambda self, n: n, "relax": lambda self: None})()
+
+        def use(self, owner):
+            self.used.append(owner)
+
+        def allowance(self):
+            return self._allowance
+
+        def advanced_stage(self, key):
+            return None
+
+        def advanced_page(self, key):
+            self.pages.append(key)
+            raise AssertionError("예산이 없는데 탭을 열었다")
+
+    def register(self, n=3):
+        for i in range(n):
+            booking.register_advance(
+                object(), {"id": i, "owner_id": 7, "scn_ymd": "20260908",
+                           "auto_book": True, "party_size": 2},
+                [{"scnsNo": "012", "scnSseq": str(i), "scnsrtTm": "2130",
+                  "frSeatCnt": 1}],
+                mov_no="M", site_no="S", site_nm="용산")
+
+    def test_no_budget_means_no_work(self):
+        self.register()
+        out = booking.advance_pending(self.Session(), budget_ms=0)
+        self.assertEqual(out["advanced"], 0)
+
+    def test_an_owner_we_are_not_logged_in_as_is_skipped(self):
+        """로그인은 좌석 사이클의 일이다 — 진행 패스가 대신 하지 않는다."""
+        self.register(2)
+        out = booking.advance_pending(self.Session(logged_in=None),
+                                      budget_ms=5000)
+        self.assertEqual(out["advanced"], 0)
+        self.assertEqual(out["skipped"], 2)
+
+    def test_an_exhausted_request_budget_stops_the_pass(self):
+        self.register(2)
+        out = booking.advance_pending(self.Session(allowance=0),
+                                      budget_ms=5000)
+        self.assertEqual(out["advanced"], 0)
+        self.assertGreaterEqual(out["skipped"], 1)
+
+    def test_nothing_registered_is_not_an_error(self):
+        self.assertEqual(booking.advance_pending(self.Session(),
+                                                 budget_ms=5000)["advanced"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
