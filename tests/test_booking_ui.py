@@ -2428,10 +2428,24 @@ class TestStageClassification(unittest.TestCase):
         url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
         self.assertEqual(self.cls(url=url), booking.STAGE_VISITOR)
 
-    def test_the_visitor_screen_with_the_seat_button_is_party_set(self):
+    def test_the_seat_button_is_not_a_party_marker(self):
+        """실측(2026-09-04): 인원을 누르기 **전에도** seatOpen이 1이다.
+
+        그래서 그걸로 "인원이 골라졌다"를 판정할 수 없다. 그렇게 짚으면 인원이
+        설정되지 않은 탭을 준비됐다고 보게 되고, 좌석을 못 누르는 선점이 된다.
+        """
         url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
         self.assertEqual(self.cls(url=url, seatOpen=1),
-                         booking.STAGE_PARTY_SET)
+                         booking.STAGE_VISITOR)
+
+    def test_seat_nodes_in_the_dom_do_not_make_it_dirty(self):
+        """좌석 요소는 모달이 닫혀 있어도 깔려 있다(624석 × 반응형 2벌 = 1248).
+
+        이걸 "좌석맵이 열렸다"로 읽어 매 패스 되돌리는 루프가 됐다.
+        """
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url, seatOpen=1, seatMap=1248, modals=3),
+                         booking.STAGE_VISITOR)
 
     def test_a_screen_still_loading_is_dirty(self):
         """아직 그리는 중이면 준비됐다고 볼 수 없다 — 다음 패스가 다시 본다."""
@@ -2439,12 +2453,24 @@ class TestStageClassification(unittest.TestCase):
         self.assertEqual(self.cls(url=url, seatOpen=1, loading=1),
                          booking.STAGE_DIRTY)
 
-    def test_an_open_seat_map_is_dirty(self):
-        """좌석맵은 미리 열어 두지 않는다 — 열려 있으면 우리가 아는 자리가 아니다."""
-        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
-        self.assertEqual(self.cls(url=url, seatOpen=1, seatMap=40),
-                         booking.STAGE_DIRTY)
+    def test_the_seat_button_is_not_a_party_marker(self):
+        """실측(2026-09-04): 인원을 누르기 **전에도** seatOpen이 1이다.
 
+        그래서 그걸로 "인원이 골라졌다"를 판정할 수 없다. 그렇게 짚으면 인원이
+        설정되지 않은 탭을 준비됐다고 보게 되고, 좌석을 못 누르는 선점이 된다.
+        """
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url, seatOpen=1),
+                         booking.STAGE_VISITOR)
+
+    def test_seat_nodes_in_the_dom_do_not_make_it_dirty(self):
+        """좌석 요소는 모달이 닫혀 있어도 깔려 있다(624석 × 반응형 2벌 = 1248).
+
+        이걸 "좌석맵이 열렸다"로 읽어 매 패스 되돌리는 루프가 됐다.
+        """
+        url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
+        self.assertEqual(self.cls(url=url, seatOpen=1, seatMap=1248, modals=3),
+                         booking.STAGE_VISITOR)
     def test_a_payment_screen_is_dirty(self):
         url = "https://cgv.co.kr" + booking.VISITOR_PAGE_MARK
         self.assertEqual(self.cls(url=url, pay=1), booking.STAGE_DIRTY)

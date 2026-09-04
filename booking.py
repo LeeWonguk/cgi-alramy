@@ -857,13 +857,27 @@ def classify_stage(state: dict | None, ctx: dict) -> str:
     if not state:
         return STAGE_DIRTY
     url = state.get("url") or ""
-    # 좌석맵이 열려 있거나 결제 화면이면 우리가 아는 쉬는 자리가 아니다.
-    if state.get("seatMap") or state.get("pay"):
+    # 결제 화면이면 돌아올 수 없는 지점을 지난 것이다.
+    if state.get("pay"):
         return STAGE_DIRTY
     if VISITOR_PAGE_MARK in url:
         if state.get("loading"):
             return STAGE_DIRTY          # 아직 그리는 중 — 다음 패스에 다시 본다
-        return STAGE_PARTY_SET if state.get("seatOpen") else STAGE_VISITOR
+        # **seatMap·seatOpen으로는 판정하지 않는다.** 실측(2026-09-04 16:36)으로
+        # 인원 화면의 스냅샷이 이렇게 나왔다:
+        #
+        #   {url: /cnm/selectVisitorCnt, loading: 0, seatOpen: 1,
+        #    seatMap: 1248, modals: 3}
+        #
+        # 좌석 요소는 모달이 닫혀 있어도 DOM에 깔려 있고(624석 × 반응형 2벌),
+        # 이 스크립트의 가시성 검사(offsetWidth||offsetHeight)는 Playwright의
+        # 것보다 약해서 visibility:hidden을 걸러 내지 못한다. 그걸 "좌석맵이
+        # 열렸다"로 읽어 매 패스 되돌리는 루프가 됐다.
+        #
+        # 그리고 seatOpen이 **인원을 누르기 전에도 1**이다 — 그래서 그건
+        # PARTY_SET 표식이 될 수 없다. 인원까지 미리 진행하려면 다른 근거가
+        # 필요하고, 그건 이 스냅샷을 더 모아 정한다. 그때까지 VISITOR가 최대다.
+        return STAGE_VISITOR
     if BOOKING_PAGE in url:
         if not state.get("showtimes"):
             return STAGE_BLANK          # 화면은 맞지만 상영표가 아직 없다
@@ -2311,10 +2325,9 @@ def hold_block(session, ctx: dict) -> dict:
             steps.mark("화면진입")
             steps.mark("회차")
             steps.mark("대기열")
-            # 쉬는 동안 안내 팝업이 앉았을 수 있다(bf71721 계열). 떠 있을 때만
-            # 치운다 — 깨끗하면 왕복 한 번도 쓰지 않는다.
-            if deep and deep.get("modals"):
-                dismiss_modals(page, rounds=1)
+            # 쉬는 동안 안내 팝업이 앉았을 수 있지만(bf71721 계열) 여기서 치우지
+            # 않는다 — 바로 뒤 인원 단계가 _wait_for_loading·dismiss_modals를
+            # 어차피 부른다. 인원까지 미리 진행하게 되면 그때 여기로 옮긴다.
         # 영화 → 극장 → 날짜를 주소 하나로 건너뛴다. 그 세 클릭이 자동 예매가 가장
         # 자주 죽던 구간이다 — 스와이퍼·바텀시트가 만든 **숨겨진 사본**을 눌러
         # 타임아웃이 났다(`.first`는 보이는 것을 고른다는 보장이 없다).
