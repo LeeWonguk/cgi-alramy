@@ -827,6 +827,11 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
     # 자료라, 오래 들고 있으면 그게 곧 감지 지연이 된다.
     sched_cache: dict[tuple, list] = {}
     warmed: set[str] = set()
+    # 미리 진행해 둘 회차 목록도 **이 바퀴에 새로 쌓는다.** 누적해 두면 감시를
+    # 지우거나 회차가 사라졌을 때 그 항목이 영원히 남아, 우선순위를 흐리고 없는
+    # 회차의 탭을 계속 세우게 된다.
+    import booking as _booking
+    _booking.forget_advance()
 
     by_owner: dict[int, list[dict]] = {}
     for w in watches:
@@ -1006,6 +1011,11 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
                 booking.prewarm(session, warm_ctx)
             if warmed is not None:
                 warmed.add(wkey)
+        # 미리 **진행해** 둘 회차를 적어 둔다. 여기서는 브라우저를 건드리지
+        # 않는다(왕복 0) — 실제 구동은 사이클 밖에서 남는 시간에 돈다.
+        booking.register_advance(session, w, rows_to_check(w, schedule),
+                                 mov_no=mov_no, site_no=site_no,
+                                 site_nm=site_nm)
 
     prev = store.prev_seat_state(w["id"])
     fresh_state: dict[str, list[str]] = {}

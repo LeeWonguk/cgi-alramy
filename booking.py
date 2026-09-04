@@ -194,6 +194,25 @@ HOLD_RESPONSE_MS = 12000     # '결제하기' → seatTempPrmp 응답이 올 때
 # 이 값이 곧 "응답이 왔는데 아직 모르고 있는" 평균 시간의 두 배다.
 HOLD_RESPONSE_POLL_MS = 25
 
+# 미리 진행해 둔 탭을 얼마나 믿을지. CGV가 부분 커밋된 예매 세션을 언제 만료시키는지
+# 모르므로 **모델링하지 않고 상한을 둔다.** 30분 브라우저 재활용보다 짧고 사이클
+# 몇 바퀴보다 길게. 지나면 되돌려 처음부터 다시 세운다 — 그 일은 사이클 밖에서
+# 돌므로 선점 경로에는 비용이 없다.
+PREADVANCE_MAX_AGE = 8 * 60
+# 진행 패스가 대기열에서 기다릴 상한. 선점 경로의 90초(QUEUE_WAIT_MS)를 여기 쓰면
+# 사이클이 통째로 밀린다 — 줄이 있으면 그냥 물러나고 다음 패스가 이어 간다.
+ADVANCE_QUEUE_MS = 3000
+# 진행 단계가 바뀔 때 스냅샷을 로그에 남길지.
+#
+# **켜 두는 이유가 있다.** 다음 단계(인원 선택까지 미리 진행)를 붙이려면 "인원이
+# 골라졌다"를 무엇으로 판정할지 알아야 하는데, 좌석맵 '선택' 버튼이 인원 클릭
+# **전에도** 있는지가 상영관마다 다를 수 있다(실측 로그에 인원 직후 좌석맵이
+# 0.0s인 표본과 0.7s인 표본이 함께 있다). 그 값을 추측으로 정하면 인원이 설정되지
+# 않은 탭을 "준비됐다"고 보게 되고, 그건 좌석을 못 누르는 선점이 된다.
+#
+# 여기 쌓인 스냅샷으로 표식을 확정한 뒤에는 꺼도 된다.
+PREADVANCE_DEBUG = True
+
 # 결제창이 뜬 탭을 얼마나 지켜 줄지 (_keep_paying_page).
 #
 # 기준은 카카오가 준 결제 만료 시각이다. 거기에 여유를 더하는 이유는, 사람이 시한
@@ -356,6 +375,7 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
     except Exception as exc:  # noqa: BLE001 - 라이브 구동 실패는 이력에 남기고 넘어간다
         log.warning("auto-book 선점 실패(예외): %s", exc)
         store.finish_booking_attempt(attempt_id, "failed", error=str(exc))
+        release_after_hold(session, ctx)
         return {"action": "failed", "error": str(exc), "attempt_id": attempt_id,
                 "seats": labels}
 
@@ -376,6 +396,9 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
             pay_error=pay.get("error") or None)
         # 선점에 성공하면 그 감시는 꺼서 중복 선점을 막는다.
         store.set_seat_watch(watch_id, enabled=False)
+        # 미리 진행해 둔 탭은 흐름 깊숙이 남아 더 못 쓴다 — 정리해 다음 패스가
+        # 처음부터 세우게 한다. **결제로 떼어낸 탭은 건드리지 않는다.**
+        release_after_hold(session, ctx)
         return {"action": "held", "attempt_id": attempt_id, "seats": final,
                 "mov_atkt_no": result.get("mov_atkt_no"),
                 "hold_expires_at": result.get("hold_expires_at"),
@@ -386,6 +409,7 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
 
     store.finish_booking_attempt(attempt_id, "failed", seat_labels=final,
                                  error=result.get("error") or "선점 실패")
+    release_after_hold(session, ctx)
     return {"action": "failed", "error": result.get("error"),
             "attempt_id": attempt_id, "seats": final}
 
@@ -437,8 +461,13 @@ def _keep_paying_page(session, ctx: dict, pay_expires_at) -> None:
             keep = max(PAY_PAGE_MIN_KEEP_SECONDS, left + PAY_PAGE_GRACE_SECONDS)
         except (AttributeError, TypeError, ValueError, OverflowError):
             pass                # 시각을 못 빼면 고정값으로 간다
+    # **선점에 실제로 쓴 탭의 키**를 써야 한다. 1층 폴백이었으면 warm_key,
+    # 미리 진행해 둔 탭이었으면 advance_key다. 여기서 엉뚱한 키를 넘기면 결제창이
+    # 풀에 남아 다음 프리워밍에 덮인다 — 돈이 나가고 좌석은 안 잡힌다.
+    ctx["_paying"] = True
     try:
-        if session.detach_booking_page(warm_key(ctx), keep):
+        if session.detach_booking_page(ctx.get("_warm_key") or warm_key(ctx),
+                                       keep):
             log.info("결제창이 뜬 탭을 %d초간 지킵니다 — 다른 감시의 프리워밍이 "
                      "덮지 못하게 워밍 풀에서 뺐습니다.", int(keep))
     except Exception as exc:  # noqa: BLE001 - 못 빼도 결제 링크는 이미 나갔다
@@ -644,7 +673,7 @@ _DATE_STATE_JS = r"""(arg) => {
     const n = b.querySelector(arg.numSel);
     return n ? (n.textContent || '').trim() : '';
   };
-  return {
+  const out = {
     url: location.href,
     // 회차 목록이 그려졌는지. 화면준비 판정이 이것과 날짜를 함께 본다.
     showtimes: arg.showSel ? document.querySelectorAll(arg.showSel).length : 0,
@@ -652,17 +681,42 @@ _DATE_STATE_JS = r"""(arg) => {
     actives: days.filter((b) => String(b.className || '').includes(arg.activeMark))
                  .map(num),
   };
+  // 여기까지가 1층(날짜 단위) 판정이 쓰는 것이다. 아래는 **미리 진행해 둔 탭**이
+  // 어디까지 갔는지 보는 데만 쓴다 — 매 사이클 도는 1층 경로에 얹으면 그만큼
+  // 비싸진다(이 판정 하나가 배포에서 783ms였던 적이 있다).
+  if (!arg.deep) return out;
+  const txt = (e) => (e.innerText || '').replace(/\s+/g, ' ').trim();
+  const btns = [...document.querySelectorAll('button')].filter(vis);
+  // **document.body.innerText는 읽지 않는다.** 무거운 화면에서 레이아웃을 강제하는
+  // 읽기다(그래서 page_text를 따로 뒀다). 대기열 판정은 그쪽에 맡긴다.
+  out.loading = [...document.querySelectorAll(arg.loadSel)].some(vis) ? 1 : 0;
+  out.seatOpen = btns.filter((b) => txt(b) === '선택').length;
+  out.seatMap = [...document.querySelectorAll(arg.seatSel)].filter(vis).length;
+  out.pay = btns.filter((b) => txt(b).includes('결제하기')).length;
+  out.modals = [...document.querySelectorAll(arg.modalSel)].filter(vis)
+      .filter((m) => !arg.keep.some((k) => txt(m).includes(k))).length;
+  return out;
 }"""
 
 
-def _date_state(page, *, with_showtimes: bool = False) -> dict | None:
-    """화면 상태 {url, showtimes, days, actives}. 못 읽으면 None."""
+def _date_state(page, *, with_showtimes: bool = False,
+                deep: bool = False) -> dict | None:
+    """화면 상태 {url, showtimes, days, actives}. 못 읽으면 None.
+
+    deep을 주면 진행 단계 판정에 쓰는 값이 더 붙는다
+    ({loading, seatOpen, seatMap, pay, modals}). **왕복은 그대로 한 번이다.**
+    """
     try:
         return page.evaluate(_DATE_STATE_JS, {
             "daySel": ", ".join(DATE_BUTTON_SELECTORS),
             "numSel": DATE_NUMBER_SELECTOR,
             "activeMark": DATE_ACTIVE_MARK,
             "showSel": ", ".join(SHOWTIME_SELECTORS) if with_showtimes else "",
+            "deep": bool(deep),
+            "loadSel": LOADING_SELECTOR,
+            "seatSel": SEAT_MAP_SELECTOR,
+            "modalSel": MODAL_SELECTOR,
+            "keep": list(MODAL_KEEP_TEXTS),
         })
     except Exception:  # noqa: BLE001 - 갈아 끼우는 중이면 확인 불가로 본다
         return None
@@ -701,6 +755,49 @@ def warm_key(ctx: dict) -> str:
                      str(ctx.get("scn_ymd") or "")))
 
 
+def advance_key(ctx: dict) -> str:
+    """**미리 진행해 둔** 탭을 가르는 키 — warm_key + 회차 + 인원.
+
+    warm_key(영화·극장·날짜)는 그대로 두고 이 키를 따로 둔다. 1층 탭은 상영표가
+    그려진 채 쉬는 **폴백**이고 그 값은 회차와 무관하다 — 회차별로 갈라 버리면
+    첫 진입 비용(딥링크 6.2초)이 회차 수만큼 늘어나는데, 상영표에서 회차를 누르는
+    건 0.2초밖에 안 든다.
+
+    **인원도 키에 넣는다.** 인원 선택을 눌러 두면 그 탭은 그 인원으로 굳는다.
+    같은 회차를 2명과 3명으로 보는 감시가 나란히 있을 수 있다.
+    """
+    scns_no, scn_sseq = showtime_ids(ctx.get("row"))
+    scns_no = str(ctx.get("scns_no") or scns_no)
+    scn_sseq = str(ctx.get("scn_sseq") or scn_sseq)
+    return "|".join((warm_key(ctx), scns_no, scn_sseq,
+                     str(ctx.get("party") or "")))
+
+
+def release_after_hold(session, ctx: dict) -> None:
+    """선점 시도가 끝난 탭을 정리한다. 실패해도 조용히 넘어간다.
+
+    미리 진행해 둔 탭에서 선점했다면 그 탭은 흐름 깊숙이 남아 더 쓸 수 없다 —
+    닫아서 다음 패스가 처음부터 다시 세우게 한다. 그 일은 **사이클 밖에서** 돌아야
+    하므로 여기서 새 화면을 열지는 않는다.
+
+    **결제로 떼어낸 탭은 건드리지 않는다.** 거기서 카카오페이 승인을 받아 CGV에
+    넘겨야 하고, 닫으면 돈은 나가고 좌석은 안 잡힌다(커밋 bdaf99c).
+
+    1층 폴백으로 돌았다면 아무것도 하지 않는다 — 그 경로는 예전과 같고, 다음
+    프리워밍이 알아서 다시 연다.
+    """
+    if ctx.get("_paying"):
+        return
+    key = ctx.get("_advance_key")
+    if not key:
+        return
+    try:
+        if session.drop_advanced_page(key):
+            log.debug("선점을 마친 탭을 정리했습니다 (%s)", key)
+    except Exception as exc:  # noqa: BLE001 - 정리 실패가 선점을 되돌리진 않는다
+        log.debug("선점 뒤 탭 정리 실패 (%s)", exc)
+
+
 def booking_page(session, ctx: dict):
     """이 ctx의 예매 화면을 담당할 탭. 세션이 탭을 못 주면 기본 페이지를 쓴다."""
     try:
@@ -730,6 +827,244 @@ def prewarm(session, ctx: dict) -> bool:
     except Exception as exc:  # noqa: BLE001 - 미리 여는 일이 실패해도 선점은 시도한다
         log.debug("예매 화면 프리워밍 실패: %s", exc)
         return False
+
+
+# 미리 진행해 둔 탭이 어디까지 갔는지.
+#
+#   BLANK      예매 화면도 인원 화면도 아니다 — 딥링크로 열어야 한다
+#   DATED      1층 준비 완료: 상영표가 그려지고 그 날짜가 활성이다
+#   VISITOR    회차를 눌러 인원 화면으로 넘어왔다 (로딩도 걷혔다)
+#   PARTY_SET  인원까지 골랐다 — 좌석맵 열기 버튼이 떠 있다
+#   DIRTY      그 밖의 모든 것 (좌석맵이 열려 있거나 결제 화면이거나 모르는 상태)
+#
+# **DIRTY는 되돌린다.** 미리 진행해 둔 상태가 조금이라도 의심스러우면 처음부터
+# 간다 — 10초 걸려 맞는 좌석을 잡는 게 1.8초에 엉뚱한 회차를 잡는 것보다 낫다.
+STAGE_BLANK, STAGE_DATED = "BLANK", "DATED"
+STAGE_VISITOR, STAGE_PARTY_SET, STAGE_DIRTY = "VISITOR", "PARTY_SET", "DIRTY"
+
+
+def classify_stage(state: dict | None, ctx: dict) -> str:
+    """deep 스냅샷을 진행 단계로 읽는다. 못 읽으면 DIRTY.
+
+    **주소로는 판정할 수 없다.** 인원 선택부터 결제까지 주소가
+    `/cnm/selectVisitorCnt`로 고정이다(README의 '결제하기 두 번'). 그래서 그
+    구간 안에서는 DOM 표식만이 근거다.
+
+    그리고 이 판정은 **"맞는 회차인가"를 말하지 않는다.** 그건 DOM으로 확정할 수
+    없어서 나가는 요청에서 본다(hold_request_mismatch). 여기서 보는 것은 "이 탭이
+    어느 단계에 있고, 망가지지 않았는가"까지다.
+    """
+    if not state:
+        return STAGE_DIRTY
+    url = state.get("url") or ""
+    # 좌석맵이 열려 있거나 결제 화면이면 우리가 아는 쉬는 자리가 아니다.
+    if state.get("seatMap") or state.get("pay"):
+        return STAGE_DIRTY
+    if VISITOR_PAGE_MARK in url:
+        if state.get("loading"):
+            return STAGE_DIRTY          # 아직 그리는 중 — 다음 패스에 다시 본다
+        return STAGE_PARTY_SET if state.get("seatOpen") else STAGE_VISITOR
+    if BOOKING_PAGE in url:
+        if not state.get("showtimes"):
+            return STAGE_BLANK          # 화면은 맞지만 상영표가 아직 없다
+        wanted = date_labels(ctx["scn_ymd"])
+        if any(text in wanted for text in state.get("actives") or []):
+            return STAGE_DATED
+        return STAGE_BLANK              # 다른 날짜를 보고 있다 — 다시 열어야 한다
+    return STAGE_BLANK
+
+
+def hold_page(session, ctx: dict):
+    """선점에 쓸 탭과 그 키. (page, key, stage)를 돌려준다.
+
+    미리 진행해 둔 탭이 있고 그 단계를 믿을 수 있으면 그걸 쓴다 — 회차·대기열·인원을
+    선점 순간에 하지 않아도 된다. 아니면 1층(날짜 단위) 탭으로 간다.
+
+    ctx에 실제로 쓴 키를 남긴다(`_warm_key`). 결제창을 떼어낼 때 그 키가 필요하고,
+    엉뚱한 키를 쓰면 결제창이 풀에 남아 다음 프리워밍에 덮인다.
+    """
+    akey = advance_key(ctx)
+    try:
+        record = session.advanced_stage(akey)
+    except Exception:  # noqa: BLE001 - 2층을 모르는 세션이면 1층으로 간다
+        record = None
+    if record and record.get("state") in (STAGE_VISITOR, STAGE_PARTY_SET):
+        if time.monotonic() - record.get("at", 0) <= PREADVANCE_MAX_AGE:
+            try:
+                page = session.advanced_page(akey)
+                ctx["_warm_key"] = akey
+                ctx["_advance_key"] = akey
+                return page, akey, record["state"]
+            except Exception as exc:  # noqa: BLE001 - 못 얻으면 1층으로
+                log.debug("미리 진행해 둔 탭을 얻지 못했습니다 (%s)", exc)
+    key = warm_key(ctx)
+    ctx["_warm_key"] = key
+    ctx.pop("_advance_key", None)
+    return booking_page(session, ctx), key, None
+
+
+# 미리 진행해 두면 좋을 회차 — {소유자: {키: 명세}}. 사이클이 여기 적어 두고
+# (register_advance) 사이클 밖에서 꺼내 쓴다(advance_pending).
+_advance_wanted: dict = {}
+# 진행 한 걸음이 CGV로 내보내는 요청 수의 어림값. 그 요청은 CGV의 자체 JS가
+# 보내므로 우리가 셀 수 없다 — 그래도 예산에 **계상은 해야** 한다. 안 하면
+# 이 트래픽이 회계 밖에서 늘어나 429로 돌아온다(커밋 3e80826에서 한 번 맞았다).
+ADVANCE_REQUEST_COST = 8
+
+
+def register_advance(session, watch_row: dict, rows: list, *, mov_no: str,
+                     site_no: str, site_nm: str) -> int:
+    """이 감시가 미리 진행해 두면 좋을 회차를 적어 둔다. 등록한 수를 돌려준다.
+
+    **브라우저를 건드리지 않는다.** 사이클 안에서 불리므로 왕복이 하나라도 있으면
+    그게 곧 사이클 길이가 된다 — `55c59d5`가 "미리 열 때 회차 목록까지 기다리지는
+    않는다. 6초를 쓰면 그 사이클이 통째로 느려진다"로 정한 원칙이다. 그래서 여기서는
+    무엇을 할지만 적고, 실제 구동은 사이클 밖에서 돈다(advance_pending).
+
+    **여유석이 적은 회차를 앞세운다.** 자리가 넉넉한 회차는 첫 사이클에 이미
+    잡히므로 속도가 무의미하다. 값이 있는 건 `frSeatCnt < party`인 회차 —
+    취소표를 기다리는 그 회차이고, 그 창은 실측 4~45초다.
+    """
+    owner = watch_row.get("owner_id")
+    if owner is None or not watch_row.get("auto_book") or not mov_no:
+        return 0
+    party = max(1, int(watch_row.get("party_size") or 1))
+    wanted = _advance_wanted.setdefault(owner, {})
+    added = 0
+    for row in rows:
+        ctx = {"mov_no": mov_no, "site_no": site_no, "site_nm": site_nm,
+               "scn_ymd": watch_row["scn_ymd"], "row": row, "party": party,
+               "start_hhmm": _fmt_hhmm(row.get("scnsrtTm")),
+               # 같은 시각에 상영관이 여럿일 때 어느 쪽인지 가리는 데 쓴다
+               # (_click_showtime). 빠지면 엉뚱한 관으로 진행해 둘 수 있고,
+               # 그건 선점 때 관문에 걸려 기회를 날린다.
+               "scns_nm": row.get("expoScnsNm") or row.get("scnsNm") or ""}
+        free = seats_mod._seat_count(row)
+        wanted[advance_key(ctx)] = {
+            "ctx": ctx,
+            # 정렬 키: 자리가 모자란 회차가 0, 그다음은 여유석 적은 순.
+            "rank": (0 if (free is not None and free < party) else 1,
+                     free if free is not None else 10**6,
+                     str(watch_row["scn_ymd"]), str(row.get("scnsrtTm") or "")),
+        }
+        added += 1
+    return added
+
+
+def forget_advance(owner_id: int | None = None) -> None:
+    """등록해 둔 것을 비운다. 감시가 바뀌면 다시 적히므로 그냥 버려도 된다."""
+    if owner_id is None:
+        _advance_wanted.clear()
+    else:
+        _advance_wanted.pop(owner_id, None)
+
+
+def advance_pending(session, *, budget_ms: float) -> dict:
+    """등록된 회차를 **한 패스에 한 걸음씩** 미리 진행한다.
+
+    사이클 밖에서 돈다. 규칙:
+
+    - **한 탭에 한 걸음.** 되돌리기(딥링크)가 제일 비싸므로 그것부터 하고,
+      그다음 한 탭을 한 단계 올린다. 4장을 처음 세우는 데 여러 패스가 걸리지만
+      그게 사이클을 밀지 않는 유일한 방법이다.
+    - **걸음마다 데드라인을 본다.** 항상 시간 안에 돌아온다.
+    - **줄은 서지 않는다.** 대기열이 있으면 3초만 보고 물러난다 — 선점 경로의
+      90초를 여기 쓰면 사이클이 통째로 밀린다. 탭은 대기열 중간에 남고 다음
+      패스가 다시 분류한다(그래서 이 엔진은 스냅샷 기반이고 재개 가능하다).
+    - **로그인하지 않는다.** 그건 좌석 사이클의 일이다. 이 소유자로 로그인돼
+      있지 않으면 건너뛴다.
+    - **예산에 계상한다.** 안 하면 회계 밖에서 트래픽이 늘어 429가 된다.
+    """
+    deadline = time.monotonic() + budget_ms / 1000
+    out = {"advanced": 0, "reset": 0, "stale": 0, "ready": 0, "skipped": 0}
+    for owner, wanted in list(_advance_wanted.items()):
+        if not wanted or time.monotonic() >= deadline:
+            break
+        try:
+            session.use(owner)
+        except Exception:  # noqa: BLE001 - 공간을 못 열면 이 소유자는 건너뛴다
+            continue
+        if getattr(session, "logged_in_owner", None) != owner:
+            out["skipped"] += len(wanted)
+            continue
+        for key in sorted(wanted, key=lambda k: wanted[k]["rank"]):
+            if time.monotonic() >= deadline:
+                break
+            if session.allowance() <= 0:
+                out["skipped"] += 1
+                break
+            step = _advance_one(session, key, wanted[key]["ctx"], out)
+            if step:                      # 한 패스에 한 걸음이면 충분하다
+                break
+    return out
+
+
+def _advance_one(session, key: str, ctx: dict, out: dict) -> bool:
+    """탭 하나를 한 단계 올린다. 실제로 뭔가 했으면 True.
+
+    실패해도 예외를 밖으로 내지 않는다 — 미리 하는 일이고, 선점할 때 어차피 다시
+    확인한다(prewarm과 같은 계약).
+    """
+    try:
+        record = session.advanced_stage(key)
+        if record and record.get("state") == STAGE_PARTY_SET:
+            if time.monotonic() - record.get("at", 0) <= PREADVANCE_MAX_AGE:
+                out["ready"] += 1
+                return False
+        page = session.advanced_page(key)
+        state = _date_state(page, with_showtimes=True, deep=True)
+        stage = classify_stage(state, ctx)
+        # **단계가 바뀔 때만** 남긴다. 검사마다 찍으면 3초에 한 줄, 시간당 1,200줄이
+        # 되어 정작 아무도 안 읽는다. 여기 남는 스냅샷이 PARTY_SET 표식을 실측으로
+        # 확정하는 근거다 — 인원을 누르기 전에도 좌석맵 '선택' 버튼이 있는지가
+        # 관마다 다를 수 있어, 그 값은 추측으로 정하면 안 된다.
+        was = (record or {}).get("state")
+        if PREADVANCE_DEBUG and stage != was:
+            log.info("사전진행 %s: %s → %s %s", key, was or "없음", stage,
+                     {k: state.get(k) for k in
+                      ("url", "showtimes", "loading", "seatOpen", "seatMap",
+                       "pay", "modals")} if state else None)
+
+        # 시한이 지난 것은 더 못 믿는다 — 되돌려 처음부터 세운다.
+        if record and time.monotonic() - record.get("at", 0) > PREADVANCE_MAX_AGE:
+            out["stale"] += 1
+            stage = STAGE_DIRTY
+
+        if stage in (STAGE_DIRTY, STAGE_BLANK):
+            session.budget.take(1)
+            if _open_booking_direct(page, ctx):
+                session.set_advanced_stage(key, STAGE_DATED)
+            else:
+                session.drop_advanced_page(key)
+            out["reset"] += 1
+            return True
+
+        if stage == STAGE_DATED:
+            session.budget.take(ADVANCE_REQUEST_COST)
+            _click_showtime(page, ctx["start_hhmm"],
+                            ctx.get("scns_nm", ""), ctx.get("scn_ymd", ""))
+            if not wait_past_queue(page, ADVANCE_QUEUE_MS):
+                # 줄을 섰거나 아직 넘어가는 중이다. 다음 패스가 이어 간다.
+                return True
+            _wait_for_loading(page)
+            session.set_advanced_stage(key, STAGE_VISITOR)
+            out["advanced"] += 1
+            return True
+
+        # VISITOR까지 왔다. 인원 선택은 PARTY_SET 표식을 실측으로 확정한 뒤에
+        # 붙인다 — 좌석맵 '선택' 버튼이 인원 클릭 **전에도** 있는지가 관마다
+        # 다를 수 있고(실측에 좌석맵 0.0s인 표본이 있다), 잘못 짚으면 인원이
+        # 설정되지 않은 탭을 준비됐다고 보게 된다.
+        session.set_advanced_stage(key, STAGE_VISITOR)
+        out["ready"] += 1
+        return False
+    except Exception as exc:  # noqa: BLE001 - 미리 하는 일은 조용히 실패한다
+        log.debug("사전진행 실패 (%s): %s", key, exc)
+        try:
+            session.drop_advanced_page(key)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
 
 def _already_on_booking(page, ctx: dict) -> bool:
@@ -1871,8 +2206,9 @@ def hold_block(session, ctx: dict) -> dict:
     """
     import json as _json
 
-    # 미리 띄워 둔 탭이 있으면 그걸 쓴다 — 예매 화면을 새로 여는 6.2초를 아낀다.
-    page = booking_page(session, ctx)
+    # 미리 진행해 둔 탭이 있으면 그걸 쓴다(회차·대기열까지 넘어가 있다). 없으면
+    # 미리 띄워 둔 1층 탭 — 예매 화면을 새로 여는 6.2초를 아낀다.
+    page, _used_key, stage = hold_page(session, ctx)
     # 결제 단계가 같은 화면에서 이어져야 한다.
     ctx["_page"] = page
     captured = {}
@@ -1940,10 +2276,34 @@ def hold_block(session, ctx: dict) -> dict:
         log.warning("선점 요청 검증을 걸지 못했습니다 (%s) — 검증 없이 갑니다", exc)
 
     try:
+        # 미리 진행해 둔 탭이면 그 상태가 **지금도** 그런지 한 번 확인한다. 기록만
+        # 믿지 않는다 — 몇 분씩 쉬는 동안 CGV가 화면을 되돌렸을 수 있다.
+        deep = None
+        if stage in (STAGE_VISITOR, STAGE_PARTY_SET):
+            deep = _date_state(page, deep=True)
+            live = classify_stage(deep, ctx)
+            if live != stage:
+                # 살리려 하지 않는다. 처음부터 가면 6.2초를 물지만, 엉뚱한 회차를
+                # 선점하는 것보다 훨씬 낫다.
+                log.info("미리 진행해 둔 화면이 %s가 아니라 %s입니다 — 처음부터 "
+                         "갑니다", stage, live)
+                stage = None
+        if stage:
+            log.info("미리 진행해 둔 화면을 그대로 씁니다 (%s %s · %s)",
+                     ctx.get("scn_ymd"), ctx.get("start_hhmm"), stage)
+            # 이 셋은 이미 끝나 있다. 로그의 단계 구분을 지켜 기준선과 비교할 수
+            # 있게 0.0s로 찍는다.
+            steps.mark("화면진입")
+            steps.mark("회차")
+            steps.mark("대기열")
+            # 쉬는 동안 안내 팝업이 앉았을 수 있다(bf71721 계열). 떠 있을 때만
+            # 치운다 — 깨끗하면 왕복 한 번도 쓰지 않는다.
+            if deep and deep.get("modals"):
+                dismiss_modals(page, rounds=1)
         # 영화 → 극장 → 날짜를 주소 하나로 건너뛴다. 그 세 클릭이 자동 예매가 가장
         # 자주 죽던 구간이다 — 스와이퍼·바텀시트가 만든 **숨겨진 사본**을 눌러
         # 타임아웃이 났다(`.first`는 보이는 것을 고른다는 보장이 없다).
-        if _already_on_booking(page, ctx):
+        elif _already_on_booking(page, ctx):
             log.info("미리 띄워 둔 예매 화면을 그대로 씁니다 (%s)", ctx["scn_ymd"])
         elif not _open_booking_direct(page, ctx):
             page.goto(BOOKING_PAGE, wait_until="domcontentloaded", timeout=40000)
@@ -1959,27 +2319,31 @@ def hold_block(session, ctx: dict) -> dict:
             # 회차를 찾게 된다 — 없으면 실패하고, 하필 같은 시각이 있으면 엉뚱한
             # 날짜를 선점한다.
             _click_date(page, ctx["scn_ymd"])
-        steps.mark("화면진입")
-        _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""),
-                        ctx.get("scn_ymd", ""))
-        steps.mark("회차")
-        # 인원 선택 화면에 닿을 때까지 기다린다. 고정 시간으로 넘겨짚으면 안 된다 —
-        # 접속이 몰리면 CGV가 가상 대기열을 세우고, 그동안 화면은 그대로다.
-        if not wait_past_queue(page):
-            raise RuntimeError(
-                "인원 선택 화면으로 넘어가지 못했습니다"
-                + (" (대기열이 길어 시간 안에 통과하지 못했습니다)"
-                   if in_queue(page_text(page)) else ""))
-        steps.mark("대기열")
+        if not stage:
+            steps.mark("화면진입")
+            _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""),
+                            ctx.get("scn_ymd", ""))
+            steps.mark("회차")
+            # 인원 선택 화면에 닿을 때까지 기다린다. 고정 시간으로 넘겨짚으면
+            # 안 된다 — 접속이 몰리면 CGV가 가상 대기열을 세우고, 그동안 화면은
+            # 그대로다.
+            if not wait_past_queue(page):
+                raise RuntimeError(
+                    "인원 선택 화면으로 넘어가지 못했습니다"
+                    + (" (대기열이 길어 시간 안에 통과하지 못했습니다)"
+                       if in_queue(page_text(page)) else ""))
+            steps.mark("대기열")
         # 이벤트·안내 팝업이 떠 있으면 아래 버튼을 누를 수 없다. 로딩 가림막이
         # 걷히면서 팝업이 뜨므로 **걷히기를 기다렸다가** 닫는다 — 로딩 중에
         # 닫으러 가면 아직 없어서 헛걸음하고, 그 팝업은 바로 다음 클릭을 막는다.
-        _wait_for_loading(page)
-        dismiss_modals(page)
-        # 관람인원: party명 (일반 기준). 권종 세분화는 후속 단계.
-        # 버튼 이름은 접근성 이름으로만 잡힌다 — 안의 숫자와 '선택'이 서로 다른
-        # 요소라 텍스트로 찾으면 걸리지 않는다.
-        _click_role(page, f"{ctx['party']} 선택", what="관람인원", timeout=5000)
+        if stage != STAGE_PARTY_SET:
+            _wait_for_loading(page)
+            dismiss_modals(page)
+            # 관람인원: party명 (일반 기준). 권종 세분화는 후속 단계.
+            # 버튼 이름은 접근성 이름으로만 잡힌다 — 안의 숫자와 '선택'이 서로 다른
+            # 요소라 텍스트로 찾으면 걸리지 않는다.
+            _click_role(page, f"{ctx['party']} 선택", what="관람인원",
+                        timeout=5000)
         steps.mark("인원")
         # 좌석맵 열기 — 좌석은 이 모달 안에서만 누를 수 있다. 이미 열려 있으면
         # 버튼이 없으므로 짧게만 기다리고 넘어간다.
