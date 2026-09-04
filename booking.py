@@ -334,6 +334,10 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
         showtime_key=showtime_key, mov_nm=mov_nm, site_nm=site_nm,
         scn_ymd=watch["scn_ymd"], start_hhmm=start_hhmm,
         seat_labels=labels, seat_loc_nos=loc_nos)
+    # 사이클이 도는 동안 사용자가 이 감시를 지웠다. 그러면 이 좌석을 원하지
+    # 않는다는 뜻이므로 **잡지 않는다** — 잡으면 자동 결제까지 이어진다.
+    if attempt_id is None:
+        return {"action": "skip", "reason": "watch deleted"}
 
     ctx = {"mov_nm": mov_nm, "site_nm": site_nm, "scn_ymd": watch["scn_ymd"],
            "start_hhmm": start_hhmm, "seat_labels": labels, "party": party,

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -614,6 +615,27 @@ class TestAutoBookOrchestration(DbCase):
         self.assertEqual(out["action"], "held")   # 선점은 유효하다
         self.assertEqual(detached, [])
 
+    def test_a_watch_deleted_mid_cycle_is_not_booked(self):
+        """사이클이 도는 동안 감시를 지우면 선점하지 않는다.
+
+        사이클은 시작할 때 감시 목록을 한 번 읽고 그 스냅샷으로 돈다. 그동안
+        사용자가 감시를 지웠다는 건 그 좌석을 원하지 않는다는 뜻이다 — 그런데도
+        잡으면 자동 결제까지 이어져 돈이 나간다.
+        """
+        import booking
+        uid = self.make_user("owner")["id"]
+        w = self._watch(uid, auto_book=True, party_size=2)
+        self.assertTrue(store.delete_seat_watch(w["id"], owner_id=uid))
+
+        def must_not_run(session, ctx):
+            self.fail("지워진 감시로 선점이 나갔습니다")
+
+        out = booking.try_auto_book(
+            None, w, self._row(), self._seats(set(range(1, 9))),
+            mov_nm="오디세이", site_nm="용산", hold_fn=must_not_run)
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["reason"], "watch deleted")
+
     def test_failed_records_failure_keeps_watch(self):
         import booking
         uid = self.make_user("owner")["id"]
@@ -1072,6 +1094,142 @@ class TestThrottling(unittest.TestCase):
     def test_the_batch_stays_small_enough(self):
         """묶음을 키웠다가 429를 받고 되돌렸다 — 다시 키우면 같은 일이 난다."""
         self.assertLessEqual(watch.SEAT_MAP_BATCH, 8)
+
+
+class TestADeletedWatchDoesNotCrashTheCycle(DbCase):
+    """사이클 도중 감시가 지워지는 경합 (store.watch_was_deleted).
+
+    사이클은 시작할 때 감시 목록을 한 번 읽고(store.seat_watches) 3초간 그
+    스냅샷으로 돈다. 그동안 웹에서 감시를 지우면 뒤이은 쓰기가 없는 id를 가리켜
+    FK 위반이 되고, 예전에는 그 예외가 사이클 밖으로 나가 **바퀴가 통째로
+    죽었다.** 실측(2026-09-02 10:10, 지난 날짜 감시를 정리하던 중):
+
+      ForeignKeyViolation: ... "booking_attempts_seat_watch_id_fkey"
+      DETAIL:  Key (seat_watch_id)=(65) is not present in table "seat_watches".
+
+    고장이 아니라 정상적인 경합이므로 조용히 넘어가야 한다.
+    """
+
+    def gone_watch(self):
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825")
+        self.assertTrue(store.delete_seat_watch(w["id"], owner_id=uid))
+        return uid, w["id"]
+
+    def test_saving_state_for_a_gone_watch_is_not_an_error(self):
+        _, wid = self.gone_watch()
+        self.assertFalse(store.save_seat_state(wid, {"001|5": ["A1"]}))
+
+    def test_saving_an_error_for_a_gone_watch_is_not_an_error(self):
+        _, wid = self.gone_watch()
+        self.assertFalse(store.save_seat_state(wid, {}, error="시간표 조회 실패"))
+
+    def test_a_live_watch_still_saves(self):
+        """그물이 정상 경로를 삼키지 않는지 — 이게 없으면 조용히 아무것도 안 남는다."""
+        uid = self.make_user("owner")["id"]
+        w = store.add_seat_watch(uid, "오디세이", "용산", "20260825")
+        self.assertTrue(store.save_seat_state(w["id"], {"001|5": ["A1"]}))
+        self.assertEqual(store.prev_seat_state(w["id"]), {"001|5": ["A1"]})
+
+    def test_a_booking_attempt_for_a_gone_watch_returns_none(self):
+        uid, wid = self.gone_watch()
+        self.assertIsNone(store.create_booking_attempt(
+            seat_watch_id=wid, owner_id=uid, showtime_key="001|5",
+            mov_nm="오디세이", site_nm="용산", scn_ymd="20260825",
+            start_hhmm="22:10", seat_labels=["A1"], seat_loc_nos=["L1"]))
+
+    def test_an_alert_for_a_gone_watch_is_still_recorded(self):
+        """선점 성공처럼 돈과 좌석이 걸린 알림을 버리면 안 된다 — 연결만 끊는다."""
+        uid, wid = self.gone_watch()
+        alert_id = store.record_alert(
+            "book_held", "🎫 좌석 선점 완료", owner_id=uid,
+            mov_nm="오디세이", site_nm="용산", dates=["20260825"],
+            seat_watch_id=wid)
+        self.assertIsNotNone(alert_id)
+        row = next(a for a in store.recent_alerts(limit=5) if a["id"] == alert_id)
+        self.assertIsNone(row["seat_watch_id"], "없는 감시를 가리키고 있다")
+        self.assertIn("선점 완료", row["body"])
+
+    def test_a_real_foreign_key_problem_is_not_swallowed(self):
+        """seat_watch_id와 무관한 FK 위반은 그대로 올라가야 한다."""
+        import psycopg
+
+        other = psycopg.errors.ForeignKeyViolation(
+            'insert or update on table "alerts" violates foreign key '
+            'constraint "alerts_owner_id_fkey"')
+        self.assertFalse(store.watch_was_deleted(other))
+        self.assertFalse(store.watch_was_deleted(RuntimeError("아무 오류")))
+
+
+class TestOneWatchCannotKillTheCycle(DbCase):
+    """감시 하나에서 예외가 나도 남은 감시는 확인돼야 한다.
+
+    예전에는 `for w in group` 루프에 그물이 없어서, 예외가 나가면
+    check_seat_watches가 통째로 죽고 남은 감시들은 확인조차 되지 않았다.
+    실측(2026-09-02 10:10)으로 사이클 도중 감시를 지웠을 때 FK 위반이 그렇게
+    바퀴를 죽였다. 그 경합은 store 쪽에서 조용히 넘기게 고쳤지만, 여기 그물이
+    없으면 다음번 뜻밖의 예외에 같은 일이 난다.
+    """
+
+    class Sess:
+        def __init__(self):
+            self.budget = type("B", (), {"relax": lambda self: None})()
+
+        def allowance(self):
+            return 100
+
+        def use(self, owner_id):
+            pass
+
+    def setUp(self):
+        super().setUp()
+        import cgv_login
+        import seats
+        self.seats = seats
+        self._patches = [
+            unittest.mock.patch.object(cgv_login, "ensure_logged_in",
+                                       lambda oid, s: True),
+            unittest.mock.patch.object(seats, "_prefetch_seat_maps",
+                                       lambda *a, **k: {}),
+        ]
+        for pt in self._patches:
+            pt.start()
+            self.addCleanup(pt.stop)
+
+    def test_a_raising_watch_does_not_stop_the_others(self):
+        uid = self.make_user("owner")["id"]
+        first = store.add_seat_watch(uid, "오디세이", "용산", "20260825")
+        second = store.add_seat_watch(uid, "오디세이", "용산", "20260826")
+        seen = []
+
+        def one(session, catalog, w, *a, **k):
+            seen.append(w["id"])
+            if w["id"] == first["id"]:
+                raise RuntimeError("뜻밖의 고장")
+            return 3
+
+        with unittest.mock.patch.object(self.seats, "_check_one_seat_watch", one):
+            summary = self.seats.check_seat_watches(self.Sess())
+
+        self.assertEqual(sorted(seen), sorted([first["id"], second["id"]]),
+                         "터진 감시 뒤로 나머지를 안 봤다")
+        self.assertEqual(summary["watches_checked"], 2)
+        self.assertEqual(summary["alerts_sent"], 3, "성공한 감시의 알림이 사라졌다")
+
+    def test_throttling_still_stops_the_whole_cycle(self):
+        """이건 사이클 전체 신호다 — 삼키고 계속하면 CGV를 계속 때린다."""
+        import watch as watch_mod
+        uid = self.make_user("owner")["id"]
+        store.add_seat_watch(uid, "오디세이", "용산", "20260825")
+        store.add_seat_watch(uid, "오디세이", "용산", "20260826")
+
+        def throttled(session, catalog, w, *a, **k):
+            raise watch_mod.Throttled("CGV가 요청을 거절했습니다 (HTTP 429)")
+
+        with unittest.mock.patch.object(self.seats, "_check_one_seat_watch",
+                                        throttled):
+            with self.assertRaises(watch_mod.Throttled):
+                self.seats.check_seat_watches(self.Sess())
 
 
 class TestThePayingTabLeavesTheWarmPool(unittest.TestCase):

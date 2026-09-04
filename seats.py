@@ -867,10 +867,25 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
             prefetched = {}
         for w in group:
             summary["watches_checked"] += 1
-            sent = _check_one_seat_watch(
-                session, catalog, w, webhook, webhook_kind, guard=guard,
-                dry_run=dry_run, cost=cost, sched_cache=sched_cache,
-                warmed=warmed, prefetched=prefetched, unchanged=unchanged)
+            # **감시 하나가 바퀴를 통째로 죽이면 안 된다.** 예외가 여기서 나가면
+            # 남은 감시들은 확인조차 되지 않는다. 실측(2026-09-02 10:10)으로
+            # 사이클 도중 감시를 지웠을 때 FK 위반이 밖으로 나가 그 바퀴가 죽었다.
+            # 그 경합은 store 쪽에서 조용히 넘기게 고쳤지만, 여기 그물이 없으면
+            # 다음번 뜻밖의 예외에 같은 일이 난다.
+            try:
+                sent = _check_one_seat_watch(
+                    session, catalog, w, webhook, webhook_kind, guard=guard,
+                    dry_run=dry_run, cost=cost, sched_cache=sched_cache,
+                    warmed=warmed, prefetched=prefetched, unchanged=unchanged)
+            except (watch.Throttled, watch.RateLimited):
+                # 이건 사이클 전체에 대한 신호다 — 삼키고 다음 감시로 가면
+                # CGV를 계속 때린다. 그대로 올려 바퀴를 멈춘다.
+                raise
+            except Exception as exc:  # noqa: BLE001 - 나머지는 이 감시만의 문제다
+                watch.log.exception(
+                    "좌석 감시 %s를 확인하다 실패했습니다 (%s) — 이 감시만 "
+                    "건너뛰고 나머지를 계속합니다", w.get("id"), exc)
+                continue
             summary["alerts_sent"] += sent
 
     # 사이클이 폴링 간격을 넘으면 다음 슬롯을 통째로 놓친다 — 그 사실이 로그에
