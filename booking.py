@@ -940,6 +940,11 @@ def register_advance(session, watch_row: dict, rows: list, *, mov_no: str,
                # 그건 선점 때 관문에 걸려 기회를 날린다.
                "scns_nm": row.get("expoScnsNm") or row.get("scnsNm") or ""}
         free = seats_mod._seat_count(row)
+        # **매진 회차는 미리 진행할 수 없다.** 회차 버튼이 aria-disabled라 눌리지
+        # 않는다 — 등록해 두면 패스마다 헛되이 시도하며 탭 자리만 차지한다.
+        # 취소표가 나서 잔여석이 1 이상이 되면 다음 사이클에 다시 등록된다.
+        if free == 0:
+            continue
         wanted[advance_key(ctx)] = {
             "ctx": ctx,
             # 정렬 키: 자리가 모자란 회차가 0, 그다음은 여유석 적은 순.
@@ -1041,8 +1046,18 @@ def _advance_one(session, key: str, ctx: dict, out: dict) -> bool:
 
         if stage == STAGE_DATED:
             session.budget.take(ADVANCE_REQUEST_COST)
-            _click_showtime(page, ctx["start_hhmm"],
-                            ctx.get("scns_nm", ""), ctx.get("scn_ymd", ""))
+            # **scn_ymd를 주지 않는다.** 그걸 주면 화면이 매진일 때 회차 목록을
+            # 다시 받아 한 번 더 시도하는데(날짜를 옮겼다 돌아온다), 그 경로가
+            # 4초대다. 선점 경로에서는 값어치가 있지만 — 좌석이 났다는 건 방금
+            # API로 확인한 사실이니까 — 미리 하는 일에서는 사이클을 미는 값이다.
+            # 매진이면 물러나고 다음 패스에 다시 본다.
+            try:
+                _click_showtime(page, ctx["start_hhmm"], ctx.get("scns_nm", ""))
+            except _ShowtimeBlocked:
+                # 그새 매진됐다. 탭은 상영표 상태로 쓸 만하니 그대로 두고 넘어간다.
+                session.set_advanced_stage(key, STAGE_DATED)
+                out["skipped"] += 1
+                return True
             if not wait_past_queue(page, ADVANCE_QUEUE_MS):
                 # 줄을 섰거나 아직 넘어가는 중이다. 다음 패스가 이어 간다.
                 return True

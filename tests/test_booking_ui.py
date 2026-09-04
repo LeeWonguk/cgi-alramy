@@ -2590,6 +2590,23 @@ class TestAdvanceRegistrationTouchesNothing(unittest.TestCase):
         order = sorted(ranks, key=lambda k: ranks[k]["rank"])
         self.assertEqual(ranks[order[0]]["ctx"]["row"]["scnSseq"], "2")
 
+    def test_a_sold_out_showtime_is_not_registered(self):
+        """매진 회차는 버튼이 비활성이라 들어갈 수 없다 — 등록하면 헛수고다."""
+        n = booking.register_advance(
+            self.Explode(), self.watch_row(),
+            [self.row("1", 0), self.row("2", 3)],
+            mov_no="M", site_no="S", site_nm="용산")
+        self.assertEqual(n, 1)
+        spec = next(iter(booking._advance_wanted[7].values()))
+        self.assertEqual(spec["ctx"]["row"]["scnSseq"], "2")
+
+    def test_a_showtime_with_one_seat_is_still_registered(self):
+        """잔여 1석은 우리 인원(2)보다 적지만 **들어갈 수는 있다** — 0석과 다르다."""
+        n = booking.register_advance(
+            self.Explode(), self.watch_row(), [self.row("1", 1)],
+            mov_no="M", site_no="S", site_nm="용산")
+        self.assertEqual(n, 1)
+
     def test_the_screen_name_is_carried(self):
         """같은 시각에 상영관이 여럿일 때 어느 쪽인지 가려야 한다."""
         booking.register_advance(
