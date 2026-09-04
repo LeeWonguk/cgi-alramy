@@ -2034,5 +2034,100 @@ class TestTheTabWithThePaymentWindowIsKept(unittest.TestCase):
         booking._keep_paying_page(Bad(), self.CTX, None)
 
 
+class TestHoldRequestGuard(unittest.TestCase):
+    """나가는 선점 요청을 의도와 맞춰 보는 관문 (booking.hold_request_mismatch).
+
+    본문은 `logs/holdspec/20260904-144228_hold.json`에서 실제로 관측된 것이다.
+    선점 요청은 **자기 자신을 설명한다** — 상영일·극장·상영관·회차 순번·좌석이
+    모두 들어 있어서, CGV에 닿기 전에 우리가 의도한 것과 맞는지 확정할 수 있다.
+
+    이 관문이 필요한 이유: 인원 선택부터 결제까지 주소가 `/cnm/selectVisitorCnt`로
+    고정이라(README '결제하기 두 번'), 화면이 정말 그 회차인지 DOM만으로는
+    확정할 수 없다. 잘못된 회차를 선점하는 건 되돌리기 어렵고 돈이 걸린다.
+    """
+
+    BODY = {
+        "coCd": "A420", "bymd": "", "mbltNo": "", "siteNo": "0013",
+        "scnYmd": "20260908", "scnsNo": "012", "scnSseq": "1",
+        "movAtktNo": "", "custNo": "123456789", "cusgdCd": "01",
+        "nmbrCrtfNo": "", "sachlCd": "10", "atktChnlCd": "01",
+        "sachlTypCd": "01", "rtctlScopCd": "08",
+        "seatPrmpDataList": [
+            {"seatRowNm": "E", "seatNo": "7", "seatLocNo": "00200100190011",
+             "sbordNo": "002", "seatAreaNo": "001", "szoneNo": "01001"},
+            {"seatRowNm": "E", "seatNo": "8", "seatLocNo": "00200100210011",
+             "sbordNo": "002", "seatAreaNo": "001", "szoneNo": "01001"},
+        ],
+    }
+    CTX = {"scn_ymd": "20260908", "site_no": "0013", "party": 2,
+           "row": {"scnsNo": "012", "scnSseq": "1"}, "start_hhmm": "09:00"}
+
+    def body(self, **over):
+        import json
+        return json.dumps({**self.BODY, **over})
+
+    def test_the_real_request_passes(self):
+        self.assertIsNone(
+            booking.hold_request_mismatch(self.body(), self.CTX))
+
+    def test_a_different_date_is_caught(self):
+        reason = booking.hold_request_mismatch(
+            self.body(scnYmd="20260909"), self.CTX)
+        self.assertIn("상영일", reason)
+        self.assertIn("20260909", reason)
+
+    def test_a_different_theater_is_caught(self):
+        self.assertIn("극장", booking.hold_request_mismatch(
+            self.body(siteNo="0001"), self.CTX))
+
+    def test_a_different_screen_is_caught(self):
+        """같은 시각에 상영관이 여럿일 수 있다 — 시각만으로는 못 가린다."""
+        self.assertIn("상영관", booking.hold_request_mismatch(
+            self.body(scnsNo="018"), self.CTX))
+
+    def test_a_different_showtime_sequence_is_caught(self):
+        self.assertIn("회차 순번", booking.hold_request_mismatch(
+            self.body(scnSseq="5"), self.CTX))
+
+    def test_the_wrong_number_of_seats_is_caught(self):
+        """2명으로 걸어 둔 감시가 3석을 잡으려 하면 막는다."""
+        three = self.BODY["seatPrmpDataList"] + [
+            {"seatRowNm": "E", "seatNo": "9", "seatLocNo": "x",
+             "sbordNo": "002", "seatAreaNo": "001", "szoneNo": "01001"}]
+        self.assertIn("좌석 수", booking.hold_request_mismatch(
+            self.body(seatPrmpDataList=three), self.CTX))
+
+    def test_an_unreadable_body_is_not_blocked(self):
+        """형태가 바뀌었을 때 모든 선점을 세우는 편이 더 나쁘다 — 통과시킨다."""
+        for junk in ("", "not json", "<html>오류</html>", None, b"\xff\xfe"):
+            self.assertIsNone(booking.hold_request_mismatch(junk, self.CTX),
+                              f"읽을 수 없는 본문을 막았다: {junk!r}")
+
+    def test_missing_fields_are_not_blocked(self):
+        """본문에 그 필드가 없으면 판단 근거가 없다 — 막지 않는다."""
+        import json
+        thin = json.dumps({"coCd": "A420"})
+        self.assertIsNone(booking.hold_request_mismatch(thin, self.CTX))
+
+    def test_bytes_are_read(self):
+        self.assertIsNone(booking.hold_request_mismatch(
+            self.body().encode("utf-8"), self.CTX))
+        self.assertIn("상영일", booking.hold_request_mismatch(
+            self.body(scnYmd="20260909").encode("utf-8"), self.CTX))
+
+    def test_a_context_without_a_showtime_still_checks_the_rest(self):
+        """회차를 모르는 ctx라도 상영일·극장·좌석 수는 확인한다."""
+        ctx = {k: v for k, v in self.CTX.items() if k != "row"}
+        self.assertIsNone(booking.hold_request_mismatch(self.body(), ctx))
+        self.assertIn("상영일", booking.hold_request_mismatch(
+            self.body(scnYmd="20260909"), ctx))
+
+    def test_showtime_ids_reads_the_schedule_row(self):
+        self.assertEqual(booking.showtime_ids({"scnsNo": "018", "scnSseq": "5"}),
+                         ("018", "5"))
+        self.assertEqual(booking.showtime_ids(None), ("", ""))
+        self.assertEqual(booking.showtime_ids({}), ("", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

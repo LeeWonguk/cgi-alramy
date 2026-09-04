@@ -673,6 +673,17 @@ def _date_is_selected(page, wanted: list[str]) -> bool | None:
     return any(text in wanted for text in state["actives"])
 
 
+def showtime_ids(row: dict | None) -> tuple[str, str]:
+    """상영표 한 줄에서 회차를 가리키는 두 값 (scnsNo, scnSseq). 없으면 빈 문자열.
+
+    `seats.seat_map_key`가 쓰는 것과 같은 필드다 — 회차를 가리키는 이름을 한
+    가지로 두어야 요청 검증과 좌석맵 조회가 같은 회차를 말한다.
+    """
+    if not row:
+        return "", ""
+    return str(row.get("scnsNo") or ""), str(row.get("scnSseq") or "")
+
+
 def warm_key(ctx: dict) -> str:
     """예매 화면 탭을 가르는 키 — 영화·극장·날짜가 같으면 같은 화면이다."""
     return "|".join((str(ctx.get("mov_no") or ""), str(ctx.get("site_no") or ""),
@@ -1709,6 +1720,69 @@ def mask_secrets(value):
     return value
 
 
+# 선점 요청 본문에서 "어느 회차인가"를 말하는 필드들. logs/holdspec/*.json으로
+# 실제 요청을 확인해 정했다.
+HOLD_BODY_IDENTITY = (
+    ("scnYmd", "scn_ymd", "상영일"),
+    ("siteNo", "site_no", "극장"),
+)
+
+
+def hold_request_mismatch(post_data, ctx: dict) -> str | None:
+    """나가려는 선점 요청이 우리가 의도한 것과 다른 점. 같으면 None.
+
+    **선점 요청은 자기 자신을 설명한다.** 본문에 상영일·극장·상영관·회차 순번과
+    좌석이 모두 들어 있다(logs/holdspec/*.json). 그래서 CGV에 닿기 전에 우리가
+    의도한 것과 맞는지 확인할 수 있다.
+
+    이 확인이 필요한 이유: 예매 화면을 미리 진행해 두면 그 탭이 정말 그 회차에
+    있는지를 **DOM만으로는 확정할 수 없다**(인원 선택부터 결제까지 주소가
+    `/cnm/selectVisitorCnt`로 고정이다 — README의 '결제하기 두 번' 항목). 화면
+    판정은 "이 탭이 망가졌는가"를 보는 데까지만 쓰고, "맞는 회차인가"는 나가는
+    요청에서 확정한다.
+
+    **읽을 수 없으면 막지 않는다.** 본문 형태가 바뀌었을 때 모든 선점을 세우는
+    편이 더 나쁘다 — 그때는 경고만 남기고 통과시킨다. 막는 것은 **읽었고 또한
+    달랐을 때**뿐이다.
+    """
+    import json as _json
+
+    if isinstance(post_data, (bytes, bytearray)):
+        try:
+            post_data = post_data.decode("utf-8")
+        except Exception:  # noqa: BLE001 - 못 읽으면 판단 근거가 없다
+            return None
+    if isinstance(post_data, str):
+        try:
+            body = _json.loads(post_data)
+        except Exception:  # noqa: BLE001
+            return None
+    else:
+        body = post_data
+    if not isinstance(body, dict):
+        return None
+
+    for field, ctx_key, label in HOLD_BODY_IDENTITY:
+        want = str(ctx.get(ctx_key) or "")
+        got = str(body.get(field) or "")
+        if want and got and want != got:
+            return f"{label}이 다릅니다 (의도 {want}, 요청 {got})"
+
+    scns_no, scn_sseq = showtime_ids(ctx.get("row"))
+    for field, want, label in (("scnsNo", scns_no, "상영관"),
+                               ("scnSseq", scn_sseq, "회차 순번")):
+        got = str(body.get(field) or "")
+        if want and got and want != got:
+            return f"{label}이 다릅니다 (의도 {want}, 요청 {got})"
+
+    seats = body.get("seatPrmpDataList")
+    party = ctx.get("party")
+    if isinstance(seats, list) and party:
+        if len(seats) != int(party):
+            return f"좌석 수가 다릅니다 (의도 {int(party)}석, 요청 {len(seats)}석)"
+    return None
+
+
 def _record_hold_request(captured: dict, ctx: dict) -> None:
     """성공한 선점 요청의 형태를 파일로 남긴다. 실패해도 조용히 넘어간다.
 
@@ -1799,8 +1873,39 @@ def hold_block(session, ctx: dict) -> dict:
         except Exception:  # noqa: BLE001 - 못 읽으면 그냥 안 남긴다
             pass
 
+    def on_route(route):
+        # **마지막 방어선.** 나가는 선점 요청이 우리가 의도한 회차인지 보고, 다르면
+        # CGV에 닿기 전에 끊는다. 화면을 미리 진행해 두면 그 탭이 정말 그 회차인지
+        # DOM만으로는 확정할 수 없어서(주소가 고정이다), 확정을 여기서 한다.
+        try:
+            reason = hold_request_mismatch(route.request.post_data, ctx)
+        except Exception as exc:  # noqa: BLE001 - 검증이 선점을 깨면 안 된다
+            log.debug("선점 요청 검증을 못 했습니다 (%s) — 그대로 보냅니다", exc)
+            reason = None
+        if reason:
+            captured["blocked"] = reason
+            log.error("선점 요청을 막았습니다 — %s. 화면이 의도한 회차가 아닙니다 "
+                      "(의도: %s %s, 좌석 %s)", reason, ctx.get("scn_ymd"),
+                      ctx.get("start_hhmm"), ctx.get("seat_labels"))
+            try:
+                route.abort()
+            except Exception:  # noqa: BLE001 - 이미 지나갔으면 어쩔 수 없다
+                pass
+            return
+        try:
+            route.continue_()
+        except Exception:  # noqa: BLE001 - 흐름을 막지 않는다
+            pass
+
     page.on("response", on_resp)
     page.on("request", on_req)
+    # 이 한 주소만 가로챈다 — 좁게 걸어야 나머지 요청에 값이 붙지 않는다.
+    routed = False
+    try:
+        page.route(f"**/{SEAT_HOLD_URL_MARK}", on_route)
+        routed = True
+    except Exception as exc:  # noqa: BLE001 - 못 걸면 검증 없이 진행한다
+        log.warning("선점 요청 검증을 걸지 못했습니다 (%s) — 검증 없이 갑니다", exc)
 
     try:
         # 영화 → 극장 → 날짜를 주소 하나로 건너뛴다. 그 세 클릭이 자동 예매가 가장
@@ -1900,6 +2005,11 @@ def hold_block(session, ctx: dict) -> dict:
                 page.remove_listener(event, handler)
             except Exception:  # noqa: BLE001
                 pass
+        if routed:
+            try:
+                page.unroute(f"**/{SEAT_HOLD_URL_MARK}", on_route)
+            except Exception:  # noqa: BLE001
+                pass
         # 성공이든 실패든 어디에 시간을 썼는지 남긴다 — "느린 것 같다"는 인상만
         # 가지고는 어느 단계를 고쳐야 할지 알 수 없다.
         log.info("자동 예매 소요 — %s", steps.summary())
@@ -1917,6 +2027,14 @@ def hold_block(session, ctx: dict) -> dict:
                 "결제 계열 요청이 감지돼 중단했습니다 — CGV 예매 내역을 직접 "
                 "확인하세요. 화면 구성이 바뀐 것일 수 있으니 자동 예매를 "
                 "잠시 꺼 두는 편이 안전합니다.", "seat_labels": chosen}
+
+    # 관문이 요청을 끊었다면 선점은 일어나지 않았다. 화면이 의도한 회차가 아니라는
+    # 뜻이므로 사람이 봐야 한다 — 조용히 "선점 실패"로 뭉개지 않는다.
+    if captured.get("blocked"):
+        shot = _save_screenshot(page, ctx)
+        return {"ok": False, "seat_labels": chosen, "error":
+                f"의도한 회차가 아니어서 선점을 막았습니다 — {captured['blocked']}"
+                + (f" (화면: {shot})" if shot else "")}
 
     body = captured.get("body") or {}
     data = (body.get("data") or {}) if isinstance(body, dict) else {}
