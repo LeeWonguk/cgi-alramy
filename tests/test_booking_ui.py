@@ -56,6 +56,14 @@ class FakeNode:
             return self.cls
         return self.attrs.get(name)
 
+    def wait_for(self, state=None, timeout=None):
+        """Playwright Locator.wait_for. 이미 그 상태면 성공, 아니면 예외."""
+        if state == "hidden" and self.visible:
+            raise RuntimeError("아직 보인다")
+        if state == "visible" and not self.visible:
+            raise RuntimeError("아직 안 보인다")
+        return None
+
     def click(self, timeout=None):
         self.clicks += 1
         root = self
@@ -101,6 +109,19 @@ class FakeLocator:
 
     def count(self):
         return len(self.nodes)
+
+    def filter(self, visible=None):
+        """Playwright Locator.filter(visible=...). 판정을 브라우저 안에서 한다."""
+        if visible is None:
+            return FakeLocator(self.nodes)
+        return FakeLocator([n for n in self.nodes if n.is_visible() == visible])
+
+    def wait_for(self, state=None, timeout=None):
+        if not self.nodes:
+            if state == "hidden":
+                return None
+            raise RuntimeError("일치하는 요소가 없습니다")
+        return self.nodes[0].wait_for(state=state, timeout=timeout)
 
     @property
     def first(self):
@@ -158,7 +179,14 @@ class FakePage(FakeNode):
 
     def wait_for_selector(self, selector, timeout=None, state=None):
         found = _select(self.descendants(), selector)
-        if not [n for n in found if n.is_visible()]:
+        visible = [n for n in found if n.is_visible()]
+        if state == "hidden":
+            # Playwright의 hidden = 없거나 안 보이거나. 보이는 게 남아 있는
+            # 동안만 기다리다 시한이 지나면 예외다.
+            if visible:
+                raise RuntimeError(f"아직 보인다: {selector}")
+            return None
+        if not visible:
             raise RuntimeError(f"나타나지 않음: {selector}")
         return found[0]
 
@@ -2032,6 +2060,297 @@ class TestTheTabWithThePaymentWindowIsKept(unittest.TestCase):
                 raise RuntimeError("세션이 죽었다")
 
         booking._keep_paying_page(Bad(), self.CTX, None)
+
+
+class TestHoldRequestGuard(unittest.TestCase):
+    """나가는 선점 요청을 의도와 맞춰 보는 관문 (booking.hold_request_mismatch).
+
+    본문은 `logs/holdspec/20260904-144228_hold.json`에서 실제로 관측된 것이다.
+    선점 요청은 **자기 자신을 설명한다** — 상영일·극장·상영관·회차 순번·좌석이
+    모두 들어 있어서, CGV에 닿기 전에 우리가 의도한 것과 맞는지 확정할 수 있다.
+
+    이 관문이 필요한 이유: 인원 선택부터 결제까지 주소가 `/cnm/selectVisitorCnt`로
+    고정이라(README '결제하기 두 번'), 화면이 정말 그 회차인지 DOM만으로는
+    확정할 수 없다. 잘못된 회차를 선점하는 건 되돌리기 어렵고 돈이 걸린다.
+    """
+
+    BODY = {
+        "coCd": "A420", "bymd": "", "mbltNo": "", "siteNo": "0013",
+        "scnYmd": "20260908", "scnsNo": "012", "scnSseq": "1",
+        "movAtktNo": "", "custNo": "123456789", "cusgdCd": "01",
+        "nmbrCrtfNo": "", "sachlCd": "10", "atktChnlCd": "01",
+        "sachlTypCd": "01", "rtctlScopCd": "08",
+        "seatPrmpDataList": [
+            {"seatRowNm": "E", "seatNo": "7", "seatLocNo": "00200100190011",
+             "sbordNo": "002", "seatAreaNo": "001", "szoneNo": "01001"},
+            {"seatRowNm": "E", "seatNo": "8", "seatLocNo": "00200100210011",
+             "sbordNo": "002", "seatAreaNo": "001", "szoneNo": "01001"},
+        ],
+    }
+    CTX = {"scn_ymd": "20260908", "site_no": "0013", "party": 2,
+           "row": {"scnsNo": "012", "scnSseq": "1"}, "start_hhmm": "09:00"}
+
+    def body(self, **over):
+        import json
+        return json.dumps({**self.BODY, **over})
+
+    def test_the_real_request_passes(self):
+        self.assertIsNone(
+            booking.hold_request_mismatch(self.body(), self.CTX))
+
+    def test_a_different_date_is_caught(self):
+        reason = booking.hold_request_mismatch(
+            self.body(scnYmd="20260909"), self.CTX)
+        self.assertIn("상영일", reason)
+        self.assertIn("20260909", reason)
+
+    def test_a_different_theater_is_caught(self):
+        self.assertIn("극장", booking.hold_request_mismatch(
+            self.body(siteNo="0001"), self.CTX))
+
+    def test_a_different_screen_is_caught(self):
+        """같은 시각에 상영관이 여럿일 수 있다 — 시각만으로는 못 가린다."""
+        self.assertIn("상영관", booking.hold_request_mismatch(
+            self.body(scnsNo="018"), self.CTX))
+
+    def test_a_different_showtime_sequence_is_caught(self):
+        self.assertIn("회차 순번", booking.hold_request_mismatch(
+            self.body(scnSseq="5"), self.CTX))
+
+    def test_the_wrong_number_of_seats_is_caught(self):
+        """2명으로 걸어 둔 감시가 3석을 잡으려 하면 막는다."""
+        three = self.BODY["seatPrmpDataList"] + [
+            {"seatRowNm": "E", "seatNo": "9", "seatLocNo": "x",
+             "sbordNo": "002", "seatAreaNo": "001", "szoneNo": "01001"}]
+        self.assertIn("좌석 수", booking.hold_request_mismatch(
+            self.body(seatPrmpDataList=three), self.CTX))
+
+    def test_an_unreadable_body_is_not_blocked(self):
+        """형태가 바뀌었을 때 모든 선점을 세우는 편이 더 나쁘다 — 통과시킨다."""
+        for junk in ("", "not json", "<html>오류</html>", None, b"\xff\xfe"):
+            self.assertIsNone(booking.hold_request_mismatch(junk, self.CTX),
+                              f"읽을 수 없는 본문을 막았다: {junk!r}")
+
+    def test_missing_fields_are_not_blocked(self):
+        """본문에 그 필드가 없으면 판단 근거가 없다 — 막지 않는다."""
+        import json
+        thin = json.dumps({"coCd": "A420"})
+        self.assertIsNone(booking.hold_request_mismatch(thin, self.CTX))
+
+    def test_bytes_are_read(self):
+        self.assertIsNone(booking.hold_request_mismatch(
+            self.body().encode("utf-8"), self.CTX))
+        self.assertIn("상영일", booking.hold_request_mismatch(
+            self.body(scnYmd="20260909").encode("utf-8"), self.CTX))
+
+    def test_a_context_without_a_showtime_still_checks_the_rest(self):
+        """회차를 모르는 ctx라도 상영일·극장·좌석 수는 확인한다."""
+        ctx = {k: v for k, v in self.CTX.items() if k != "row"}
+        self.assertIsNone(booking.hold_request_mismatch(self.body(), ctx))
+        self.assertIn("상영일", booking.hold_request_mismatch(
+            self.body(scnYmd="20260909"), ctx))
+
+    def test_showtime_ids_reads_the_schedule_row(self):
+        self.assertEqual(booking.showtime_ids({"scnsNo": "018", "scnSseq": "5"}),
+                         ("018", "5"))
+        self.assertEqual(booking.showtime_ids(None), ("", ""))
+        self.assertEqual(booking.showtime_ids({}), ("", ""))
+
+
+class TestWaitsAreDelegatedToTheBrowser(unittest.TestCase):
+    """직접 폴링하던 대기들을 브라우저 판정으로 옮긴 부분.
+
+    100ms마다 왕복하며 직접 보면 (1) 조건이 만족된 것을 최대 100ms 늦게 알고
+    (2) 그동안 왕복이 계속 쌓인다. Playwright가 같은 판정을 브라우저 안에서
+    하면 조건이 서는 순간 돌아온다. **상한은 그대로 둔다** — 상한은 쓰는
+    시간이 아니라 최대 기다림이다.
+    """
+
+    def veil_page(self, *, visible):
+        veil = FakeNode(tag="div", cls="loading_page", visible=visible)
+        return FakePage(children=[veil])
+
+    def test_a_lifted_veil_costs_no_sleep(self):
+        page = self.veil_page(visible=False)
+        self.assertTrue(booking._wait_for_loading(page))
+        self.assertEqual(page.waits, 0, "가림막이 이미 걷혔는데 잤다")
+
+    def test_a_veil_that_never_lifts_does_not_raise(self):
+        """걷히지 않아도 멈추지 않는다 — 호출자는 그대로 진행한다."""
+        page = self.veil_page(visible=True)
+        self.assertFalse(booking._wait_for_loading(page))
+        self.assertEqual(page.waits, 0)
+
+    def test_no_veil_at_all_is_fine(self):
+        self.assertTrue(booking._wait_for_loading(FakePage()))
+
+    def test_the_hold_response_is_watched_closely(self):
+        """응답을 늦게 알아채는 만큼 그대로 선점이 늦는다."""
+        self.assertLessEqual(booking.HOLD_RESPONSE_POLL_MS, 25)
+        self.assertGreater(booking.HOLD_RESPONSE_POLL_MS, 0)
+
+
+class TestSeatmapReadyCostsOneRoundTrip(unittest.TestCase):
+    """좌석맵이 열렸는지 보는 판정 (booking._seatmap_ready)."""
+
+    def seat(self, cls, visible):
+        return FakeNode(tag="div", cls=cls, visible=visible)
+
+    def test_a_visible_seat_means_the_map_is_open(self):
+        page = FakePage(children=[self.seat("seatMap_seatNumber_abc", True)])
+        self.assertTrue(booking._seatmap_ready(page))
+
+    def test_seats_in_the_dom_but_hidden_do_not_count(self):
+        """좌석 요소는 모달이 닫혀 있을 때도 DOM에 들어 있다."""
+        page = FakePage(children=[self.seat("seatMap_seatNumber_abc", False)])
+        self.assertFalse(booking._seatmap_ready(page))
+
+    def test_the_minimap_is_never_mistaken_for_the_seat_map(self):
+        """'seatMainMap_'에는 'seatMap_'이 들어 있지 않다 — 이 착각이 12.3초를 태웠다."""
+        page = FakePage(children=[self.seat("seatMainMap_seatNumber_x", True)])
+        self.assertFalse(booking._seatmap_ready(page))
+
+    def test_a_seat_visible_in_the_middle_counts(self):
+        """예전에는 양끝만 물어봐서 가운데만 보이는 경우를 놓쳤다."""
+        page = FakePage(children=[
+            self.seat("seatMap_seatNumber_1", False),
+            self.seat("seatMap_seatNumber_2", True),
+            self.seat("seatMap_seatNumber_3", False)])
+        self.assertTrue(booking._seatmap_ready(page))
+
+    def test_an_empty_page_is_not_ready(self):
+        self.assertFalse(booking._seatmap_ready(FakePage()))
+
+
+class TestSeatNoticePayloadIsBounded(unittest.TestCase):
+    """좌석 안내를 읽을 때 좌석맵 전문을 실어 오지 않는다 (booking.seat_notice).
+
+    좌석맵 자체가 `[role=dialog]`라, 자르지 않으면 좌석 라벨 수백 개가 좌석
+    하나 누를 때마다 CDP로 건너온다. 파이썬 쪽 판정이 200자를 넘으면 버리므로
+    브라우저에서 201자로 잘라도 결과가 같다.
+    """
+
+    class Page:
+        def __init__(self, texts):
+            self.texts = texts
+            self.asked = 0
+
+        def evaluate(self, script, arg=None):
+            self.asked += 1
+            # 실제 스크립트가 하는 일을 그대로 흉내낸다: 공백 정리 + 201자 자르기.
+            assert ".slice(0, 201)" in script, "브라우저에서 자르지 않는다"
+            return [" ".join(x.split())[:201] for x in self.texts]
+
+    def test_a_notice_is_returned(self):
+        page = self.Page(["선택하신 패밀리 리클라이너는 4인 단위로 인원을 선택해주세요"])
+        self.assertIn("리클라이너", booking.seat_notice(page))
+
+    def test_the_seat_map_itself_is_still_not_a_notice(self):
+        page = self.Page([" ".join(f"A{i}" for i in range(1, 400))])
+        self.assertEqual(booking.seat_notice(page), "")
+
+    def test_a_body_cut_at_201_is_still_rejected(self):
+        """201자로 잘려 와도 200자 상한에 걸려 안내가 아니라고 판정한다."""
+        page = self.Page(["가" * 5000])
+        self.assertEqual(booking.seat_notice(page), "")
+
+    def test_an_unreadable_page_means_no_notice(self):
+        class Bad:
+            def evaluate(self, script, arg=None):
+                raise RuntimeError("죽음")
+
+        self.assertEqual(booking.seat_notice(Bad()), "")
+
+
+class TestModalCloseWaitsForTheModalNotTheClock(unittest.TestCase):
+    """팝업을 닫은 뒤 고정 400ms를 자던 것을 조건 대기로 바꾼 부분.
+
+    그 400ms는 "조금 자자"가 아니라 **팝업이 실제로 사라지기를** 기다리는
+    것이었다(bf71721에서 600ms를 여기까지 줄였다). 조건을 직접 기다리면 보통
+    훨씬 빨리 돌아오고, 최악이어도 상한이 같아서 느려질 수가 없다.
+    """
+
+    class Btn:
+        def __init__(self, vanishes=True):
+            self.vanishes = vanishes
+            self.visible = True
+            self.clicks = 0
+            self.waited = None
+
+        def is_visible(self):
+            return self.visible
+
+        def click(self, timeout=None):
+            self.clicks += 1
+            if self.vanishes:
+                self.visible = False
+
+        def wait_for(self, state=None, timeout=None):
+            self.waited = (state, timeout)
+            if state == "hidden" and self.visible:
+                raise RuntimeError("아직 보인다")
+
+    class Loc:
+        def __init__(self, nodes):
+            self.nodes = nodes
+
+        def all(self):
+            return list(self.nodes)
+
+    class Modal:
+        def __init__(self, text, btn):
+            self.text = text
+            self.btn = btn
+
+        def is_visible(self):
+            return True
+
+        def text_content(self):
+            return self.text
+
+        def locator(self, selector):
+            hit = [self.btn] if ("닫기" in selector and self.btn.is_visible()) else []
+            return TestModalCloseWaitsForTheModalNotTheClock.Loc(hit)
+
+    class Page:
+        def __init__(self, modals):
+            self.modals = modals
+            self.waits = 0
+
+        def locator(self, selector):
+            return TestModalCloseWaitsForTheModalNotTheClock.Loc(self.modals)
+
+        def wait_for_timeout(self, ms):
+            self.waits += 1
+
+    def test_a_popup_that_vanishes_costs_no_fixed_sleep(self):
+        btn = self.Btn(vanishes=True)
+        page = self.Page([self.Modal("이벤트 안내입니다", btn)])
+        self.assertEqual(booking.dismiss_modals(page), 1)
+        self.assertEqual(btn.clicks, 1)
+        self.assertEqual(page.waits, 0, "고정 대기가 남아 있다")
+        self.assertEqual(btn.waited, ("hidden", booking.MODAL_CLOSE_MS))
+
+    def test_a_stubborn_popup_is_bounded_by_the_old_ceiling(self):
+        """안 사라져도 상한은 예전과 같고, 바퀴 수도 예전과 같다.
+
+        닫기를 눌렀는데도 남아 있는 팝업은 바퀴마다 다시 눌린다(rounds=3) —
+        이 변경 전과 같은 동작이다. 바뀐 것은 각 바퀴에서 고정 400ms를 자는
+        대신 사라지기를 기다린다는 점뿐이다.
+        """
+        btn = self.Btn(vanishes=False)
+        page = self.Page([self.Modal("이벤트 안내입니다", btn)])
+        self.assertEqual(booking.dismiss_modals(page), 3)
+        self.assertEqual(btn.clicks, 3)
+        self.assertEqual(btn.waited[1], booking.MODAL_CLOSE_MS)
+        self.assertEqual(page.waits, 0, "고정 대기가 남아 있다")
+
+    def test_our_own_screen_is_never_closed(self):
+        """좌석맵·결제 바텀시트는 통과해야 할 화면이다 — 닫으면 버튼이 사라진다."""
+        btn = self.Btn()
+        page = self.Page([self.Modal("결제하기", btn)])
+        self.assertEqual(booking.dismiss_modals(page), 0)
+        self.assertEqual(btn.clicks, 0)
 
 
 if __name__ == "__main__":

@@ -190,6 +190,9 @@ DATE_SELECT_MS = 2500
 SEATMAP_READY_MS = 5000      # 좌석맵 모달이 열려 좌석이 눌릴 수 있게 될 때까지
 PAY_BUTTON_READY_MS = 6000   # 좌석 선택완료 → '결제하기'가 뜰 때까지
 HOLD_RESPONSE_MS = 12000     # '결제하기' → seatTempPrmp 응답이 올 때까지
+# 그 응답을 얼마나 촘촘히 보는지. 술어가 공짜라 촘촘해도 비용은 드라이버 핑뿐이고,
+# 이 값이 곧 "응답이 왔는데 아직 모르고 있는" 평균 시간의 두 배다.
+HOLD_RESPONSE_POLL_MS = 25
 
 # 결제창이 뜬 탭을 얼마나 지켜 줄지 (_keep_paying_page).
 #
@@ -224,6 +227,10 @@ LOADING_WAIT_MS = 6000
 # '확인'을 먼저 본다 — 안내 팝업은 대개 그 버튼 하나로 닫히고, 그게 사람이
 # 누르는 것과 같은 길이다. 아이콘만 있는 팝업은 btn-close로 닫는다.
 MODAL_SELECTOR = '.cgv-modal.active, [role="dialog"][aria-modal="true"]'
+# 닫기를 누른 팝업이 사라지기를 기다리는 **상한**. 쓰는 시간이 아니다 —
+# 보통은 그 전에 사라져 바로 돌아온다.
+MODAL_CLOSE_MS = 400
+
 MODAL_CLOSE_SELECTORS = (
     'button:has-text("확인")',
     'button:has-text("닫기")',
@@ -673,6 +680,17 @@ def _date_is_selected(page, wanted: list[str]) -> bool | None:
     return any(text in wanted for text in state["actives"])
 
 
+def showtime_ids(row: dict | None) -> tuple[str, str]:
+    """상영표 한 줄에서 회차를 가리키는 두 값 (scnsNo, scnSseq). 없으면 빈 문자열.
+
+    `seats.seat_map_key`가 쓰는 것과 같은 필드다 — 회차를 가리키는 이름을 한
+    가지로 두어야 요청 검증과 좌석맵 조회가 같은 회차를 말한다.
+    """
+    if not row:
+        return "", ""
+    return str(row.get("scnsNo") or ""), str(row.get("scnSseq") or "")
+
+
 def warm_key(ctx: dict) -> str:
     """예매 화면 탭을 가르는 키 — 영화·극장·날짜가 같으면 같은 화면이다."""
     return "|".join((str(ctx.get("mov_no") or ""), str(ctx.get("site_no") or ""),
@@ -1006,11 +1024,16 @@ def seat_notice(page) -> str:
         texts = page.evaluate("""() => [...document.querySelectorAll(
               '.cgv-modal, [role="dialog"]')]
             .filter(d => d.offsetWidth || d.offsetHeight)
-            .map(d => (d.innerText || '').replace(/\\s+/g, ' ').trim())""")
+            .map(d => (d.innerText || '').replace(/\\s+/g, ' ').trim()
+                       .slice(0, 201))""")
     except Exception:  # noqa: BLE001 - 못 읽으면 안내가 없는 것으로 본다
         return ""
     for text in texts or []:
         # 좌석맵 자체가 큰 모달로 떠 있다 — 좌석 라벨이 잔뜩 든 건 안내가 아니다.
+        #
+        # 그 긴 문구는 **브라우저에서 201자로 자른다**(위 slice). 여기서 200자를
+        # 넘으면 버리므로 201자만 있어도 판정이 같고, 좌석맵 모달의 라벨 수백 개를
+        # CDP로 실어 오지 않는다 — 좌석 하나 누를 때마다 그걸 했다.
         if 8 <= len(text) <= 200 and "닫기" not in text[:6]:
             return text
     return ""
@@ -1505,7 +1528,14 @@ def dismiss_modals(page, rounds: int = 3) -> int:
                     continue
                 closed += 1
                 hit = True
-                page.wait_for_timeout(400)
+                # 이 400ms는 "조금 자자"가 아니라 **팝업이 실제로 사라지기를**
+                # 기다리는 것이었다(bf71721에서 600ms를 여기까지 줄였다). 조건을
+                # 직접 기다리면 보통 그보다 훨씬 빨리 돌아오고, 최악이어도 예전과
+                # 같은 상한이다 — 느려질 수가 없다.
+                try:
+                    buttons[0].wait_for(state="hidden", timeout=MODAL_CLOSE_MS)
+                except Exception:  # noqa: BLE001 - 안 사라져도 다음 바퀴가 본다
+                    pass
                 break
             if hit:
                 break
@@ -1603,12 +1633,22 @@ class _Steps:
 
 
 def _wait_for_loading(page, timeout_ms: int = LOADING_WAIT_MS) -> bool:
-    """화면을 덮은 로딩 가림막이 걷힐 때까지 기다린다. 걷혔으면 True."""
-    def gone() -> bool:
-        nodes = page.locator(LOADING_SELECTOR)
-        return nodes.count() == 0 or not nodes.first.is_visible()
+    """화면을 덮은 로딩 가림막이 걷힐 때까지 기다린다. 걷혔으면 True.
 
-    return _wait_until(page, gone, timeout_ms)
+    **판정을 브라우저에 맡긴다.** 예전에는 100ms마다 count()·is_visible()로
+    왕복하며 직접 폴링했는데, 그러면 가림막이 걷힌 것을 최대 100ms 늦게 알고
+    그동안 왕복도 계속 쌓인다. Playwright의 `state="hidden"`이 같은 것을
+    (없거나·크기가 0이거나·visibility:hidden) 브라우저 안에서 판정하며, 걷히는
+    순간 돌아온다 — 왕복 1회다.
+
+    상한(timeout_ms)은 그대로다. 이건 쓰는 시간이 아니라 최대 기다림이다.
+    """
+    try:
+        page.wait_for_selector(LOADING_SELECTOR, state="hidden",
+                               timeout=timeout_ms)
+        return True
+    except Exception:  # noqa: BLE001 - 안 걷혀도 멈추지 않는다(호출자가 진행한다)
+        return False
 
 
 def _blocked_by_modal(exc: Exception) -> bool:
@@ -1646,18 +1686,17 @@ def _seatmap_ready(page) -> bool:
     개수만 세면 안 된다 — 좌석 요소는 모달이 닫혀 있을 때도 DOM에 들어 있다.
     실제로 보이는지까지 봐야 '열렸다'는 뜻이 된다.
     """
-    nodes = page.locator(SEAT_MAP_SELECTOR)
-    if nodes.count() == 0:
-        return False
     # 좌석맵은 반응형으로 두 벌이 렌더된다(그래서 좌석 클릭도 `.last`를 쓴다).
-    # 어느 쪽이 보이는지 모르므로 양끝을 본다 — 전부 훑으면 수백 번 왕복이다.
-    for node in (nodes.last, nodes.first):
-        try:
-            if node.is_visible():
-                return True
-        except Exception:  # noqa: BLE001 - 갈아 끼우는 중이면 다음 바퀴에
-            continue
-    return False
+    # 어느 쪽이 보이는지 모르므로 예전에는 양끝을 따로 물어봤다 — 왕복 3회다.
+    # filter(visible=True)는 그 판정을 브라우저 안에서 하므로 왕복 1회로 끝나고,
+    # 양끝이 아닌 가운데만 보이는 경우까지 맞게 센다.
+    #
+    # **셀렉터는 그대로다.** seatMap_seatNumber이지 seatMainMap_이 아니다 —
+    # 그 착각이 한 번 12.3초의 타임아웃을 만들었다(위 SEAT_MAP_SELECTOR 주석).
+    try:
+        return page.locator(SEAT_MAP_SELECTOR).filter(visible=True).count() > 0
+    except Exception:  # noqa: BLE001 - 갈아 끼우는 중이면 다음 바퀴에
+        return False
 
 
 def _visible_pay_buttons(page) -> list:
@@ -1707,6 +1746,69 @@ def mask_secrets(value):
     if isinstance(value, list):
         return [mask_secrets(v) for v in value]
     return value
+
+
+# 선점 요청 본문에서 "어느 회차인가"를 말하는 필드들. logs/holdspec/*.json으로
+# 실제 요청을 확인해 정했다.
+HOLD_BODY_IDENTITY = (
+    ("scnYmd", "scn_ymd", "상영일"),
+    ("siteNo", "site_no", "극장"),
+)
+
+
+def hold_request_mismatch(post_data, ctx: dict) -> str | None:
+    """나가려는 선점 요청이 우리가 의도한 것과 다른 점. 같으면 None.
+
+    **선점 요청은 자기 자신을 설명한다.** 본문에 상영일·극장·상영관·회차 순번과
+    좌석이 모두 들어 있다(logs/holdspec/*.json). 그래서 CGV에 닿기 전에 우리가
+    의도한 것과 맞는지 확인할 수 있다.
+
+    이 확인이 필요한 이유: 예매 화면을 미리 진행해 두면 그 탭이 정말 그 회차에
+    있는지를 **DOM만으로는 확정할 수 없다**(인원 선택부터 결제까지 주소가
+    `/cnm/selectVisitorCnt`로 고정이다 — README의 '결제하기 두 번' 항목). 화면
+    판정은 "이 탭이 망가졌는가"를 보는 데까지만 쓰고, "맞는 회차인가"는 나가는
+    요청에서 확정한다.
+
+    **읽을 수 없으면 막지 않는다.** 본문 형태가 바뀌었을 때 모든 선점을 세우는
+    편이 더 나쁘다 — 그때는 경고만 남기고 통과시킨다. 막는 것은 **읽었고 또한
+    달랐을 때**뿐이다.
+    """
+    import json as _json
+
+    if isinstance(post_data, (bytes, bytearray)):
+        try:
+            post_data = post_data.decode("utf-8")
+        except Exception:  # noqa: BLE001 - 못 읽으면 판단 근거가 없다
+            return None
+    if isinstance(post_data, str):
+        try:
+            body = _json.loads(post_data)
+        except Exception:  # noqa: BLE001
+            return None
+    else:
+        body = post_data
+    if not isinstance(body, dict):
+        return None
+
+    for field, ctx_key, label in HOLD_BODY_IDENTITY:
+        want = str(ctx.get(ctx_key) or "")
+        got = str(body.get(field) or "")
+        if want and got and want != got:
+            return f"{label}이 다릅니다 (의도 {want}, 요청 {got})"
+
+    scns_no, scn_sseq = showtime_ids(ctx.get("row"))
+    for field, want, label in (("scnsNo", scns_no, "상영관"),
+                               ("scnSseq", scn_sseq, "회차 순번")):
+        got = str(body.get(field) or "")
+        if want and got and want != got:
+            return f"{label}이 다릅니다 (의도 {want}, 요청 {got})"
+
+    seats = body.get("seatPrmpDataList")
+    party = ctx.get("party")
+    if isinstance(seats, list) and party:
+        if len(seats) != int(party):
+            return f"좌석 수가 다릅니다 (의도 {int(party)}석, 요청 {len(seats)}석)"
+    return None
 
 
 def _record_hold_request(captured: dict, ctx: dict) -> None:
@@ -1799,8 +1901,39 @@ def hold_block(session, ctx: dict) -> dict:
         except Exception:  # noqa: BLE001 - 못 읽으면 그냥 안 남긴다
             pass
 
+    def on_route(route):
+        # **마지막 방어선.** 나가는 선점 요청이 우리가 의도한 회차인지 보고, 다르면
+        # CGV에 닿기 전에 끊는다. 화면을 미리 진행해 두면 그 탭이 정말 그 회차인지
+        # DOM만으로는 확정할 수 없어서(주소가 고정이다), 확정을 여기서 한다.
+        try:
+            reason = hold_request_mismatch(route.request.post_data, ctx)
+        except Exception as exc:  # noqa: BLE001 - 검증이 선점을 깨면 안 된다
+            log.debug("선점 요청 검증을 못 했습니다 (%s) — 그대로 보냅니다", exc)
+            reason = None
+        if reason:
+            captured["blocked"] = reason
+            log.error("선점 요청을 막았습니다 — %s. 화면이 의도한 회차가 아닙니다 "
+                      "(의도: %s %s, 좌석 %s)", reason, ctx.get("scn_ymd"),
+                      ctx.get("start_hhmm"), ctx.get("seat_labels"))
+            try:
+                route.abort()
+            except Exception:  # noqa: BLE001 - 이미 지나갔으면 어쩔 수 없다
+                pass
+            return
+        try:
+            route.continue_()
+        except Exception:  # noqa: BLE001 - 흐름을 막지 않는다
+            pass
+
     page.on("response", on_resp)
     page.on("request", on_req)
+    # 이 한 주소만 가로챈다 — 좁게 걸어야 나머지 요청에 값이 붙지 않는다.
+    routed = False
+    try:
+        page.route(f"**/{SEAT_HOLD_URL_MARK}", on_route)
+        routed = True
+    except Exception as exc:  # noqa: BLE001 - 못 걸면 검증 없이 진행한다
+        log.warning("선점 요청 검증을 걸지 못했습니다 (%s) — 검증 없이 갑니다", exc)
 
     try:
         # 영화 → 극장 → 날짜를 주소 하나로 건너뛴다. 그 세 클릭이 자동 예매가 가장
@@ -1876,7 +2009,14 @@ def hold_block(session, ctx: dict) -> dict:
                               what="결제하기", timeout=5000)
         # 선점 응답이 오면 바로 나간다. 예전에는 무조건 5초를 잤는데, 응답은 보통
         # 1초 안쪽에 오고 그 차이가 다음 회차를 잡을 수 있느냐를 가른다.
-        if not _wait_until(page, lambda: "body" in captured, HOLD_RESPONSE_MS):
+        # 술어는 순수 파이썬(dict 조회)이고, 자는 이유는 **동기 API의 이벤트
+        # 디스패처를 돌려 on_resp가 실행되게** 하는 것뿐이다. 그래서 촘촘히 볼수록
+        # 응답을 빨리 알아챈다 — 100ms면 평균 50ms를 늦게 안다.
+        #
+        # `time.sleep`으로 바꾸면 안 된다. 디스패처가 안 돌아 captured가 영원히
+        # 안 채워진다.
+        if not _wait_until(page, lambda: "body" in captured, HOLD_RESPONSE_MS,
+                           poll_ms=HOLD_RESPONSE_POLL_MS):
             log.warning("선점 응답을 %d초 안에 받지 못했습니다",
                         HOLD_RESPONSE_MS // 1000)
         steps.mark("선점")
@@ -1900,6 +2040,11 @@ def hold_block(session, ctx: dict) -> dict:
                 page.remove_listener(event, handler)
             except Exception:  # noqa: BLE001
                 pass
+        if routed:
+            try:
+                page.unroute(f"**/{SEAT_HOLD_URL_MARK}", on_route)
+            except Exception:  # noqa: BLE001
+                pass
         # 성공이든 실패든 어디에 시간을 썼는지 남긴다 — "느린 것 같다"는 인상만
         # 가지고는 어느 단계를 고쳐야 할지 알 수 없다.
         log.info("자동 예매 소요 — %s", steps.summary())
@@ -1917,6 +2062,14 @@ def hold_block(session, ctx: dict) -> dict:
                 "결제 계열 요청이 감지돼 중단했습니다 — CGV 예매 내역을 직접 "
                 "확인하세요. 화면 구성이 바뀐 것일 수 있으니 자동 예매를 "
                 "잠시 꺼 두는 편이 안전합니다.", "seat_labels": chosen}
+
+    # 관문이 요청을 끊었다면 선점은 일어나지 않았다. 화면이 의도한 회차가 아니라는
+    # 뜻이므로 사람이 봐야 한다 — 조용히 "선점 실패"로 뭉개지 않는다.
+    if captured.get("blocked"):
+        shot = _save_screenshot(page, ctx)
+        return {"ok": False, "seat_labels": chosen, "error":
+                f"의도한 회차가 아니어서 선점을 막았습니다 — {captured['blocked']}"
+                + (f" (화면: {shot})" if shot else "")}
 
     body = captured.get("body") or {}
     data = (body.get("data") or {}) if isinstance(body, dict) else {}
