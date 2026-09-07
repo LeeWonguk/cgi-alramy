@@ -683,6 +683,60 @@ def _schedule(session, key, *, cost=None, sched_cache=None):
     return rows
 
 
+def schedule_keys(catalog, group) -> list[tuple]:
+    """이 소유자가 이번 바퀴에 볼 상영표 키들 — (극장, 영화, 날짜). 중복은 뺀다.
+
+    같은 (영화·극장·날짜)를 여러 감시가 보는 일이 흔하다(열만 다르게 걸어 둔
+    경우). 상영표 1건이 그 날짜의 모든 회차를 덮으므로 키 하나면 된다.
+    """
+    keys, seen = [], set()
+    for w in group:
+        movie, _ = catalog.resolve_movie(w["movie_query"])
+        site, _ = catalog.resolve_site(w["site_query"])
+        if movie is None or site is None:
+            continue
+        key = (site["siteNo"], movie["movNo"], w["scn_ymd"])
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return keys
+
+
+def warm_schedules(session, catalog, group, *, cost=None,
+                   sched_cache: dict | None = None) -> int:
+    """이번 바퀴의 상영표를 **한꺼번에** 받아 캐시에 채운다. 받은 건수를 돌려준다.
+
+    **왜 묶는가.** 지금까지는 날짜마다 하나씩 받았다. 왕복을 줄줄이 기다리는
+    셈이라 실측으로 6건에 760ms였는데, 브라우저 안에서 Promise.all로 묶으면
+    136ms다(5.6배). 좌석맵이 이미 쓰는 기법을 상영표에도 쓰는 것이다.
+
+    **요청 수는 그대로다.** 같은 건수를 겹쳐 보낼 뿐이라 CGV 쪽 부담은 달라지지
+    않는다 — 줄어드는 건 우리 사이클의 길이고, 그게 곧 감지 지연이다.
+
+    실패한 것은 캐시에 넣지 않는다. 그러면 `_schedule`이 개별로 다시 받으면서
+    지금까지의 실패 처리(사유 기록·401 복구)를 그대로 지난다.
+    """
+    import watch
+
+    if sched_cache is None:
+        return 0
+    keys = [k for k in schedule_keys(catalog, group) if k not in sched_cache]
+    # 한 건이면 묶을 이유가 없다 — 같은 왕복 한 번이다.
+    if len(keys) < 2:
+        return 0
+    paths = [watch.EP_SCHEDULE.format(site_no=k[0], mov_no=k[1], ymd=k[2])
+             for k in keys]
+    with cost.call("상영표(묶음)") if cost else contextlib.nullcontext():
+        results = session.get_json_many(paths)
+    got = 0
+    for key, payload in zip(keys, results):
+        if payload is None:
+            continue            # 개별 경로가 다시 받는다
+        sched_cache[key] = payload.get("data") or []
+        got += 1
+    return got
+
+
 def _prefetch_seat_maps(session, catalog, group, *, cost=None,
                         sched_cache=None, unchanged: set | None = None) -> dict:
     """이 소유자가 볼 좌석맵을 큐에 쌓고, **예산만큼만** 받아 온다.
@@ -704,6 +758,16 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
     queue: dict = _pending.setdefault(owner, {})
     if unchanged is None:
         unchanged = set()
+
+    # 아래 루프가 날짜마다 `_schedule`을 부르는데, 그걸 하나씩 받으면 왕복이
+    # 줄줄이 쌓인다. 먼저 한꺼번에 받아 캐시에 채워 두면 그 호출들이 캐시에
+    # 맞는다 — 실측 760ms → 136ms.
+    try:
+        warm_schedules(session, catalog, group, cost=cost,
+                       sched_cache=sched_cache)
+    except Exception as exc:  # noqa: BLE001 - 묶어 받기는 부가 기능이다
+        import watch as _w
+        _w.log.debug("상영표를 묶어 받지 못했습니다 (%s) — 하나씩 받습니다", exc)
 
     # 1) 이번 바퀴에 볼 것을 큐에 올린다. 이미 있으면 그대로 둔다 — 먼저 들어온
     #    것이 더 오래 기다렸다는 뜻이라 순서를 흔들 이유가 없다.
@@ -733,6 +797,8 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
             # 회차의 좌석 배치는 바뀌지 않았으므로 좌석맵을 열 이유가 없다.
             count = _seat_count(row)
             moved = False
+            # 잔여 좌석 수를 못 읽었으면 다시 받아야 한다 — 판단 근거가 없다.
+            stale = True
             if count is not None:
                 before = _last_count.get(key)
                 _last_count[key] = count
@@ -750,8 +816,19 @@ def _prefetch_seat_maps(session, catalog, group, *, cost=None,
             # 막으려고 있는 것인데, 잔여 좌석 수가 변한 회차는 알아낼 게 있다는 뜻
             # 그 자체다. 여기서 걸러 내면 _last_count는 이미 새 값으로 갱신된 뒤라
             # 다음 바퀴엔 '변화 없음'이 되어 **그 취소표를 영영 못 본다.**
+            # **다시 받기로 정해진 회차는 간격으로 막지 않는다.** 여기까지 온
+            # 키는 위에서 '변화 없음'으로 걸러지지 않았다는 뜻이고, 그러면 본
+            # 루프가 어차피 개별로 받는다(`좌석맵 N회`). 막아 봐야 요청 수는
+            # 그대로이고 **묶어 받을 기회만 사라진다** — 실측으로 개별 4회 0.8s,
+            # 묶음 4회 0.3s였다.
+            #
+            # 두 단계가 어긋나 있던 게 원인이다: FULL_REFRESH_SECONDS(30초)가
+            # 지나 stale이 되면 '변화 없음'에서 빠지는데, 먼 날짜의 간격은
+            # 90초라 프리페치가 막았다. 그 사이 30~90초 구간의 조회가 전부
+            # 개별로 나갔다.
             seen = _last_fetched.get(key)
-            if not moved and seen is not None and time.monotonic() - seen < gap:
+            if not moved and not stale and seen is not None \
+                    and time.monotonic() - seen < gap:
                 continue
             queue[key] = (rank, time.monotonic(), watch.EP_SEAT.format(
                 site_no=key[0], scns_no=key[1], ymd=key[2], scn_sseq=key[3]))

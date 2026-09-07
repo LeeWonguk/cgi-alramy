@@ -628,11 +628,16 @@ class TestPendingQueue(unittest.TestCase):
     """예산을 넘는 일감은 큐에 남았다가 다음 창에서 처리된다."""
 
     class Sess:
-        def __init__(self, limit):
+        def __init__(self, limit, free=10):
             import watch
 
             self.budget = watch.RateBudget(limit=limit)
             self.asked = []
+            # **잔여 좌석 수를 반드시 준다.** 실제 상영표에는 늘 있는 값이고,
+            # 프리페치의 판단이 이 값에 달려 있다(변화 없으면 좌석맵을 안 연다).
+            # 예전 가짜는 이걸 빼먹어서 그 경로를 통째로 못 타고, 대신 재확인
+            # 간격만 시험하고 있었다 — 실제로는 일어나지 않는 상태였다.
+            self.free = free
 
         def allowance(self):
             return self.budget.allowance()
@@ -640,9 +645,21 @@ class TestPendingQueue(unittest.TestCase):
         def showtimes(self, site_no, mov_no, ymd):
             return [{"scnsNo": f"S{i}", "scnSseq": str(i), "scnsrtTm": "1800",
                      "siteNo": site_no, "scnsNm": "IMAX관",
-                     "atktGoodsNm": "IMAX LASER 2D"} for i in range(4)]
+                     "atktGoodsNm": "IMAX LASER 2D",
+                     "frSeatCnt": str(self.free)} for i in range(4)]
 
         def get_json_many(self, paths, seat_fields=None):
+            """**주소를 보고 답한다.** 상영표와 좌석맵이 같은 수단을 쓰기 때문이다.
+
+            묶어 받기를 상영표에도 쓰면서(seats.warm_schedules) 이 가짜가 둘을
+            구분해야 하게 됐다. 어느 쪽에나 좌석맵 모양을 돌려주면 상영표 자리에
+            dict가 들어가고, 그러면 rows_to_check가 문자열을 회차로 훑는다.
+            """
+            if all("searchSchByMov" in p for p in paths):
+                # 상영표는 예산에서 세지만 이 테스트의 관심사가 아니다 —
+                # 좌석맵 예산 계산이 흐려지지 않게 따로 세지 않는다.
+                return [{"data": self.showtimes("0013", "M1", "")}
+                        for _ in paths]
             self.asked.append(len(paths))
             got = self.budget.take(len(paths))
             return ([{"data": {"items": [{"seats": []}]}}] * got
@@ -662,6 +679,20 @@ class TestPendingQueue(unittest.TestCase):
 
 
 
+    # **날짜를 못박지 않는다.** 이 테스트들이 시험하는 건 상영일이 얼마나
+    # 남았는지로 정해지는 순위·재확인 간격(seat_priority)이다. 절대 날짜를 적어
+    # 두면 그날이 지나는 순간 전부 순위 0(간격 0초)이 되어 **시험하려던 것을
+    # 시험하지 못한다** — 실제로 2026-09-07에 4건이 그렇게 조용히 깨져 있었다.
+    #
+    #   D0·D1  급한 회차 (간격 0초)
+    #   D2·D3  중간      (간격 20초)
+    #   D5 이상 먼 회차  (간격 90초)
+    @staticmethod
+    def ymd(days_ahead: int) -> str:
+        import datetime
+        return (datetime.date.today()
+                + datetime.timedelta(days=days_ahead)).strftime("%Y%m%d")
+
     def group(self, dates):
         return [{"id": i, "owner_id": 7, "movie_query": "오디세이",
                  "site_query": "용산아이파크몰", "scn_ymd": d,
@@ -672,14 +703,14 @@ class TestPendingQueue(unittest.TestCase):
 
     def test_work_beyond_the_budget_waits_instead_of_vanishing(self):
         s = self.Sess(limit=5)
-        group = self.group(["20260901", "20260902", "20260903"])   # 회차 12개
+        group = self.group([self.ymd(0), self.ymd(2), self.ymd(3)])   # 회차 12개
         got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
         self.assertEqual(len(got), 5, "예산만큼만 받아야 한다")
         self.assertEqual(len(seats._pending[7]), 7, "나머지는 큐에 남아야 한다")
 
     def test_the_next_window_picks_up_where_it_left_off(self):
         s = self.Sess(limit=5)
-        group = self.group(["20260902", "20260903"])   # 둘 다 재확인 간격이 있다
+        group = self.group([self.ymd(2), self.ymd(3)])   # 둘 다 재확인 간격이 있다
         first = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
         s.budget._sent.clear()          # 창이 지난 것으로
         second = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
@@ -690,20 +721,36 @@ class TestPendingQueue(unittest.TestCase):
     def test_a_recently_checked_showtime_is_not_requeued(self):
         """가까운 날짜가 매 창 예산을 채우면 먼 날짜가 영영 밀린다."""
         s = self.Sess(limit=100)
-        group = self.group(["20260903"])              # 재확인 간격이 있는 순위
+        group = self.group([self.ymd(3)])              # 재확인 간격이 있는 순위
         seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
         s.budget._sent.clear()
         again = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
         self.assertEqual(again, {}, "방금 본 회차를 곧바로 또 받았다")
 
-    def test_an_urgent_showtime_is_always_rechecked(self):
-        # 가까운 날짜는 간격이 0이라 매 바퀴 다시 본다.
+    def test_a_changed_count_is_rechecked_at_once(self):
+        """잔여 좌석 수가 변하면 재확인 간격을 기다리지 않는다.
+
+        예전 이름은 "가까운 날짜는 간격이 0이라 매 바퀴 다시 본다"였는데, 그건
+        잔여 좌석 수를 보기 전의 규칙이다. 지금은 숫자가 그대로면 가까운 날짜도
+        좌석맵을 열지 않는다 — 다시 보게 만드는 건 **변화**다.
+        """
         s = self.Sess(limit=100)
-        group = self.group(["20260901"])
+        group = self.group([self.ymd(0)])
         first = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
         s.budget._sent.clear()
+        s.free += 1                                   # 취소표가 났다
         again = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
-        self.assertEqual(set(first), set(again), "급한 회차인데 안 봤다")
+        self.assertEqual(set(first), set(again), "숫자가 변했는데 안 봤다")
+
+    def test_an_unchanged_count_costs_nothing(self):
+        # 숫자가 그대로면 좌석맵을 열지 않는다 — 절감의 대부분이 이것이다.
+        s = self.Sess(limit=100)
+        group = self.group([self.ymd(0)])
+        seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
+        s.budget._sent.clear()
+        self.assertEqual(
+            seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={}),
+            {}, "변화가 없는데 좌석맵을 열었다")
 
     def test_far_dates_are_not_starved(self):
         """급한 것이 계속 예산을 채워도 먼 것이 끝내 차례를 받아야 한다.
@@ -718,11 +765,11 @@ class TestPendingQueue(unittest.TestCase):
         seats.AGE_PROMOTE_SECONDS = 0.01      # 실제로는 45초
 
         s = self.Sess(limit=4)                # 급한 회차 4개로 딱 차는 예산
-        group = self.group(["20260901", "20260905"])
+        group = self.group([self.ymd(0), self.ymd(5)])
         far = set()
         for _ in range(8):
             got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
-            far |= {k for k in got if k[2] == "20260905"}
+            far |= {k for k in got if k[2] == self.ymd(5)}
             s.budget._sent.clear()
             _time.sleep(0.02)                 # 기다린 시간이 쌓인다
         self.assertTrue(far, "먼 날짜가 한 번도 처리되지 않았다")
@@ -736,18 +783,18 @@ class TestPendingQueue(unittest.TestCase):
         seats.AGE_PROMOTE_SECONDS = 0.01
 
         s = self.Sess(limit=4)
-        group = self.group(["20260901", "20260905"])
+        group = self.group([self.ymd(0), self.ymd(5)])
         near = set()
         for _ in range(8):
             got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
-            near |= {k for k in got if k[2] == "20260901"}
+            near |= {k for k in got if k[2] == self.ymd(0)}
             s.budget._sent.clear()
             _time.sleep(0.02)
         self.assertEqual(len(near), 4, "급한 회차가 처리되지 않았다")
 
     def test_everything_is_eventually_fetched(self):
         s = self.Sess(limit=5)
-        group = self.group(["20260902", "20260903"])   # 회차 8개
+        group = self.group([self.ymd(2), self.ymd(3)])   # 회차 8개
         seen = {}
         for _ in range(4):
             seen.update(seats._prefetch_seat_maps(s, self.Cat(), group,
@@ -759,14 +806,14 @@ class TestPendingQueue(unittest.TestCase):
     def test_urgent_work_is_taken_first(self):
         s = self.Sess(limit=4)
         # 먼 날짜를 먼저 올려도 가까운 날짜가 앞서야 한다.
-        group = self.group(["20260905", "20260901"])
+        group = self.group([self.ymd(5), self.ymd(0)])
         got = seats._prefetch_seat_maps(s, self.Cat(), group, sched_cache={})
-        self.assertTrue(all(k[2] == "20260901" for k in got),
+        self.assertTrue(all(k[2] == self.ymd(0) for k in got),
                         f"급한 것부터 안 가져갔다: {sorted(k[2] for k in got)}")
 
     def test_no_budget_means_no_request(self):
         s = self.Sess(limit=0)
-        group = self.group(["20260901"])
+        group = self.group([self.ymd(0)])
         self.assertEqual(seats._prefetch_seat_maps(s, self.Cat(), group,
                                                    sched_cache={}), {})
         self.assertEqual(s.asked, [], "예산이 없는데 물었다")
@@ -778,6 +825,119 @@ class TestPendingQueue(unittest.TestCase):
         seats._prefetch_seat_maps(s, self.Cat(), self.group(many),
                                   sched_cache={})
         self.assertLessEqual(len(seats._pending[7]), seats.PENDING_LIMIT)
+
+
+class TestSchedulesAreBatched(unittest.TestCase):
+    """상영표도 묶어 받는다 — 하나씩 받으면 왕복이 줄줄이 쌓인다.
+
+    실측(2026-09-07): 날짜 6건에 하나씩 760ms, 묶어서 136ms(5.6배). 요청 수는
+    그대로이므로 CGV 쪽 부담은 달라지지 않는다 — 줄어드는 건 사이클 길이이고,
+    그게 곧 좌석 감지 지연이다.
+    """
+
+    class Sess:
+        def __init__(self, *, fail: set | None = None):
+            self.batches: list[list[str]] = []
+            self.individual: list[tuple] = []
+            self.fail = fail or set()
+
+        def allowance(self):
+            return 1000
+
+        def get_json_many(self, paths, seat_fields=None):
+            self.batches.append(list(paths))
+            return [None if any(f in p for f in self.fail)
+                    else {"data": [{"scnsNo": "S1", "scnSseq": "1",
+                                    "scnsrtTm": "1800", "frSeatCnt": "5"}]}
+                    for p in paths]
+
+        def showtimes(self, site_no, mov_no, ymd):
+            self.individual.append((site_no, mov_no, ymd))
+            return [{"scnsNo": "S1", "scnSseq": "1", "scnsrtTm": "1800",
+                     "frSeatCnt": "5"}]
+
+    class Cat:
+        def resolve_movie(self, q):
+            return {"movNo": "M1", "movNm": q}, ""
+
+        def resolve_site(self, q):
+            return {"siteNo": "0013", "siteNm": q}, ""
+
+    def group(self, dates):
+        return [{"id": i, "owner_id": 7, "movie_query": "오디세이",
+                 "site_query": "용산아이파크몰", "scn_ymd": d,
+                 "screen_types": [], "rows": [], "scn_time": "",
+                 "scn_time_from": "", "scn_time_to": "", "min_consecutive": 2,
+                 "auto_book": False, "seat_num_from": 0, "seat_num_to": 0}
+                for i, d in enumerate(dates, start=1)]
+
+    def test_every_date_goes_out_in_one_batch(self):
+        s = self.Sess()
+        cache: dict = {}
+        got = seats.warm_schedules(s, self.Cat(),
+                                   self.group(["20260908", "20260909",
+                                               "20260910"]),
+                                   sched_cache=cache)
+        self.assertEqual(got, 3)
+        self.assertEqual(len(s.batches), 1, "한 번에 안 보냈다")
+        self.assertEqual(len(s.batches[0]), 3)
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(s.individual, [], "묶었는데 개별로도 받았다")
+
+    def test_watches_sharing_a_date_ask_once(self):
+        # 같은 (영화·극장·날짜)를 열만 다르게 걸어 두는 건 흔하다. 상영표 1건이
+        # 그 날짜의 모든 회차를 덮으므로 키 하나면 된다.
+        group = self.group(["20260908", "20260908", "20260909"])
+        self.assertEqual(seats.schedule_keys(self.Cat(), group),
+                         [("0013", "M1", "20260908"),
+                          ("0013", "M1", "20260909")])
+        s = self.Sess()
+        seats.warm_schedules(s, self.Cat(), group, sched_cache={})
+        self.assertEqual(len(s.batches[0]), 2, "같은 날짜를 두 번 물었다")
+
+    def test_a_single_date_is_not_batched(self):
+        # 묶을 이유가 없다 — 같은 왕복 한 번이다.
+        s = self.Sess()
+        self.assertEqual(
+            seats.warm_schedules(s, self.Cat(), self.group(["20260908"]),
+                                 sched_cache={}), 0)
+        self.assertEqual(s.batches, [])
+
+    def test_what_is_already_cached_is_not_asked_again(self):
+        s = self.Sess()
+        cache = {("0013", "M1", "20260908"): []}
+        seats.warm_schedules(s, self.Cat(),
+                             self.group(["20260908", "20260909", "20260910"]),
+                             sched_cache=cache)
+        self.assertEqual(len(s.batches[0]), 2, "캐시에 있는 것을 또 물었다")
+
+    def test_a_failed_one_is_left_for_the_individual_path(self):
+        """실패한 것은 캐시에 넣지 않는다.
+
+        그러면 `_schedule`이 개별로 다시 받으면서 지금까지의 실패 처리
+        (사유 기록·401 복구)를 그대로 지난다 — 조용히 빠뜨리면 그 감시가
+        확인되지 않은 채 넘어간다.
+        """
+        s = self.Sess(fail={"20260909"})
+        cache: dict = {}
+        got = seats.warm_schedules(s, self.Cat(),
+                                   self.group(["20260908", "20260909"]),
+                                   sched_cache=cache)
+        self.assertEqual(got, 1)
+        self.assertIn(("0013", "M1", "20260908"), cache)
+        self.assertNotIn(("0013", "M1", "20260909"), cache)
+
+    def test_the_prefetch_uses_the_warmed_cache(self):
+        # 프리페치 루프가 날짜마다 부르는 _schedule이 캐시에 맞아야 한다.
+        for cache in (seats._pending, seats._last_fetched, seats._last_count):
+            cache.clear()
+            self.addCleanup(cache.clear)
+        s = self.Sess()
+        seats._prefetch_seat_maps(s, self.Cat(),
+                                  self.group(["20260908", "20260909",
+                                              "20260910"]),
+                                  sched_cache={})
+        self.assertEqual(s.individual, [], "상영표를 개별로 받았다")
 
 
 class TestCancelledSeatDetection(unittest.TestCase):
