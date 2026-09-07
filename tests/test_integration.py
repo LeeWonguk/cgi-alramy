@@ -995,6 +995,32 @@ class TestRateBudget(unittest.TestCase):
         b.penalize()
         self.assertEqual(b.limit, start // 2)
 
+    def test_the_floor_is_above_the_steady_demand(self):
+        """**바닥값이 수요보다 낮으면 429 한 번에 영구 기아가 된다.**
+
+        한도가 바닥에 눌리고, 바닥이 수요보다 낮으니 매 사이클 예산이 마르고,
+        마른 상태로는 조용해질 수가 없어 AIMD가 다시 올라가지도 못한다.
+        실측(2026-09-07)으로 그 상태에 빠져 `예산을 다 썼습니다`가 78번 찍혔다.
+
+        수요는 **날짜 수 × (60 / 폴링간격)** 이 지배한다. 날짜 5개·폴링 5초면
+        60/분이고, 거기에 카탈로그·좌석맵을 더해도 바닥값 아래여야 한다.
+        """
+        dates, interval = 5, 5
+        demand = dates * (60 / interval)
+        self.assertLess(demand, watch.RATE_FLOOR,
+                        "평상시 수요가 바닥값을 넘는다 — 429 한 번에 굶는다")
+
+    def test_the_ceiling_stays_inside_what_cgv_accepted(self):
+        """천장은 관측된 안전지대 안에 있어야 한다.
+
+        실측(2026-09-07): 205/분은 무사했고 332부터 429가 났다. 천장을 1800으로
+        열어 두자 한도가 665까지 올라간 뒤 한 초에 429를 세 번 맞고 120으로
+        곤두박질쳤다 — 올라가는 데 몇십 분, 떨어지는 데 1초다. 그 비대칭 때문에
+        높은 천장은 "가끔 빠르고 대체로 바닥"이라는 결과를 낳는다.
+        """
+        self.assertLess(watch.RATE_CEILING, 332, "거절당한 구간까지 열어 뒀다")
+        self.assertGreater(watch.RATE_CEILING, 205, "무사했던 값보다 낮다")
+
     def test_the_floor_stops_the_halving(self):
         """반으로 줄이다 감시가 멎으면 안 된다 — 바닥 밑으로는 안 내려간다."""
         b = watch.RateBudget(limit=watch.RATE_FLOOR + 10)

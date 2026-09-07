@@ -653,6 +653,16 @@ def _seat_count(row: dict) -> int | None:
         return None
 
 
+def watch_throttled():
+    import watch
+    return watch.Throttled
+
+
+def watch_rate_limited():
+    import watch
+    return watch.RateLimited
+
+
 def _schedule(session, key, *, cost=None, sched_cache=None):
     """상영표를 받는다. 같은 바퀴에 이미 받았으면 그걸 쓴다. 실패하면 None.
 
@@ -676,6 +686,13 @@ def _schedule(session, key, *, cost=None, sched_cache=None):
     try:
         with cost.call("상영표") if cost else contextlib.nullcontext():
             rows = session.showtimes(key[0], key[1], key[2])
+    except (watch_throttled(), watch_rate_limited()):
+        # **거절당한 뒤에는 계속 묻지 않는다.** 이건 이 날짜만의 실패가 아니라
+        # 사이클 전체에 대한 신호다. 삼키면 남은 날짜·감시마다 폴백이 한 번씩
+        # 더 나가는데, 그만하라는 쪽을 더 때리는 셈이다 — 실측(2026-09-07
+        # 16:54:51)으로 묶음이 429를 맞은 직후 `상영표 20회`가 0.0초에 줄줄이
+        # 실패했다. 그대로 올려 바퀴를 멈춘다.
+        raise
     except RuntimeError:
         return None
     if sched_cache is not None:
@@ -949,6 +966,11 @@ def check_seat_watches(session, *, dry_run: bool = False) -> dict:
             prefetched = _prefetch_seat_maps(session, catalog, group, cost=cost,
                                              sched_cache=sched_cache,
                                              unchanged=unchanged)
+        except (watch.Throttled, watch.RateLimited):
+            # **이것만은 삼키지 않는다.** 미리 받기가 거절당했다는 건 본 루프도
+            # 거절당한다는 뜻이라, 넘어가면 감시마다 개별 요청이 한 번씩 더
+            # 나간다. 사이클을 여기서 멈춘다.
+            raise
         except Exception as exc:  # noqa: BLE001 - 미리 받기는 부가 기능이다
             watch.log.warning("좌석맵을 미리 받지 못했습니다 (%s) — "
                               "하나씩 받습니다", exc)
