@@ -262,6 +262,8 @@ def seat_watch_view(row: dict) -> dict:
         "auto_book": row["auto_book"],
         "auto_pay": row["auto_pay"],
         "pay_method": row["pay_method"] or store.DEFAULT_PAY_METHOD,
+        # 좌석을 잡는 방식 — 'ui'(화면 구동) 또는 'api'(직접 호출).
+        "hold_mode": row["hold_mode"] or store.DEFAULT_HOLD_MODE,
         "party_size": row["party_size"] or 1,
         "ticket_spec": row["ticket_spec"] or {},
         "enabled": row["enabled"],
@@ -281,6 +283,8 @@ def booking_view(row: dict) -> dict:
         "status": row["status"],
         "amount": row["amount"],
         "hold_expires_at": row["hold_expires_at"],
+        # API 결제의 결제번호. 승인 상태를 CGV에 물어볼 때 쓴다.
+        "paym_no": row["paym_no"] or "",
         "last_error": row["last_error"],
         "created_at": row["created_at"],
         # 자동 결제를 켠 감시에서만 채워진다. 링크는 몇 분 만에 죽으므로 화면이
@@ -794,6 +798,10 @@ def register_api(app: Flask) -> None:
         if data.get("auto_pay") and not auto_book:
             return fail("자동 결제는 자동 예매를 켠 감시에서만 쓸 수 있습니다")
         try:
+            hold_mode = store.normalize_hold_mode(data.get("hold_mode"))
+        except ValueError as exc:
+            return fail(str(exc))
+        try:
             row = store.add_seat_watch(
                 me()["id"], movie, site, scn_ymd,
                 screen_types=data.get("screen_types"), rows=data.get("rows"),
@@ -801,7 +809,7 @@ def register_api(app: Flask) -> None:
                 auto_book=auto_book, party_size=data.get("party_size", 1),
                 ticket_spec=data.get("ticket_spec"),
                 auto_pay=bool(data.get("auto_pay")),
-                pay_method=data.get("pay_method"),
+                pay_method=data.get("pay_method"), hold_mode=hold_mode,
                 scn_time=data.get("scn_time", ""),
                 scn_time_from=data.get("scn_time_from", ""),
                 scn_time_to=data.get("scn_time_to", ""),
@@ -828,7 +836,7 @@ def register_api(app: Flask) -> None:
             if not book_on:
                 return fail("자동 결제는 자동 예매를 켠 감시에서만 쓸 수 있습니다")
         fields = {k: data[k] for k in
-                  ("enabled", "auto_book", "auto_pay", "pay_method",
+                  ("enabled", "auto_book", "auto_pay", "pay_method", "hold_mode",
                    "party_size", "min_consecutive", "ticket_spec") if k in data}
         try:
             row = store.set_seat_watch(watch_id, owner_id=me()["id"], **fields)

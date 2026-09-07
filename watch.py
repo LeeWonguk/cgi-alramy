@@ -59,6 +59,20 @@ EP_SEAT = (
     "&scnYmd={ymd}&scnSseq={scn_sseq}"
 )
 
+# 좌석 임시 선점. **UI를 몰지 않고 직접 부르는 경로**가 쓰는 주소다
+# (booking.hold_api). CGV 화면의 '결제하기'가 만들어 보내던 것과 같은 요청이라,
+# 형태는 logs/holdspec/*.json에 남긴 실제 관측으로 확정했다.
+EP_SEAT_HOLD = "/api/v1/content/seatTemp/seatTempPrmp"
+
+# 그 회차의 예매 정보. **결제 판매정보에만 필요하다** — 개봉일(rlsYmd)과 영진위
+# 영화코드(koficMovfCd)가 여기에만 있다. 상영표에도 영화 카탈로그에도 없어서
+# (2026-09-07 실측) 결제 바디를 만들려면 이 조회가 한 번 더 필요하다.
+EP_ADNC_SEAT = (
+    "/api/v1/booking/searchAtktAdncSeatInfo"
+    f"?coCd={CO_CD}&siteNo={{site_no}}&scnYmd={{ymd}}&scnsNo={{scns_no}}"
+    "&scnSseq={scn_sseq}&dblfrRpsntYn=N&cxprdYn=N&hotdlYn=N&movNo={mov_no}"
+)
+
 # ── CGV 로그인 (계정 세션) ──────────────────────────────────────────────────
 # 로그인은 cgv.co.kr/mem/login에서 이뤄진다. 비밀번호 암호화·바디 구성은 페이지의
 # 자체 JS가 하므로, 우리는 폼을 채우고 제출만 한다. 화면의 숫자 캡차는 canvas에
@@ -69,6 +83,53 @@ REFRESH_URL = "https://oidc.cgv.co.kr/common/auth/refreshtoken"
 # 로그인 성공 시 발급돼 세션을 이루는 쿠키들. 저장·복원할 때 이만큼을 다룬다.
 SESSION_COOKIES = ("accessToken", "refresh_token", "cjssoq",
                    "CJONE_SSO", "CJONE_SSO_SYS")
+
+# accessToken 쿠키를 푸는 열쇠. **CGV가 자기 화면에서 쓰는 것과 같은 값이다** —
+# 그 쿠키는 서명만 된 JWT가 아니라 AES-256-ECB로 한 번 더 감싸인 것이고, 사이트의
+# 자체 JS(`encryt.ts`의 `Jz.decrypt`)가 매 요청에서 이걸로 풀어 쓴다.
+#
+# **왜 우리가 풀어야 하는가.** 좌석을 API로 바로 선점하려면 요청 바디에 그 계정의
+# 고객번호(custNo)와 고객등급(cusgdCd)이 들어가야 하는데, 이 둘은 **오직 이 토큰
+# 안에만** 있다. 쿠키·localStorage·회원 API 어디에도 없어서(2026-09-07 실측),
+# 화면을 몰지 않고 얻을 방법이 이것뿐이다.
+#
+# CryptoJS의 `Utf8.parse(key).clone(); sigBytes = 32`를 그대로 옮긴 것이다 —
+# 29바이트짜리 열쇠를 32바이트로 **0으로 채워** 쓴다는 뜻이다.
+CGV_TOKEN_KEY = b"cagbvc1Jwt3Seecfrgehti5Kjekyl".ljust(32, b"\x00")
+# 토큰 안 JWT에서 우리가 읽는 값들. 이름은 CGV의 것이다.
+TOKEN_CUST_NO = "crerNo"        # 고객번호 → 선점 바디의 custNo
+TOKEN_CUSGD_CD = "cntCusgdCd"   # 고객등급 코드 → cusgdCd ('01' = 일반)
+
+# 결제 판매정보에 사람을 실을 때 CGV가 쓰는 열쇠. **accessToken의 것과 다르다.**
+# 사이트의 자체 JS가 `paymInfoCont`를 만들면서 아이디·이름·연락처·이메일·접속
+# IP만 골라 이걸로 감싼다(`service/mpy/apiCpx.ts`의 tw → zb). 고객번호는 감싸지
+# 않는다 — 그래서 관측에서 userNo만 평문이었다.
+#
+# 우리 것을 새로 정하는 게 아니라 **CGV가 읽을 수 있게 같은 방식으로 감싸는**
+# 것이다. 실측으로 확인했다(2026-09-07): userId·userName·ipAddress 세 값이
+# 관측된 암호문과 글자까지 일치했다.
+PAY_FIELD_KEY = b"5918bbf210880bd670217f746b4f2e2".ljust(32, b"\x00")
+
+
+def encrypt_pay_field(text: str) -> str:
+    """판매정보에 실을 값 하나를 CGV와 같은 방식으로 감싼다.
+
+    AES-256-ECB · PKCS7 · base64. 빈 값은 그대로 둔다 — CGV도 빈 자리는
+    감싸지 않는다.
+    """
+    import base64
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    raw = str(text or "").encode("utf-8")
+    if not raw:
+        return ""
+    pad = 16 - len(raw) % 16
+    enc = Cipher(algorithms.AES(PAY_FIELD_KEY), modes.ECB()).encryptor()
+    return base64.b64encode(
+        enc.update(raw + bytes([pad]) * pad) + enc.finalize()).decode()
+
+
 # canvas의 fillText를 후킹해 캡차 숫자를 모으는 스크립트. 페이지 JS보다 먼저
 # 심어야 하므로 add_init_script로 넣는다.
 _CAPTCHA_HOOK = """
@@ -117,10 +178,27 @@ BOOKING_PAGE_LIMIT = 20
 # 1층을 축출하는데, 1층은 **무효가 됐을 때 돌아갈 폴백**이라 그게 사라지면 선점마다
 # 딥링크 6.2초를 다시 문다.
 #
-# 왜 전부가 아니라 4장인가. 자리가 넉넉한 회차는 첫 사이클에 이미 잡히므로 속도가
+# 왜 전부가 아니라 몇 장인가. 자리가 넉넉한 회차는 첫 사이클에 이미 잡히므로 속도가
 # 무의미하다. 값이 있는 건 `frSeatCnt < party`인 회차 — 취소표를 기다리는 그
-# 회차다(실측 4~45초 창). 그런 회차만 골라 담으면 12~13장이 아니라 4장이면 된다.
-ADVANCED_PAGE_LIMIT = 4
+# 회차다(실측 4~45초 창). 그런 회차만 골라 담으면 12~13장까지는 필요 없다.
+#
+# **4장이었다가 8장으로 올렸다.** 4는 실측과 맞지 않았다: 2026-09-07 배포 로그에서
+# 등록된 키가 7개인데(날짜 5개 × 회차, 그중 하루는 회차 3개) 상한이 4라, 준비
+# 상태가 0→1→2→3→4까지 갔다가 **0으로 무너지기를 끝없이 반복**했다.
+#
+#   11:40:29  준비 4
+#   11:40:31  탭이 4장을 넘어 20260908을 닫습니다
+#   11:40:32  예매 화면을 20260907로 바로 열었습니다   ← 딥링크를 다시 문다
+#   11:40:32  준비 0
+#
+# 5번째 키를 넣으려고 하나를 닫으면 그게 곧 다시 필요해지고, 그러면 또 다른 걸
+# 닫는 축출 연쇄가 된다. 10분 남짓에 탭 축출이 198회, 분당 5~9회였다. 사전진행은
+# "이미 진행돼 있으면 0초"라서 하는 것인데 정확히 그 이득이 사라지고, 요청 예산만
+# 쓴다 — BOOKING_PAGE_LIMIT 주석이 1층에 대해 적어 둔 것과 같은 실패다.
+#
+# 그래서 **실제로 등록되는 키 수보다 넉넉히** 잡는다. 탭이 늘면 메모리를 더 쓰지만,
+# 무너지는 사전진행은 메모리도 쓰고 시간도 쓰면서 아무것도 돌려주지 않는다.
+ADVANCED_PAGE_LIMIT = 8
 
 # 결제창이 떠 있어 워밍 풀에서 빼 둔 탭을 한 소유자당 몇 장까지 지킬지.
 # 선점은 감시 하나가 성공하면 그 감시를 끄므로 여러 장이 동시에 뜨는 일은
@@ -153,12 +231,35 @@ SEAT_MAP_BATCH = 6
 # 되고, 낮으면 계속 거절당한다. 대신 **429가 날 때까지 올려 보고, 나면 반으로
 # 줄인다**(AIMD). 창을 넘는 일감은 버리지 않고 큐에 남겨 다음 창에서 처리한다.
 RATE_WINDOW_SECONDS = 60.0
-RATE_START = 180          # 처음 한도(분당). 무사했던 205보다 조금 낮게 시작한다
+# 처음 한도(분당). **실측으로 무사했던 값 그대로다** — 205/분은 통과했고 429는
+# 820/분에서 났으니, 205는 확인된 안전지대의 위쪽 끝이다.
+#
+# 180에서 205로 올렸다. 낮게 시작할 이유가 없었다: 재시작할 때마다 180에서
+# 30초당 +10씩 기어오르는데(RATE_STEP·RATE_PROBE_SECONDS), 그 몇 분 동안 좌석
+# 사이클 혼자 분당 160건을 쓰면서 사전진행이 돌 여유가 없었다. 실측(2026-09-07
+# 13:04 기동)에서 준비 상태를 7까지 세우는 데 2~3분이 걸렸고, 그동안 잠깐씩
+# "예산을 다 썼습니다"가 났다.
+#
+# 여기서 더 올리지는 않는다. 205 위는 **관측된 적이 없는 구간**이고, 그건
+# RATE_CEILING까지 AIMD가 찾아낼 몫이다 — 시작값은 확인된 것으로 둔다.
+RATE_START = 205
 # 이 밑으로는 안 내린다 — 감시가 아예 멎으면 의미가 없다. 좌석 변화가 없는
-# 평상시에 실제로 드는 양이 분당 39건이라(상영표 24 + 좌석맵 15), 최대로 눌려도
-# 정상 동작은 하도록 그보다 넉넉히 잡는다.
-RATE_FLOOR = 60
-RATE_CEILING = 900        # 이 위로는 안 올린다
+# 평상시에 실제로 드는 양이 분당 39건이고(상영표 24 + 좌석맵 15), 자리가 나서
+# 여러 회차를 한꺼번에 볼 때는 그보다 훨씬 든다. 최대로 눌린 상태에서도 그
+# 순간을 넘길 수 있도록 평상시의 세 배쯤으로 잡는다.
+#
+# **올릴수록 429가 나도 덜 물러선다는 뜻이다.** 바닥이 높으면 CGV가 거절해도
+# 우리는 그 아래로 안 내려가므로, 거절이 이어지면 그만큼 계속 거절당한다.
+RATE_FLOOR = 120
+# 이 위로는 안 올린다. 900에서 1800으로 올렸다 — 실측으로 429가 난 820/분이
+# 우리가 아는 전부라, 그 두 배까지만 열어 두고 진짜 한계는 AIMD가 찾게 한다.
+# 900 위는 **관측된 적이 없는 구간**이므로 여기 적힌 숫자는 근거가 아니라
+# '어디까지 시험해 볼지'다.
+#
+# 올려도 단숨에 거기까지 가지는 않는다: 180에서 30초마다 +10씩이라(RATE_STEP,
+# RATE_PROBE_SECONDS) 1800에 닿는 데만 80분이 넘고, 그전에 429를 만나면 거기서
+# 반으로 줄었다 다시 오르며 진동한다 — 그 진동하는 지점이 곧 실제 한계다.
+RATE_CEILING = 1800
 RATE_STEP = 10            # 조용하면 이만큼씩 올린다
 RATE_PROBE_SECONDS = 30.0  # 이만큼 조용하면 한 번 올려 본다
 WEEKDAYS = "월화수목금토일"
@@ -321,6 +422,94 @@ class AuthRequired(RuntimeError):
     """
 
 
+class TokenUnreadable(RuntimeError):
+    """accessToken을 풀지 못했다 — 그 계정의 고객번호를 알 수 없다.
+
+    API로 바로 선점하는 경로만 이걸 만난다. UI 구동은 사이트의 JS가 바디를
+    채우므로 토큰을 우리가 읽을 필요가 없다.
+
+    **조용히 넘어가면 안 된다.** 고객번호가 빠진 선점 요청은 남의 것도 내 것도
+    아닌 요청이라, 잘 되기를 바라며 보내느니 사유를 그대로 올리는 편이 낫다.
+    """
+
+
+def decrypt_access_token(raw: str) -> str:
+    """accessToken 쿠키를 풀어 안에 든 JWT 문자열을 돌려준다.
+
+    쿠키 값은 퍼센트 인코딩된 base64다(`%2F`가 그대로 들어 있다). 풀면
+    AES-256-ECB · PKCS7 암호문이고, 그 안이 JWT다.
+
+    순수 함수라 브라우저 없이 시험할 수 있다 — 실제 토큰 하나만 있으면 된다.
+    """
+    import base64
+    import urllib.parse
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    text = urllib.parse.unquote(str(raw or "")).strip()
+    if not text:
+        raise TokenUnreadable("accessToken이 비어 있습니다")
+    try:
+        blob = base64.b64decode(text)
+        dec = Cipher(algorithms.AES(CGV_TOKEN_KEY), modes.ECB()).decryptor()
+        plain = dec.update(blob) + dec.finalize()
+        pad = plain[-1] if plain else 0
+        if not 1 <= pad <= 16 or plain[-pad:] != bytes([pad]) * pad:
+            raise ValueError("PKCS7 패딩이 아닙니다")
+        return plain[:-pad].decode("utf-8")
+    except TokenUnreadable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 어떤 이유로든 못 풀면 같은 뜻이다
+        raise TokenUnreadable(
+            f"accessToken을 풀지 못했습니다 ({type(exc).__name__}) — CGV가 "
+            f"토큰 형식을 바꿨을 수 있습니다") from exc
+
+
+def access_token_claims(raw: str) -> dict:
+    """accessToken 안 JWT의 클레임. **서명은 검증하지 않는다.**
+
+    검증할 이유가 없다 — 우리가 방금 CGV에게서 받아 우리 브라우저에 담아 둔
+    토큰이고, 여기서 읽는 것은 '이 요청을 누구 이름으로 보낼지'뿐이다. 위조를
+    걱정할 상대가 우리 자신인 셈이라, 서명 검증은 아무것도 더 막아 주지 않는다.
+    """
+    import base64
+    import json as _json
+
+    jwt = decrypt_access_token(raw)
+    parts = jwt.split(".")
+    if len(parts) != 3:
+        raise TokenUnreadable(f"JWT가 아닙니다 (조각 {len(parts)}개)")
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = _json.loads(base64.urlsafe_b64decode(payload))
+    except Exception as exc:  # noqa: BLE001
+        raise TokenUnreadable(f"JWT를 읽지 못했습니다 ({type(exc).__name__})") from exc
+    if not isinstance(claims, dict):
+        raise TokenUnreadable("JWT 본문이 객체가 아닙니다")
+    return claims
+
+
+def booking_identity(raw: str) -> dict:
+    """선점 요청에 실을 신원 — {"cust_no", "cusgd_cd"}.
+
+    고객번호가 비어 있으면 올린다. 빈 custNo로 보내면 CGV가 무엇을 하는지
+    모르고, **모르는 채로 예매 요청을 보내지는 않는다.**
+    """
+    claims = access_token_claims(raw)
+    cust_no = str(claims.get(TOKEN_CUST_NO) or "").strip()
+    if not cust_no:
+        raise TokenUnreadable(
+            f"토큰에 고객번호({TOKEN_CUST_NO})가 없습니다 — CGV가 클레임 이름을 "
+            f"바꿨을 수 있습니다")
+    return {"cust_no": cust_no,
+            # 등급을 못 읽으면 일반('01')로 본다. 이건 넘겨짚어도 되는 값이다 —
+            # 요금은 CGV가 계산하고, 우리는 선점까지만 간다.
+            "cusgd_cd": str(claims.get(TOKEN_CUSGD_CD) or "01").strip() or "01",
+            "user_id": str(claims.get("userId") or ""),
+            # commonGetPayId가 아이디와 이름을 **평문으로** 싣는다(실측).
+            "user_nm": str(claims.get("userNm") or "")}
+
+
 def _close_quietly(page) -> None:
     """탭을 닫는다. 이미 닫혔으면 그냥 넘어간다 — 정리는 실패해도 되는 일이다."""
     try:
@@ -362,6 +551,9 @@ class _OwnerSpace:
         # 닫을 때 이 기록도 함께 사라져야 한다. 탭이 없는데 "PARTY_SET"이라고
         # 우기는 기록이 남으면 그게 곧 엉뚱한 회차 선점이다.
         self.advance_state: dict = {}
+        # 이 공간의 accessToken에서 읽어 둔 신원 — (토큰, {"cust_no", ...}).
+        # 토큰이 갱신되면 열쇠가 달라져 저절로 무효가 된다.
+        self.identity_cache: tuple[str, dict] | None = None
 
     def close(self) -> None:
         try:
@@ -584,8 +776,14 @@ class CgvSession:
         while len(tabs) >= ADVANCED_PAGE_LIMIT:
             victim, old = tabs.popitem(last=False)
             space.advance_state.pop(victim, None)
-            log.info("미리 진행해 둔 탭이 %d장을 넘어 %s를 닫습니다 — 그 회차는 "
-                     "선점할 때 처음부터 갑니다.", ADVANCED_PAGE_LIMIT, victim)
+            # **warning이어야 한다.** info로 적어 두는 바람에 분당 5~9회씩 도는
+            # 축출 연쇄가 몇 시간 동안 눈에 띄지 않았다(2026-09-07). 여기 걸린다는
+            # 건 사전진행이 이득을 못 내고 있다는 뜻이고, 그건 조용히 넘어갈 일이
+            # 아니다 — 1층(BOOKING_PAGE_LIMIT)은 처음부터 warning이었다.
+            log.warning("미리 진행해 둔 탭이 %d장을 넘어 %s를 닫습니다 — 그 회차는 "
+                        "선점할 때 처음부터 갑니다. 이 줄이 반복되면 "
+                        "ADVANCED_PAGE_LIMIT을 올리는 편이 좋습니다.",
+                        ADVANCED_PAGE_LIMIT, victim)
             _close_quietly(old)
         page = space.context.new_page()
         tabs[key] = page
@@ -647,6 +845,27 @@ class CgvSession:
             return False
         # 지켜 주는 탭도 무한정 쌓이면 안 된다. 넘치면 가장 오래된 것부터 닫는다 —
         # 그쪽은 결제 시한이 이미 지났을 가능성이 높다.
+        while len(space.paying_pages) >= PAYING_PAGE_LIMIT:
+            old, _ = space.paying_pages.pop(0)
+            log.warning("결제 중으로 지키던 탭이 %d장을 넘어 가장 오래된 것을 "
+                        "닫습니다.", PAYING_PAGE_LIMIT)
+            _close_quietly(old)
+        space.paying_pages.append((page, time.monotonic() + keep_seconds))
+        return True
+
+    def keep_page(self, page, keep_seconds: float) -> bool:
+        """워밍 풀에 없는 탭을 결제 시한까지 지킨다. 지키기로 했으면 True.
+
+        `detach_booking_page`는 (영화·극장·날짜) 키로 관리되는 탭을 옮기는 것이고,
+        이쪽은 **키 없이 따로 연 탭**을 맡긴다 — API 결제가 PG 결제창을 새 탭에
+        여는 경우다(booking.fetch_pay_link).
+
+        **왜 지켜야 하는가.** 카카오페이 브릿지는 그 탭에서 승인 상태를 폴링하고,
+        승인이 오면 거기서 CGV의 완료 주소로 넘어가면서 매출이 만들어진다. 탭을
+        닫으면 그 연쇄가 시작되지 않는다 — **돈은 나가고 표는 안 나온다.**
+        실제로 그렇게 만들어 예매가 하나 날아갔다(2026-09-07).
+        """
+        space = self._space
         while len(space.paying_pages) >= PAYING_PAGE_LIMIT:
             old, _ = space.paying_pages.pop(0)
             log.warning("결제 중으로 지키던 탭이 %d장을 넘어 가장 오래된 것을 "
@@ -941,6 +1160,82 @@ class CgvSession:
         )
         return payload.get("data") or {}
 
+    def post_json(self, path: str, body: dict) -> dict:
+        """같은 오리진으로 POST 한 번. {"status", "body", "text"}를 돌려준다.
+
+        **재시도하지 않는다.** get_json은 조회라 다시 물어도 그만이지만, 이쪽은
+        좌석 선점처럼 부작용이 있는 요청에 쓴다 — 응답을 못 봤다고 다시 보내면
+        같은 계정으로 두 번 잡을 수 있다. 한 번 보내고, 무슨 답이 왔든 그대로
+        올린다.
+
+        200이 아니어도 예외를 내지 않는다. CGV는 실패 사유를 본문에 담아 주므로
+        (예: 422 "존재하지 않는 좌석 위치 번호"), 그 문구가 곧 사용자에게 전할
+        말이다. 401·429만 기존 규칙대로 예외로 올린다.
+
+        `authorization` 헤더는 페이지 안에서 accessToken 쿠키로 만든다 — CGV의
+        자체 JS가 하는 것과 같다(`Bearer ` + 쿠키를 URL 디코드한 값, 실측 확인).
+        토큰은 갱신되면 쿠키가 먼저 바뀌므로, 보내는 순간에 읽어야 어긋나지 않는다.
+        """
+        script = """async (arg) => {
+            const m = document.cookie.match(/(?:^|; )accessToken=([^;]*)/);
+            const headers = {'accept': 'application/json',
+                             'content-type': 'application/json'};
+            if (m) headers['authorization'] = 'Bearer ' + decodeURIComponent(m[1]);
+            const res = await fetch(arg.path, {
+                method: 'POST', headers: headers, body: JSON.stringify(arg.body),
+            });
+            return {status: res.status, text: await res.text()};
+        }"""
+
+        if not self.budget.take(1):
+            raise RateLimited(f"{path}: 이번 창의 요청 예산을 다 썼습니다 "
+                              f"(분당 {self.budget.limit}건)")
+        self.requests += 1
+        out = self._page.evaluate(script, {"path": path, "body": body})
+
+        if out["status"] == 401:
+            raise AuthRequired(f"{path}: 로그인이 필요합니다 (HTTP 401)")
+        if out["status"] == 429:
+            self.budget.penalize()
+            raise Throttled(f"{path}: CGV가 요청을 거절했습니다 (HTTP 429)")
+        try:
+            payload = json.loads(out["text"])
+        except json.JSONDecodeError:
+            payload = None
+        return {"status": out["status"], "body": payload, "text": out["text"]}
+
+    def identity(self) -> dict:
+        """지금 로그인된 계정의 예매용 신원 — {"cust_no", "cusgd_cd", "user_id"}.
+
+        accessToken 쿠키를 풀어 읽는다(booking_identity). 토큰이 그대로면 결과도
+        그대로라 **토큰 값을 열쇠로 캐시**한다 — 갱신되면 열쇠가 달라져 저절로
+        다시 계산된다. 사이클 안에서 불리는 자리라 매번 AES를 돌릴 이유가 없다.
+        """
+        jar = {c["name"]: c["value"] for c in self._page.context.cookies()}
+        raw = jar.get("accessToken") or ""
+        if not raw:
+            raise TokenUnreadable("로그인 쿠키(accessToken)가 없습니다 — 이 계정으로 "
+                                  "로그인되어 있지 않습니다")
+        space = self._space
+        cached = space.identity_cache
+        if cached and cached[0] == raw:
+            return cached[1]
+        found = booking_identity(raw)
+        space.identity_cache = (raw, found)
+        return found
+
+    def adnc_seat_info(self, site_no: str, scns_no: str, ymd: str,
+                       scn_sseq: str, mov_no: str) -> dict:
+        """그 회차의 예매 정보. 결제 판매정보를 만들 때만 쓴다.
+
+        개봉일·영진위 영화코드가 여기에만 있다 — 상영표에도 카탈로그에도 없다.
+        """
+        payload = self.get_json(
+            EP_ADNC_SEAT.format(site_no=site_no, scns_no=scns_no, ymd=ymd,
+                                scn_sseq=scn_sseq, mov_no=mov_no),
+            retries=1)
+        return payload.get("data") or {}
+
     # ── 계정 로그인 / 세션 ──
     def logged_in(self) -> bool:
         """accessToken 쿠키가 있으면 로그인된 것으로 본다.
@@ -998,6 +1293,8 @@ class CgvSession:
         확인까지 같이 멎는다. 이름 지정 삭제를 못 받는 버전에서만 통째로 지운다.
         """
         self.logged_in_owner = None
+        # 신원은 그 쿠키에서 읽은 것이다 — 쿠키를 버리면서 같이 버린다.
+        self._space.identity_cache = None
         try:
             for name in SESSION_COOKIES:
                 self._page.context.clear_cookies(name=name)

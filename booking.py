@@ -26,6 +26,7 @@ CGV 앱을 다시 열어 결제수단부터 고르는 대신, 링크 하나만 �
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,11 +34,48 @@ from zoneinfo import ZoneInfo
 
 import seats as seats_mod
 import store
+from watch import CO_CD, EP_SEAT_HOLD
 
 log = logging.getLogger("cgv-watch.booking")
 
 SEAT_HOLD_URL_MARK = "seatTemp/seatTempPrmp"
 
+# ── 선점 방식 ───────────────────────────────────────────────────────────────
+# 좌석을 잡는 길이 둘이다. 감시마다 고른다(seat_watches.hold_mode).
+#
+#   ui   예매 화면을 사람처럼 몰아 '결제하기'까지 간다. 사이트의 자체 JS가 요청을
+#        만들므로 우리가 바디를 재구성하지 않는다 — 지금까지의 유일한 길이었다.
+#   api  seatTempPrmp를 **직접** 부른다. 화면 전환·대기열·팝업·좌석 클릭이 통째로
+#        빠져서, 실측 2.6초짜리 경로가 좌석맵 조회 한 번 + POST 한 번으로 줄어든다.
+#
+# **왜 UI를 남겨 두는가.** API 경로는 CGV가 요청 형태를 바꾸면 그날로 멎는다.
+# 화면은 사람이 쓰는 길이라 훨씬 천천히 바뀐다. 그래서 기본은 ui이고, api는
+# 사용자가 감시마다 켜는 것으로 둔다.
+HOLD_MODE_UI = "ui"
+HOLD_MODE_API = "api"
+HOLD_MODES = (HOLD_MODE_UI, HOLD_MODE_API)
+
+# 선점 요청 바디에서 **회차·좌석과 무관하게 늘 같은** 값들. logs/holdspec/*.json에
+# 남긴 실제 관측(2026-08~09, 서로 다른 극장·회차 11건)에서 한 번도 달라지지 않았다.
+#   sachlCd 10   판매채널(웹)      atktChnlCd 01  예매채널
+#   sachlTypCd 01 판매채널 유형     rtctlScopCd 08 상영 구분 (EP_SCHEDULE과 같은 값)
+# bymd·mbltNo·movAtktNo·nmbrCrtfNo는 비회원/재선점 경로의 자리이고, 우리 경로에서는
+# 늘 빈 문자열이었다 — 없애면 안 된다. CGV가 키의 존재를 본다.
+HOLD_FIXED_FIELDS = {
+    "bymd": "", "mbltNo": "", "movAtktNo": "", "nmbrCrtfNo": "",
+    "sachlCd": "10", "atktChnlCd": "01", "sachlTypCd": "01",
+    "rtctlScopCd": "08",
+}
+# 좌석 하나를 가리키는 데 필요한 값들: 선점 바디의 키 ← 좌석맵(parse_seats)의 키.
+# 하나라도 비면 그 좌석은 요청에 실을 수 없다 — 빈 값으로 보내면 CGV가 422로
+# "존재하지 않는 좌석 위치 번호"를 낸다(실측).
+HOLD_SEAT_FIELDS = (
+    ("seatRowNm", "row"), ("seatNo", "no"), ("seatLocNo", "seat_loc_no"),
+    ("sbordNo", "sbord_no"), ("seatAreaNo", "seat_area_no"),
+    ("szoneNo", "szone_no"),
+)
+
+BASE_ORIGIN = "https://cgv.co.kr"
 BOOKING_PAGE = "https://cgv.co.kr/cnm/movieBook/movie"
 # 회차를 고르면 넘어가는 인원 선택 화면. 여기 닿았는지로 진행을 판정한다.
 VISITOR_PAGE_MARK = "/cnm/selectVisitorCnt"
@@ -117,15 +155,88 @@ DATE_ACTIVE_MARK = "itemActive"
 # 실패했을 때 화면을 남겨 둘 곳. 셀렉터가 깨졌는지 좌석이 없어진 건지는 스크린샷
 # 없이는 사후에 가릴 수 없다.
 SHOT_DIR = Path(__file__).resolve().parent / "logs" / "booking"
-# 성공한 선점 요청의 형태를 남겨 두는 곳. 지금은 **기록만** 한다 — 언젠가 UI를
-# 몰지 않고 seatTempPrmp를 직접 부르려면 그 요청이 어떻게 생겼는지 알아야 하는데,
-# 지금 우리는 응답만 가로챌 뿐 요청은 CGV의 JS가 만들어 보내고 있어 형태를 모른다.
+# 성공한 선점 요청의 형태를 남겨 두는 곳. **여기 쌓인 관측이 API 직접 선점의
+# 근거다** — hold_body의 필드는 전부 이 파일들에서 왔고 추측한 자리는 없다.
+# 화면 구동으로 잡을 때마다 계속 쌓아 둔다: CGV가 형태를 바꾸면 여기에 먼저
+# 드러나고, 그때 hold_body를 어떻게 고쳐야 할지도 여기서 읽는다.
 HOLD_SPEC_DIR = Path(__file__).resolve().parent / "logs" / "holdspec"
+
+# 결제 화면이 주고받은 것의 형태를 남겨 두는 곳.
+#
+# **선점에서 했던 것과 같은 준비다.** API로 바로 선점하는 길(hold_api)이 가능했던
+# 건 logs/holdspec/에 실제 요청이 쌓여 있었기 때문이다 — 형태를 몰랐다면 설계
+# 자체가 불가능했다. 결제는 그 관측이 아직 하나도 없어서, 지금 만들면 전부
+# 추측이 된다. 그래서 **먼저 모은다.**
+#
+# 여기서 하는 일은 관찰뿐이다. 결제 동작은 조금도 바뀌지 않는다.
+PAY_SPEC_DIR = Path(__file__).resolve().parent / "logs" / "payspec"
+# 결제 단계가 실제로 부르는 주소들. **번들에서 캐낸 것이다**(2026-09-07,
+# `/service/mpy/apiCpx.ts` — "통합결제 - 복합결제 공통 함수"):
+#
+#   /mpy/pay/searchGroupedPaymdList      결제수단 목록
+#   /mpy/mpy/searchLastPayknd            그 계정이 마지막에 쓴 결제수단
+#   /mpy/pay/onlineAuthRequestReserve    **결제 요청** — 카카오페이 창을 띄우는 곳
+#   /mpy/pay/onlineApprovalSearchPayment 승인 조회
+#   /mpy/iss/salCreateSal                매출 생성 — **돈이 확정되는 곳**
+#
+# **같은 오리진 BFF가 아니다.** 좌석·상영표는 cgv.co.kr의 /api/v1/... 로 가지만
+# (URL 매퍼가 /mpy → /api/v1/payment로 바꾼다), 결제 모듈은 그 매퍼를 쓰지 않고
+# `https://api.cgv.co.kr/mpy/...` 를 코드에 박아 직접 부른다.
+#
+# 이걸 놓치면 관측이 통째로 헛것이 된다 — 처음에 /api/v1/payment 만 걸어 뒀다가
+# 정작 onlineAuthRequestReserve 를 못 담는 것을 확인하고 고쳤다. 그래서 지금은
+# **경로에 /mpy/ 가 있으면 오리진을 가리지 않고** 담는다.
+PAY_SPEC_URL_MARKS = (
+    "/mpy/",                    # 결제 API 전부 (api.cgv.co.kr · BFF 양쪽)
+    "/api/v1/payment",          # 매퍼를 타고 오는 것들
+    # 결제 화면이 사람 정보를 채우는 조회들. **여기를 안 담아서 cust·cjOneUser의
+    # 출처를 못 찾았다**(2026-09-07) — 필터가 /mpy/만 보고 있었다.
+    "/mcv/", "/mem/", "/api/v1/member", "/api/getIp",
+    # 선점 단계의 예매 조회 전부. 좁게 걸었더니 `hrzoneCd`의 출처를 못 찾았다
+    # (2026-09-07) — 좌석맵에도 예매정보에도 번들에도 없는 값이 판매정보에는
+    # 실려 있으니, 우리가 아직 안 보는 조회가 하나 더 있다는 뜻이다.
+    "/api/v1/booking/",
+    "seatTemp/",                # 선점 직후 이어지는 조회
+    "kakaopay.com",             # 카카오페이 브릿지
+) + PAYMENT_URL_MARKS           # 승인 계열 — 나가면 반드시 남아야 한다
+# 본문 하나를 이만큼까지만 남긴다. 형태를 배우는 게 목적이라 전문이 필요 없다.
+#
+# **인색하게 잡으면 안 된다.** 우리가 알고 싶은 건 onlineAuthRequestReserve의
+# 바디인데, 거기엔 productItems가 JSON을 문자열로 다시 담아 실린다 — 4KB에서
+# 자르면 정작 그 안이 통째로 날아간다. 관측 기회가 자주 오지 않으므로 넉넉히 둔다.
+PAY_SPEC_BODY_LIMIT = 16000
+# 결제 화면 **문서**만은 훨씬 넉넉히 남긴다. 68KB짜리인데 16KB에서 자르는 바람에
+# 거기 담긴 고객 정보를 한 라운드 내내 못 찾았다(2026-09-07) — 관측 기회가 자주
+# 오지 않는데 정작 찾던 것이 잘린 자리에 있었다.
+PAY_SPEC_DOC_LIMIT = 200_000
+# 약관 전문(89KB)은 남길 이유가 없다 — 크기만 차지한다.
+PAY_SPEC_SKIP_MARKS = ("searchUsgStplDtl",)
+# 한 번의 결제에서 남길 최대 건수. 결제 화면은 수단·카드사·할인·쿠폰을 저마다
+# 따로 조회해서 금방 수십 건이 된다.
+PAY_SPEC_MAX_ENTRIES = 120
 
 # 기록에서 가려야 할 값. 이름에 이 조각이 들어간 헤더·필드는 값을 지운다 —
 # 선점 요청에 로그인 토큰이 실려 나가므로 그대로 남기면 파일이 곧 자격증명이다.
-SECRET_HINTS = ("token", "cookie", "authorization", "auth", "secret",
-                "password", "pwd", "session", "csrf", "custno")
+#
+# 결제 쪽은 가릴 것이 더 많다. 카드번호·계좌·생년월일·연락처가 지나갈 수 있고,
+# 카카오페이의 거래 식별자(tid·hash)는 **그것만으로 그 결제를 이어받을 수 있는**
+# 값이다. 짧게 사는 값이라도 파일에 그대로 두지 않는다.
+#
+# 가려도 키 이름과 길이는 남으므로(mask_secrets) 형태를 배우는 데는 지장이 없다.
+# "auth"는 뺐다 — 너무 넓다. `onlineAuthUseYn`·`onlineAuthAplyYn`·`cjOneAuthFlag`
+# 같은 **구조적 Y/N 플래그**까지 가려서, 정작 형태를 배우려고 모은 관측이 못 쓰게
+# 됐다(2026-09-07). 가려야 할 것은 "authorization"이 이미 잡고, 토큰류는 "token"이
+# 잡는다.
+SECRET_HINTS = ("token", "cookie", "authorization", "secret",
+                "password", "pwd", "session", "csrf", "custno",
+                "cardno", "crdno", "acctno", "accountno",
+                "bymd", "birth", "mbltno", "hpno", "telno", "phone",
+                "mobile", "email", "hash", "tid",
+                # 실제 관측(2026-09-07)에서 평문으로 나온 것들. 결제 바디는
+                # 예매 바디보다 사람을 훨씬 많이 담는다 — 이름·아이디·회원번호가
+                # 그대로 실린다.
+                "userid", "username", "usernm", "userno", "memberno",
+                "membername", "custnm", "cashreceiptinfo")
 
 # ── 결제 화면 (auto_pay) ────────────────────────────────────────────────────
 # 2026-08 실측 구조.
@@ -316,7 +427,8 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
 
     반환: {"action": skip|held|failed|no_seats, ...}. hold_fn(session, ctx)->result 와
     pay_fn(session, ctx, method=...)->result 를 주입하면 라이브 구동 대신 그걸
-    쓴다(테스트용). 기본은 hold_block·pay_block.
+    쓴다(테스트용). 기본은 그 감시의 선점 방식이 정한다 — 화면을 모는 hold_block이
+    거나 API를 직접 부르는 hold_api다(hold_for).
 
     여기서 고르는 좌석은 **후보**다. 감지 때 읽은 배치도는 UI를 모는 동안 낡으므로,
     실제로 누를 좌석은 좌석맵에 도착해서 다시 고른다(hold_block → _select_block).
@@ -368,8 +480,14 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
            "mov_no": mov_no,
            # 같은 시각의 회차가 여러 상영관에 있을 때 어느 쪽인지 가리는 데 쓴다.
            "scns_nm": row.get("expoScnsNm") or row.get("scnsNm") or "",
-           "row": row}
-    fn = hold_fn or hold_block
+           "row": row,
+           # 어느 방식으로 잡았는지 — 로그와 뒤처리(release_after_hold)가 본다.
+           "hold_mode": hold_mode(watch),
+           # 결제까지 갈 감시인지. 선점 단계의 관측을 켤지가 여기서 갈린다
+           # (watch_pay_requests) — 결제 바디에 실릴 가격 정보가 **선점 단계에서**
+           # 조회되기 때문이다.
+           "auto_pay": bool(watch.get("auto_pay"))}
+    fn = hold_fn or hold_for(watch)
     try:
         result = fn(session, ctx)
     except Exception as exc:  # noqa: BLE001 - 라이브 구동 실패는 이력에 남기고 넘어간다
@@ -393,7 +511,10 @@ def try_auto_book(session, watch: dict, row: dict, parsed_seats: list[dict],
             hold_expires_at=result.get("hold_expires_at"),
             pay_method=pay.get("method"), pay_url=pay.get("pay_url"),
             pay_expires_at=pay.get("pay_expires_at"),
-            pay_error=pay.get("error") or None)
+            pay_error=pay.get("error") or None,
+            # API 결제만 준다. 승인은 됐는데 예매가 안 된 건을 사후에 조회할
+            # 유일한 열쇠다 — 안 남겨 뒀다가 한 번 겪었다(2026-09-07).
+            paym_no=pay.get("paym_no"))
         # 선점에 성공하면 그 감시는 꺼서 중복 선점을 막는다.
         store.set_seat_watch(watch_id, enabled=False)
         # 미리 진행해 둔 탭은 흐름 깊숙이 남아 더 못 쓴다 — 정리해 다음 패스가
@@ -421,7 +542,7 @@ def _try_pay(session, watch: dict, ctx: dict, pay_fn=None) -> dict:
     잡혀 있으니, 사람이 CGV 앱에서 손으로 마치면 된다. 그래서 여기서는 사유만
     챙겨 돌려주고 호출자는 held를 유지한다.
     """
-    fn = pay_fn or pay_block
+    fn = pay_fn or pay_for(watch)
     method = (watch.get("pay_method") or DEFAULT_PAY_METHOD).strip()
     try:
         out = fn(session, ctx, method=method)
@@ -430,7 +551,9 @@ def _try_pay(session, watch: dict, ctx: dict, pay_fn=None) -> dict:
         return {"method": method, "error": str(exc)}
     if not out.get("ok"):
         log.warning("자동 결제 요청 실패: %s", out.get("error"))
-    elif out.get("pay_url"):
+    elif out.get("pay_url") and hold_mode(watch) != HOLD_MODE_API:
+        # **API 경로는 지킬 탭이 없다.** 결제창을 우리 화면에 띄우지 않았고,
+        # 카카오 승인은 사용자 휴대폰에서 카카오가 CGV에 직접 알린다.
         _keep_paying_page(session, ctx, out.get("pay_expires_at"))
     return out
 
@@ -925,6 +1048,25 @@ _advance_wanted: dict = {}
 # 이 트래픽이 회계 밖에서 늘어나 429로 돌아온다(커밋 3e80826에서 한 번 맞았다).
 ADVANCE_REQUEST_COST = 8
 
+# 사전진행이 **건드리지 않고 남겨 둘** 요청 수. 이 밑으로 내려가면 이번 창에서는
+# 더 진행하지 않고 물러난다.
+#
+# **사전진행은 부차적인 일이다.** 좌석 사이클이 본업이고, 미리 진행해 두는 건
+# 그 본업이 성공했을 때 몇 초를 아끼려는 것뿐이다. 그런데 예산을 나눠 쓰는
+# 사이라서, 남김없이 가져가면 정작 좌석을 보는 쪽이 굶는다 — 그건 취소표가
+# 나는 창(실측 4~45초)을 통째로 놓친다는 뜻이라 아낀 몇 초보다 훨씬 나쁘다.
+#
+# 실측(2026-09-07 기동): 탭 7장을 세우는 동안 한 걸음에 8건씩 20패스/분이라
+# 사전진행만 분당 160건을 썼고, 좌석 사이클(분당 100건 남짓)과 합쳐 한도를
+# 넘겼다. 그 60초 동안 상영표·좌석맵 조회가 "예산을 다 썼습니다"로 실패했다.
+#
+#   12:57:16 WARNING 좌석 배치도 조회 실패 (용산아이파크몰 018|5): … 예산을 다 썼습니다
+#
+# 값은 좌석 사이클 몇 바퀴 몫이다 — 한 바퀴가 상영표 5건 + 좌석맵 최대 7건이라
+# 넉넉히 잡아 서너 바퀴. 모자라 남겨 두는 편이 낫다: 사전진행은 다음 창에
+# 이어서 하면 그만이지만, 놓친 좌석은 돌아오지 않는다.
+ADVANCE_BUDGET_RESERVE = 40
+
 
 def register_advance(session, watch_row: dict, rows: list, *, mov_no: str,
                      site_no: str, site_nm: str) -> int:
@@ -967,15 +1109,45 @@ def register_advance(session, watch_row: dict, rows: list, *, mov_no: str,
                      str(watch_row["scn_ymd"]), str(row.get("scnsrtTm") or "")),
         }
         added += 1
+    _warn_if_advance_overflows(owner, wanted)
     return added
+
+
+# 소유자별로 마지막에 알린 키 개수. 같은 상태를 사이클마다 다시 알리지 않는다.
+_advance_warned: dict = {}
+
+
+def _warn_if_advance_overflows(owner, wanted: dict) -> None:
+    """등록된 회차가 탭 상한을 넘으면 알린다. 같은 개수는 한 번만.
+
+    **축출이 일어난 뒤에 아는 건 늦다.** 상한을 넘긴 순간부터 사전진행은 준비
+    상태를 쌓았다 무너뜨리기를 반복하는데(2026-09-07 실측: 준비 4 → 0 → 4 → 0,
+    분당 5~9회 축출), 그 사실은 여기 등록하는 자리에서 이미 알 수 있다.
+    키 개수와 상한은 둘 다 여기서 보이기 때문이다.
+    """
+    from watch import ADVANCED_PAGE_LIMIT
+
+    count = len(wanted)
+    if count <= ADVANCED_PAGE_LIMIT:
+        _advance_warned.pop(owner, None)
+        return
+    if _advance_warned.get(owner) == count:
+        return              # 같은 상태를 사이클마다 다시 알리지 않는다
+    _advance_warned[owner] = count
+    log.warning("미리 진행할 회차가 %d개인데 탭 상한이 %d장입니다 — 사전진행이 "
+                "준비 상태를 쌓았다 무너뜨리기를 반복하게 됩니다. "
+                "ADVANCED_PAGE_LIMIT을 %d 이상으로 올리세요.",
+                count, ADVANCED_PAGE_LIMIT, count)
 
 
 def forget_advance(owner_id: int | None = None) -> None:
     """등록해 둔 것을 비운다. 감시가 바뀌면 다시 적히므로 그냥 버려도 된다."""
     if owner_id is None:
         _advance_wanted.clear()
+        _advance_warned.clear()
     else:
         _advance_wanted.pop(owner_id, None)
+        _advance_warned.pop(owner_id, None)
 
 
 def advance_pending(session, *, budget_ms: float) -> dict:
@@ -993,6 +1165,9 @@ def advance_pending(session, *, budget_ms: float) -> dict:
     - **로그인하지 않는다.** 그건 좌석 사이클의 일이다. 이 소유자로 로그인돼
       있지 않으면 건너뛴다.
     - **예산에 계상한다.** 안 하면 회계 밖에서 트래픽이 늘어 429가 된다.
+    - **예산을 남겨 둔다.** 좌석 사이클이 본업이고 이건 부차적인 일이라, 남김없이
+      가져가면 정작 좌석을 보는 쪽이 굶는다(ADVANCE_BUDGET_RESERVE). 기동 직후
+      탭을 여러 장 세울 때 실제로 그렇게 됐다 — 그때는 여러 창에 나눠 세운다.
     """
     deadline = time.monotonic() + budget_ms / 1000
     out = {"advanced": 0, "reset": 0, "stale": 0, "ready": 0, "skipped": 0}
@@ -1009,7 +1184,9 @@ def advance_pending(session, *, budget_ms: float) -> dict:
         for key in sorted(wanted, key=lambda k: wanted[k]["rank"]):
             if time.monotonic() >= deadline:
                 break
-            if session.allowance() <= 0:
+            # **남김없이 가져가지 않는다.** 예산이 이만큼 밑으로 내려가면 나머지는
+            # 좌석 사이클 몫으로 두고 물러난다 — 다음 창에 이어서 세우면 된다.
+            if session.allowance() <= ADVANCE_BUDGET_RESERVE:
                 out["skipped"] += 1
                 break
             step = _advance_one(session, key, wanted[key]["ctx"], out)
@@ -2182,9 +2359,12 @@ def hold_request_mismatch(post_data, ctx: dict) -> str | None:
 def _record_hold_request(captured: dict, ctx: dict) -> None:
     """성공한 선점 요청의 형태를 파일로 남긴다. 실패해도 조용히 넘어간다.
 
-    **동작은 바꾸지 않는다.** 선점은 지금까지처럼 UI로 하고, 여기서는 그때 나간
-    요청을 들여다볼 뿐이다. 이 기록이 쌓여야 "UI를 몰지 않고 직접 부른다"를
-    설계할 수 있다 — 지금은 요청 바디가 코드 어디에도 없어 설계 자체가 불가능하다.
+    **동작은 바꾸지 않는다.** 여기서는 화면 구동으로 나간 요청을 들여다볼 뿐이다.
+
+    이 기록이 쌓여서 API 직접 선점(hold_api)이 가능해졌다 — 요청 바디가 코드
+    어디에도 없던 때는 설계 자체가 불가능했다. 그래도 계속 남긴다: CGV가 형태를
+    바꾸면 화면 구동은 그대로 돌아가면서 여기 새 모양이 찍히고, 그게 hold_body를
+    고칠 근거가 된다.
     """
     req = captured.get("request")
     if not req:
@@ -2219,6 +2399,213 @@ def _record_hold_request(captured: dict, ctx: dict) -> None:
         log.info("선점 요청의 형태를 남겼습니다: %s", path)
     except Exception as exc:  # noqa: BLE001 - 관찰 실패로 선점을 망치지 않는다
         log.debug("선점 요청을 기록하지 못했습니다: %s", exc)
+
+
+# 걸러 낼 정적 파일. **PG 화면이 통째로 딸려 온다.** 실제 관측에서 57건 중 30건이
+# onepg의 css·js·폰트·아이콘이었고, 그것들이 파일을 454KB로 부풀리면서 정작 읽어야
+# 할 요청과 같은 예산을 나눠 썼다. 주소가 결제 도메인인 것과 결제 요청인 것은 다르다.
+PAY_SPEC_SKIP_SUFFIXES = (
+    ".css", ".js", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".map",
+)
+
+
+def pay_spec_match(url: str) -> bool:
+    """그 주소를 결제 관측에 남길지. 결제 흐름 밖은 담지 않는다."""
+    text = str(url or "")
+    if any(mark in text for mark in PAY_SPEC_SKIP_MARKS):
+        return False
+    if not any(mark in text for mark in PAY_SPEC_URL_MARKS):
+        return False
+    # 쿼리·조각을 떼고 확장자를 본다 — `style.css?v=3` 같은 것이 흔하다.
+    path = text.split("?", 1)[0].split("#", 1)[0].lower()
+    return not path.endswith(PAY_SPEC_SKIP_SUFFIXES)
+
+
+def mask_url_secrets(url: str) -> str:
+    """주소의 쿼리에 실린 자격증명을 가린다. 경로와 나머지 값은 그대로 둔다.
+
+    **GET 요청은 신원을 쿼리로 나른다.** 헤더와 본문만 가리면 가린 줄 알고 안
+    가려진다 — 실제 관측(2026-09-07)에서 `searchImdtlDcList?…&custNo=118012814`가
+    그대로 남았다.
+
+    가리는 기준은 본문과 같다(SECRET_HINTS). coCd·siteNo·scnYmd처럼 형태 그
+    자체인 값은 남는다.
+    """
+    text = str(url or "")
+    if "?" not in text:
+        return text
+    try:
+        import urllib.parse as _up
+
+        head, _, tail = text.partition("?")
+        query, sep, frag = tail.partition("#")
+        parts = []
+        for pair in query.split("&"):
+            if not pair:
+                continue
+            name, eq, value = pair.partition("=")
+            if eq and value and _is_secret(_up.unquote(name)):
+                parts.append(f"{name}=({len(_up.unquote(value))}자 가림)")
+            else:
+                parts.append(pair)
+        return head + "?" + "&".join(parts) + (sep + frag if sep else "")
+    except Exception:  # noqa: BLE001 - 못 가리면 주소를 통째로 접는다
+        return text.split("?", 1)[0] + "?(가림)"
+
+
+def _pay_spec_body(text, limit: int = PAY_SPEC_BODY_LIMIT) -> str | None:
+    """본문을 남길 수 있는 크기로 자른다. 잘랐으면 그 사실을 적는다."""
+    if text is None:
+        return None
+    raw = str(text)
+    if len(raw) <= limit:
+        return raw
+    return raw[:limit] + f"… (뒤 {len(raw) - limit}자 자름)"
+
+
+def mask_secrets_deep(value, _depth: int = 0):
+    """mask_secrets와 같되, **JSON을 담고 있는 문자열 안까지** 들어가 가린다.
+
+    이게 없으면 가린 줄 알고 안 가려진다. 실제 결제 요청의 `paymInfoCont`는
+    12KB짜리 JSON을 **문자열 하나로** 담고 있어서(2026-09-07 관측), 바깥만 훑는
+    mask_secrets는 그 안의 이름·휴대폰번호·회원번호를 그대로 통과시켰다.
+
+    가린 뒤 **다시 문자열로 되돌린다.** 객체로 펴 두면 읽기는 편하지만 "이 필드는
+    JSON 문자열이다"라는 사실이 사라지는데, 나중에 이 요청을 우리가 만들 때
+    정확히 그 사실이 필요하다.
+    """
+    import json as _json
+
+    if _depth > 12:                      # 도는 구조를 만나도 멈춘다
+        return value
+    if isinstance(value, dict):
+        return {k: (f"(가림: {len(str(v))}자)" if _is_secret(k)
+                    else mask_secrets_deep(v, _depth + 1))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [mask_secrets_deep(v, _depth + 1) for v in value]
+    if isinstance(value, str):
+        head = value.lstrip()[:1]
+        if head in ("{", "["):
+            try:
+                inner = _json.loads(value)
+            except ValueError:
+                return value
+            if isinstance(inner, (dict, list)):
+                return _json.dumps(mask_secrets_deep(inner, _depth + 1),
+                                   ensure_ascii=False)
+    return value
+
+
+def _pay_spec_limit(url: str) -> int:
+    """그 주소의 본문을 얼마까지 남길지. 결제 화면 문서만 넉넉하다."""
+    return (PAY_SPEC_DOC_LIMIT if str(url or "").endswith(PAY_MAIN_PAGE)
+            else PAY_SPEC_BODY_LIMIT)
+
+
+def _pay_spec_json(text, limit: int = PAY_SPEC_BODY_LIMIT):
+    """본문이 JSON이면 자격증명을 가린 구조로, 아니면 잘린 문자열로.
+
+    구조를 남겨야 하는 이유는 선점 때와 같다 — 나중에 이 요청을 우리가 만들려면
+    **키와 중첩 모양**을 알아야 한다. 값은 가려도 되지만 형태는 아니다.
+    """
+    import json as _json
+
+    if text is None:
+        return None
+    try:
+        return mask_secrets_deep(_json.loads(text))
+    except (ValueError, TypeError):
+        return _pay_spec_body(text, limit)
+
+
+def watch_pay_requests(page, entries: list):
+    """결제 화면이 주고받는 것을 `entries`에 모은다. (핸들러 둘)을 돌려준다.
+
+    **관찰 전용이다.** 여기서 손대는 것은 없고, 무슨 일이 나도 결제에는 영향이
+    없어야 한다 — 그래서 모든 곳이 try로 감싸여 있고 실패하면 그냥 안 남긴다.
+
+    응답 본문까지 읽는 이유: 나중에 결제를 API로 하려면 "무엇을 보내는가"만으로는
+    모자란다. 앞 응답에서 받은 값을 다음 요청에 실어야 하는 자리가 있을 텐데,
+    요청만 모아 두면 그 연결을 영영 알 수 없다. 대신 주소를 좁게 걸고 본문을
+    잘라(PAY_SPEC_BODY_LIMIT) 결제가 느려지지 않게 한다.
+    """
+    def on_req(r):
+        try:
+            if len(entries) >= PAY_SPEC_MAX_ENTRIES or not pay_spec_match(r.url):
+                return
+            entries.append({
+                "쪽": "요청", "url": mask_url_secrets(r.url), "method": r.method,
+                "headers": mask_secrets(dict(r.headers or {})),
+                "body": _pay_spec_json(r.post_data),
+            })
+        except Exception:  # noqa: BLE001 - 관찰이 결제를 깨뜨리면 안 된다
+            pass
+
+    def on_resp(r):
+        try:
+            if len(entries) >= PAY_SPEC_MAX_ENTRIES or not pay_spec_match(r.url):
+                return
+            try:
+                text = r.text()
+            except Exception:  # noqa: BLE001 - 아직 못 읽는 응답은 건너뛴다
+                text = None
+            entries.append({
+                "쪽": "응답", "url": mask_url_secrets(r.url), "status": r.status,
+                "body": _pay_spec_json(text, _pay_spec_limit(r.url)),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+    page.on("request", on_req)
+    page.on("response", on_resp)
+    return on_req, on_resp
+
+
+def record_pay_spec(entries: list, ctx: dict, *, method: str,
+                    error: str | None, got_bridge: bool) -> str | None:
+    """한 번의 결제 시도에서 오간 것을 파일로 남긴다. 실패해도 조용히 넘어간다.
+
+    **동작은 바꾸지 않는다.** 결제는 지금까지처럼 화면으로 하고, 여기서는 그때
+    오간 것을 들여다볼 뿐이다.
+
+    이 기록이 쌓여야 "화면을 몰지 않고 결제를 요청한다"를 설계할 수 있다. 선점이
+    정확히 그 길을 지나왔다 — 요청 형태가 코드 어디에도 없던 때는 설계 자체가
+    불가능했고, logs/holdspec/이 쌓이고 나서야 hold_api를 추측 없이 만들 수 있었다.
+
+    **실패한 시도도 남긴다.** 어디까지 갔다가 무엇에서 멎었는지가 형태만큼이나
+    중요한 단서다 — 성공만 모으면 실패 응답의 모양을 영영 못 본다.
+    """
+    if not entries:
+        return None
+    try:
+        import json as _json
+
+        PAY_SPEC_DIR.mkdir(parents=True, exist_ok=True)
+        record = {
+            "관측시각": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "결제수단": method,
+            "성공": error is None and got_bridge,
+            "오류": error,
+            "브릿지응답": got_bridge,
+            # 어떤 상황의 결제인지 — 바디의 값이 무엇과 맞는지 대조하려면 있어야 한다.
+            "party": ctx.get("party"),
+            "seats": list(ctx.get("seat_labels") or []),
+            "scn_ymd": ctx.get("scn_ymd"),
+            "start_hhmm": ctx.get("start_hhmm"),
+            "site_nm": ctx.get("site_nm"),
+            "오간것": entries,
+        }
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = PAY_SPEC_DIR / f"{stamp}_pay.json"
+        path.write_text(_json.dumps(record, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        log.info("결제 흐름의 형태를 남겼습니다 (%d건): %s", len(entries), path)
+        return str(path)
+    except Exception as exc:  # noqa: BLE001 - 관찰 실패로 결제를 망치지 않는다
+        log.debug("결제 흐름을 기록하지 못했습니다: %s", exc)
+        return None
 
 
 def hold_block(session, ctx: dict) -> dict:
@@ -2296,6 +2683,19 @@ def hold_block(session, ctx: dict) -> dict:
 
     page.on("response", on_resp)
     page.on("request", on_req)
+    # **결제까지 갈 감시라면 여기서부터 관찰한다.** 결제 요청에 실리는 가격 정보
+    # (paymInfoCont의 mov.sellProductsList)가 선점 단계에서 조회되므로, pay_block이
+    # 리스너를 붙일 때는 이미 지나간 뒤다 — 실제 관측에서 그게 통째로 빠졌다.
+    #
+    # 결제를 안 하는 선점에는 걸지 않는다. 여기는 초를 다투는 구간이라, 쓰지도
+    # 않을 관측으로 응답 본문을 읽을 이유가 없다.
+    spec = ctx.setdefault("_pay_spec", []) if ctx.get("auto_pay") else None
+    spec_handlers = None
+    if spec is not None:
+        try:
+            spec_handlers = watch_pay_requests(page, spec)
+        except Exception as exc:  # noqa: BLE001 - 못 걸어도 선점은 그대로 간다
+            log.debug("선점 단계 관찰을 걸지 못했습니다: %s", exc)
     # 이 한 주소만 가로챈다 — 좁게 걸어야 나머지 요청에 값이 붙지 않는다.
     routed = False
     try:
@@ -2436,6 +2836,12 @@ def hold_block(session, ctx: dict) -> dict:
                 page.remove_listener(event, handler)
             except Exception:  # noqa: BLE001
                 pass
+        if spec_handlers:
+            for event, handler in zip(("request", "response"), spec_handlers):
+                try:
+                    page.remove_listener(event, handler)
+                except Exception:  # noqa: BLE001
+                    pass
         if routed:
             try:
                 page.unroute(f"**/{SEAT_HOLD_URL_MARK}", on_route)
@@ -2482,6 +2888,1252 @@ def hold_block(session, ctx: dict) -> dict:
     detail = f" (화면: {shot})" if shot else ""
     return {"ok": False, "error": f"선점 응답을 확인하지 못했습니다{detail}",
             "seat_labels": chosen}
+
+
+# ── API 직접 선점 (hold_mode = 'api') ───────────────────────────────────────
+def hold_body(ctx: dict, identity: dict, chosen: list[dict]) -> dict:
+    """seatTempPrmp에 보낼 요청 바디를 만든다. 순수 함수 — 브라우저를 모른다.
+
+    ctx: hold_block이 받는 것과 같다(scn_ymd·site_no·row·party…).
+    identity: CgvSession.identity()가 준 {"cust_no", "cusgd_cd"}.
+    chosen: seats.pick_block이 고른 좌석 dict들 — 좌석 식별자가 그대로 들어 있다.
+
+    **이 함수가 UI 경로가 하던 일을 대신한다.** 지금까지는 CGV의 JS가 이 바디를
+    만들었고 우리는 응답만 가로챘다. 그래서 형태를 몰라 직접 부를 수가 없었는데,
+    성공한 요청을 기록해 두기 시작하면서(`_record_hold_request` → logs/holdspec/)
+    필드가 전부 드러났다. 여기 있는 값은 전부 그 관측에서 온 것이고, 추측으로
+    채운 자리는 없다.
+    """
+    scns_no, scn_sseq = showtime_ids(ctx.get("row"))
+    row = ctx.get("row") or {}
+    seats_out = []
+    for seat in chosen:
+        item = {}
+        for field, key in HOLD_SEAT_FIELDS:
+            value = str(seat.get(key) or "").strip()
+            if not value:
+                raise ValueError(
+                    f"좌석 {seat.get('label') or '?'}의 {field}를 좌석맵에서 "
+                    f"읽지 못했습니다 — 그 자리는 API로 지정할 수 없습니다")
+            item[field] = value
+        seats_out.append(item)
+    if not seats_out:
+        raise ValueError("선점할 좌석이 없습니다")
+
+    return {
+        "coCd": CO_CD,
+        **HOLD_FIXED_FIELDS,
+        "siteNo": str(row.get("siteNo") or ctx.get("site_no") or ""),
+        "scnYmd": str(ctx.get("scn_ymd") or ""),
+        "scnsNo": scns_no,
+        "scnSseq": scn_sseq,
+        "custNo": identity["cust_no"],
+        "cusgdCd": identity.get("cusgd_cd") or "01",
+        "seatPrmpDataList": seats_out,
+    }
+
+
+def hold_api(session, ctx: dict) -> dict:
+    """UI를 몰지 않고 seatTempPrmp를 직접 불러 좌석을 선점한다.
+
+    hold_block과 **같은 것을 돌려준다**({ok, seat_labels, mov_atkt_no,
+    hold_expires_at, amount, error}) — 호출자(try_auto_book)는 둘을 구분하지 않는다.
+
+    한 번에 하는 일이 둘뿐이다: 좌석맵을 지금 다시 읽고(0.2~0.3초), POST 한 번.
+    화면 진입·회차 클릭·대기열·팝업 닫기·좌석 클릭·결제하기가 통째로 빠진다.
+
+    **화면이 없으니 화면으로 하던 확인도 없다.** UI 경로는 "이 탭이 정말 그
+    회차인가"를 몰라 나가는 요청을 관문에서 검사했는데(hold_request_mismatch),
+    여기서는 그 요청을 **우리가 만든다** — 그래도 같은 관문을 통과시킨다. 바디를
+    만드는 코드와 검사하는 코드가 따로 있어야, 한쪽이 틀렸을 때 다른 쪽이 잡는다.
+
+    **결제 화면으로는 이어지지 않는다.** 선점은 세션(쿠키)에 걸리지만 결제 UI는
+    그 탭의 SPA 상태를 타고 가므로, 여기서 잡은 좌석은 사람이 CGV 앱/웹의 '진행
+    중인 예매'에서 마친다. 그래서 이 방식에서는 자동 결제를 켤 수 없다(store).
+    """
+    steps = _Steps()
+    party = max(1, int(ctx.get("party") or 1))
+    # 좌석맵에 닿기 전에 죽으면 감지 때 고른 후보가 곧 '시도한 좌석'이다.
+    chosen_labels = list(ctx.get("seat_labels") or [])
+
+    try:
+        identity = session.identity()
+        steps.mark("신원")
+        # **좌석은 여기서 다시 고른다.** 감지와 선점 사이에 팔릴 수 있는 건 UI
+        # 경로와 똑같다 — 다만 그 사이가 2.6초가 아니라 0.3초다.
+        live = live_seats(session, ctx)
+        steps.mark("좌석맵")
+        block = seats_mod.pick_block(live, party, ctx.get("rows"),
+                                     ctx.get("num_from") or 0,
+                                     ctx.get("num_to") or 0)
+        if len(block) < party:
+            return {"ok": False, "seat_labels": [],
+                    "error": f"{party}석 연속 빈자리가 사라졌습니다 "
+                             f"(좌석맵을 다시 읽었습니다)"}
+        labels = [s["label"] for s in block]
+        if labels != chosen_labels:
+            log.info("좌석을 다시 골랐습니다: %s → %s",
+                     ", ".join(chosen_labels) or "(없음)", ", ".join(labels))
+        chosen_labels = labels
+        body = hold_body(ctx, identity, block)
+        steps.mark("좌석고르기")
+    except Exception as exc:  # noqa: BLE001 - 여기까지는 아무것도 나가지 않았다
+        log.warning("API 선점을 준비하지 못했습니다: %s", exc)
+        return {"ok": False, "seat_labels": chosen_labels,
+                "error": f"API 선점 준비 실패: {exc}"}
+
+    # 만든 요청을 UI 경로와 **같은 관문**에 통과시킨다. 여기 걸린다는 건 바디를
+    # 만드는 쪽과 ctx가 어긋났다는 뜻이라, 보내면 엉뚱한 회차를 잡는다.
+    reason = hold_request_mismatch(body, ctx)
+    if reason:
+        log.error("만든 선점 요청이 의도와 다릅니다 — %s (의도: %s %s, 좌석 %s)",
+                  reason, ctx.get("scn_ymd"), ctx.get("start_hhmm"), chosen_labels)
+        return {"ok": False, "seat_labels": chosen_labels,
+                "error": f"의도한 회차가 아니어서 선점을 보내지 않았습니다 — {reason}"}
+
+    try:
+        out = session.post_json(EP_SEAT_HOLD, body)
+    except Exception as exc:  # noqa: BLE001 - 401·429·드라이버 오류 모두
+        log.warning("API 선점 요청 실패: %s", exc)
+        return {"ok": False, "seat_labels": chosen_labels,
+                "error": f"API 선점 요청 실패: {exc}"}
+    finally:
+        steps.mark("선점")
+        log.info("자동 예매 소요(API) — %s", steps.summary())
+
+    payload = out.get("body")
+    if not isinstance(payload, dict):
+        return {"ok": False, "seat_labels": chosen_labels,
+                "error": f"선점 응답을 읽지 못했습니다 (HTTP {out.get('status')}): "
+                         f"{(out.get('text') or '')[:120]}"}
+    data = payload.get("data") or {}
+    if isinstance(data, dict) and data.get("resultCode") in ("0", 0):
+        # 결제가 이 좌석의 식별자를 다시 쓴다. 좌석맵을 또 읽지 않도록 남긴다 —
+        # 우리가 방금 잡았으니 그 사이 바뀔 수 있는 값도 아니다.
+        ctx["_held_seats"] = block
+        ctx["mov_atkt_no"] = data.get("movAtktNo")
+        return {
+            "ok": True,
+            "seat_labels": chosen_labels,
+            "mov_atkt_no": data.get("movAtktNo"),
+            "hold_expires_at": _parse_limit_dt(data.get("seatTempPrmpLimitDt")),
+            "amount": None,   # UI 경로와 같다 — 금액은 여기서 안 온다
+        }
+    # CGV는 실패 사유를 본문에 담아 준다("존재하지 않는 좌석 위치 번호" 등).
+    # 그 문구가 곧 사용자에게 전할 말이라, 우리 말로 바꾸지 않고 그대로 싣는다.
+    detail = str(payload.get("statusMessage") or "").strip()
+    if isinstance(data, dict) and data.get("resultMessage"):
+        detail = str(data["resultMessage"]).strip() or detail
+    return {"ok": False, "seat_labels": chosen_labels,
+            "error": f"선점이 거절됐습니다 (HTTP {out.get('status')})"
+                     + (f" — {detail}" if detail else "")}
+
+
+def hold_mode(watch: dict) -> str:
+    """이 감시가 어느 방식으로 선점하는지. 모르는 값이면 화면 구동으로 본다.
+
+    **모르면 안전한 쪽으로 떨어진다.** 오래된 행이나 손으로 넣은 값이 'api'가
+    아니라면 지금까지 쓰던 길로 간다.
+    """
+    return (HOLD_MODE_API
+            if str(watch.get("hold_mode") or "").strip().lower() == HOLD_MODE_API
+            else HOLD_MODE_UI)
+
+
+def hold_for(watch: dict):
+    """그 감시의 선점 함수. try_auto_book이 hold_fn을 안 받았을 때 쓴다."""
+    return hold_api if hold_mode(watch) == HOLD_MODE_API else hold_block
+
+
+def pay_for(watch: dict):
+    """그 감시의 결제 함수. 선점 방식과 짝을 맞춘다.
+
+    **섞을 수 없다.** UI로 잡은 선점은 그 탭의 화면 상태를 타고 결제로 이어지고,
+    API로 잡은 선점은 그 상태가 없다. 반대로 API 결제는 선점이 남긴 좌석
+    식별자(`_held_seats`)를 쓰는데 UI 경로는 그것을 남기지 않는다.
+    """
+    return pay_api if hold_mode(watch) == HOLD_MODE_API else pay_block
+
+
+# ── API 결제 (설계 중) ──────────────────────────────────────────────────────
+# **아직 보내지 않는다.** 여기 있는 것은 결제 요청을 우리 손으로 만들어 보고,
+# 실제로 CGV가 보낸 것과 **대조만** 하는 코드다(compare_pay_body). 차이가 0이 되는
+# 것을 여러 예매에서 확인한 뒤에야 실제로 보낼지 정한다.
+#
+# **왜 이렇게 조심하는가.** paymInfoCont는 PG 콜백이 매출을 만들 때 읽는 판매정보다.
+# 이게 틀리면 사용자가 카카오페이 승인을 누른 뒤 CGV가 판매정보를 못 읽는다 —
+# **돈은 나가고 표는 안 나온다.** 선점은 틀려도 좌석을 못 잡고 마는 것과 무게가
+# 다르다. 그래서 "만들어서 보낸다"가 아니라 "만들어서 맞는지 본다"부터 한다.
+#
+# 필드의 출처는 logs/payspec/ 관측 5건에서 확정했다:
+#   상영표(searchSchByMov)     prodNo·prodNm·prdcmpTypCd·movfNo·scnendTm·scnsNm …
+#   좌석맵(searchIfSeatData)   seatLocNo·szoneNo·stkndCd·sbordNo·seatRowNm …
+#   가격(searchMovAtktSeatPrcList)  salAmt·scnAmt·tcsvcAmt·sasvcAmt
+#   선점 응답                  movAtktNo
+#   토큰                       custNo·cusgdCd·userId
+PAY_KAKAO_PAYKND_CD = "1007"        # 카카오페이(온라인)
+PAY_KAKAO_METHOD = "kakaoCert"
+PAY_MRCH_CLS_CD = "1001"
+
+# 좌석 하나를 ticketProducts로 옮길 때 쓰는 짝: 결제 바디의 키 ← 좌석맵(parse_seats)의 키.
+PAY_TICKET_FROM_SEAT = (
+    ("seatLocNo", "seat_loc_no"), ("szoneNo", "szone_no"),
+    ("szoneCd", "szone_no"), ("stkndCd", "stknd_cd"),
+    ("seatAreaNo", "seat_area_no"), ("szoneKindCd", "szone_kind_cd"),
+    ("seatSalfrmCd", "seat_salfrm_cd"), ("sbordNo", "sbord_no"),
+    ("seatNo", "no"), ("seatRowNm", "row"),
+    # 코드가 아니라 이름으로 싣는 자리들.
+    ("stkndNm", "kind"), ("szoneNm", "zone"),
+    ("szoneKindNm", "szone_kind_nm"), ("hrzoneCd", "hrzone_cd"),
+)
+# 상영표 한 줄에서 그대로 옮겨 오는 것들. 실측에서 이름도 값도 같았다.
+PAY_TICKET_FROM_ROW = (
+    "siteNo", "scnsNo", "scnSseq", "scnsrtTm", "scnendTm",
+    "movNo", "movTirCd", "movfNo", "movkndCd",
+    "salsTznCd", "sascnsGradCd", "tcscnsGradCd", "siteGradCd", "prcrulDivCd",
+    "vatincYn", "speclIndctTypCd", "movEtcAttrCd", "videoAddexpCd",
+)
+# 상영 구분. 상영표를 부를 때 우리가 넣는 값과 같다(watch.EP_SCHEDULE).
+# 상영표 응답에는 안 실려 오므로 여기서 다시 적는다.
+PAY_RTCTL_SCOP_CD = "08"
+# 포스터 주소. 상영표는 `prodImg`를 null로 주고 경로 조각만 준다(physcFilePathnm)
+# — 번들의 조립 코드와 같은 방식으로 우리가 붙인다.
+PAY_POSTER_PREFIX = "https://cdn.cgv.co.kr/cgvpomsfilm/Movie/Thumbnail/Poster/"
+# `hrzoneCd`는 **판매시간대코드(salsTznCd)와 같은 값이다.** 관측 10건 · 좌석 21개
+# 전부에서 일치했고, 서로 다른 두 값('01'과 '24')이 모두 그랬다.
+#
+# 찾는 데 애를 먹었다. 이름이 `hrzone`이라 구역(zone) 코드로 보이는데, 그 말은
+# 좌석맵에도 예매정보에도 가격 조회에도 없고 예매·결제 화면 번들(138개 청크)
+# 어디에도 없다. 처음엔 "01"이 상수인 줄 알았다 — 관측 8건이 그랬다. 9번째
+# 관측(다른 회차)이 '24'를 내면서 틀렸다는 게 드러났고, 응답 중 값이 '24'인
+# 필드를 전수로 훑어서야 salsTznCd가 나왔다.
+#
+# **좌석이 아니라 회차의 속성이다.** 처음에 좌석(J열)이 달라서 값이 달라진 줄
+# 알았는데, 실은 그 관측이 다른 회차였다. 좌석 단위로 넘겨짚었으면 같은 회차의
+# 다른 좌석에서 또 틀렸을 것이다.
+
+
+def pay_poster_url(row: dict) -> str | None:
+    """상영표의 경로 조각으로 포스터 주소를 만든다. 조각이 없으면 None."""
+    tail = _row_get(row, "physcFilePathnm")
+    return f"{PAY_POSTER_PREFIX}{tail}" if tail else None
+
+
+def _row_get(row: dict, *names):
+    """상영표 줄에서 이름이 여럿일 수 있는 값을 꺼낸다. 없으면 None."""
+    for name in names:
+        if row.get(name) not in (None, ""):
+            return row[name]
+    return None
+
+
+def pay_ticket_product(seat: dict, row: dict, price: dict, mov_atkt_no: str) -> dict:
+    """좌석 하나에 대응하는 ticketProducts 조각. 순수 함수.
+
+    좌석맵·상영표·가격 조회가 각각 한 조각씩 준다. 어느 값이 어디서 왔는지가
+    분명해야, 대조에서 어긋났을 때 어느 조회를 고쳐야 하는지 알 수 있다.
+    """
+    out = {field: str(seat.get(key) or "") for field, key in PAY_TICKET_FROM_SEAT}
+    for field in PAY_TICKET_FROM_ROW:
+        out[field] = _row_get(row, field)
+    out["scnYmd"] = str(row.get("scnYmd") or "")
+    out["scnTm"] = _row_get(row, "scnsrtTm", "scnTm")
+    out["rtctlScopCd"] = PAY_RTCTL_SCOP_CD
+    # **상영관 이름과 영화 이름은 '전시용'을 쓴다.** ticketProducts.movNm은
+    # 상영표의 movNm(원제)이 아니라 prodNm("…(SCREENX 2D)")이었다 — 관측 확인.
+    out["movNm"] = _row_get(row, "prodNm", "movNm")
+    out["scnsNm"] = _row_get(row, "expoScnsNm", "scnsNm")
+    # ticketProducts의 rlsYmd는 개봉일이 아니라 **상영일**이다(실측: scnYmd와 같다).
+    out["rlsYmd"] = str(row.get("scnYmd") or "")
+    out["prodBnduNm"] = "일반"
+    out["hrzoneCd"] = _row_get(row, "salsTznCd")
+    out["itgrScnsGradCd"] = _row_get(row, "scnsGradCd")
+    for field in ("smtScnRepYn", "smtScnNo", "smtScnYn"):
+        out[field] = None
+    out["movAtktNo"] = mov_atkt_no
+    for field in ("salAmt", "scnAmt", "tcsvcAmt", "sasvcAmt"):
+        out[field] = price.get(field)
+    out["rtktAmt"] = price.get("salAmt")
+    out["prodBnduCd"] = price.get("prodBnduCd") or "01"
+    return out
+
+
+def pay_sell_product(seat: dict, row: dict, price: dict, mov_atkt_no: str,
+                     site_no: str) -> dict:
+    """sellProductsList 한 칸 — 좌석 하나가 상품 하나다(salQty 1)."""
+    return {
+        "bzplcTypCd": "01",
+        "dblfrNo": None, "dblfrYn": None, "cxprdYn": "N", "dblfrProducts": None,
+        "prodImg": pay_poster_url(row),
+        "dcAmt": 0, "giftYn": "N",
+        "movAtktNo": mov_atkt_no,
+        "parntGrpProdNo": None,
+        "prcrulDivCd": _row_get(row, "prcrulDivCd"),
+        "prdcmpTypCd": _row_get(row, "prdcmpTypCd"),
+        "prddtlTypCd": _row_get(row, "prddtlTypCd"),
+        "prdtypCd": _row_get(row, "prdtypCd"),
+        "prodNm": _row_get(row, "prodNm", "movNm"),
+        "prodNo": _row_get(row, "prodNo"),
+        "prodPrc": price.get("salAmt"),
+        "salAmt": price.get("salAmt"),
+        "salQty": 1,
+        # 출처를 아직 못 찾은 셋. 실측값은 siteNo에서 파생된 모양이지만
+        # (0013 → 0013001 · 0013021) 규칙인지 우연인지 모른다 — 대조가 말해 준다.
+        # bzplcNo는 상영표가 그대로 준다. selStoNo만 출처를 못 찾았다 —
+        # 실측값이 siteNo에서 파생된 모양이라 그렇게 두고 대조에 맡긴다.
+        "selBzplcNo": _row_get(row, "bzplcNo"),
+        "selSiteNo": site_no,
+        "selStoNo": f"{site_no}021",
+        "ticketProducts": pay_ticket_product(seat, row, price, mov_atkt_no),
+        "generalProducts": None, "cmpProductsList": None,
+        "speclIndctTypCd": _row_get(row, "speclIndctTypCd"),
+        "vatincYn": _row_get(row, "vatincYn"),
+        "hotdlNo": None, "hotdlTypCd": "02",
+    }
+
+
+def pay_mov_block(ctx: dict, identity: dict, seats: list[dict],
+                  prices: list[dict], mov_atkt_no: str,
+                  adnc: dict | None = None) -> dict:
+    """paymInfoCont의 `mov` — 이 예매가 무엇을 파는지.
+
+    seats와 prices는 seatLocNo로 짝지어진다. 순서를 믿지 않는다 — 가격 조회가
+    좌석 순서를 지킨다는 보장이 없고, 어긋나면 값이 조용히 뒤바뀐다.
+    """
+    row = ctx.get("row") or {}
+    site_no = str(row.get("siteNo") or ctx.get("site_no") or "")
+    by_loc = {str(p.get("seatLocNo")): p for p in prices}
+    products = [
+        pay_sell_product(seat, row, by_loc.get(str(seat.get("seat_loc_no")), {}),
+                         mov_atkt_no, site_no)
+        for seat in seats
+    ]
+    total = sum(int(p.get("salAmt") or 0) for p in products)
+    seat0 = seats[0] if seats else {}
+    out = {
+        "cratgClsCd": _row_get(row, "cratgClsCd"),
+        "prodImg": pay_poster_url(row),
+        "bzplcNo": _row_get(row, "bzplcNo"),
+        "bzplcTypCd": "01",
+        "cpnTypCd": "0",
+        "cxprdYn": _row_get(row, "cxprdYn"),
+        "cjAempYn": "N", "cntCgvAempYn": "N", "cntCjAempYn": "N",
+        "cmpProductsList": None, "dblfrProducts": None,
+        # 좌석마다 한 칸씩, 할인이 없으면 전부 null이다.
+        "discountDatas": [None] * len(seats),
+        # 권종별 매수. 지금은 일반 한 종뿐이다.
+        "movDtlKindsList": [{"cratgClsNm": "일반", "atktQty": str(len(seats)),
+                             "prodBnduCd": "01"}],
+        # 좌석 종류·구역은 첫 좌석 것을 대표로 싣는다(실측).
+        "stkndCd": str(seat0.get("stknd_cd") or ""),
+        "szoneKindCd": str(seat0.get("szone_kind_cd") or ""),
+        "itgrScnsGradCd": _row_get(row, "scnsGradCd"),
+        # 좌석 만료 안내를 띄운 시각. 화면이 만드는 값이라 대조에서 뺀다.
+        "szoneExpTm": datetime.now().strftime("%Y%m%d%H%M%S"),
+        # vatincYn은 **키 자체가 없다.** 상영표는 "Y"를 주지만 mov 층에는 싣지
+        # 않는다(실측). null로 넣는 것과 키가 없는 것은 다르다.
+        "prodNo": _row_get(row, "prodNo"),
+        "movNo": _row_get(row, "movNo"),
+        "movNm": _row_get(row, "prodNm", "movNm"),
+        "orgMovNm": _row_get(row, "movNm"),
+        "scnNm": _row_get(row, "expoScnsNm", "scnsNm"),
+        "expoScnsNm": _row_get(row, "expoScnsNm", "scnsNm"),
+        "rtctlScopCd": PAY_RTCTL_SCOP_CD,
+        "nmbrCrtf": None, "dblfrNo": None, "dblfrYn": "N",
+        "movEtcAttrCd": _row_get(row, "movEtcAttrCd"),
+        "videoAddexpCd": _row_get(row, "videoAddexpCd"),
+        "scnYmd": str(ctx.get("scn_ymd") or ""),
+        "scnsNo": str(row.get("scnsNo") or ""),
+        "scnSseq": str(row.get("scnSseq") or ""),
+        "siteNo": site_no,
+        "sellProductsList": products,
+        "sumSalAmt": total,
+        "amountTotal": "0",          # 실측에서 늘 문자열 "0"이었다
+        "bnduQty": str(len(products)),
+        "custNo": identity.get("cust_no"),
+        "prodBnduCd": "01",
+        "sachlTypCd": "01",
+    }
+    for field in ("prcrulDivCd", "prdcmpTypCd", "prddtlTypCd", "prdtypCd",
+                  "movfNo", "movkndCd", "movTirCd", "salsTznCd",
+                  "sascnsGradCd", "tcscnsGradCd", "siteGradCd",
+                  "movkndDsplEnm", "srvltKindCd"):
+        out[field] = _row_get(row, field)
+    # 개봉일과 영진위 영화코드는 **회차 예매 정보에만** 있다 — 상영표에도
+    # 카탈로그에도 없어서 조회가 한 번 더 든다(CgvSession.adnc_seat_info).
+    for field in ("koficMovfCd", "rlsYmd"):
+        out[field] = (adnc or {}).get(field)
+    # 상영 시간은 "09:00~11:35" 꼴이다 — 상영표는 '0900'·'1135'로 준다.
+    start, end = _row_get(row, "scnsrtTm"), _row_get(row, "scnendTm")
+    out["scnTm"] = (f"{_fmt_hhmm(start)}~{_fmt_hhmm(end)}"
+                    if start and end else None)
+    return out
+
+
+def pay_amounts(total: int) -> dict:
+    """총액에서 부가세·과세분을 가른다.
+
+    실측 3건(28,000 · 20,000 · 45,000)에서 규칙이 같았다: 부가세는 총액의 1/11을
+    반올림한 값이고 과세분은 나머지다. 영화표는 전액 과세라 면세분은 0이다.
+    """
+    total = int(total or 0)
+    vat = round(total / 11)
+    return {"amountTotal": total, "amountVat": vat,
+            "amountTax": total - vat, "amountTaxFree": 0}
+
+
+def pay_verify_no(length: int = 26) -> str:
+    """결제 대조번호(paymVrifyNo). **클라이언트가 만드는 난수다.**
+
+    CGV가 주는 값이 아니라 화면이 지어내서 판매정보와 리다이렉트 주소 양쪽에
+    싣고, 돌아올 때 같은 값인지로 그 결제가 우리 것인지 가린다. 실측 5건이 모두
+    26자 영숫자였다.
+
+    `secrets`를 쓴다 — 남이 맞힐 수 있으면 대조번호의 뜻이 없어진다.
+    """
+    import secrets
+    import string
+
+    pool = string.ascii_letters + string.digits
+    return "".join(secrets.choice(pool) for _ in range(length))
+
+
+def pay_goods_name(ctx: dict) -> str:
+    """결제창에 뜨는 상품명 — "영화명(상영형태) 극장명" (실측)."""
+    row = ctx.get("row") or {}
+    title = _row_get(row, "prodNm", "movNm") or ctx.get("mov_nm") or ""
+    return f"{title} {ctx.get('site_nm') or ''}".strip()
+
+
+def pay_id_body(ctx: dict, identity: dict, total: int, count: int,
+                today: str | None = None) -> dict:
+    """`commonGetPayId` 요청 — 결제번호(paymNo)를 받아 오는 첫 걸음.
+
+    userId·userName은 **가리지 않은 값**이 들어간다(실측). 토큰 안 JWT가 준다.
+    """
+    row = ctx.get("row") or {}
+    amounts = pay_amounts(total)
+    return {
+        "coCd": CO_CD,
+        "siteCode": str(row.get("siteNo") or ctx.get("site_no") or ""),
+        "mrchClsCd": PAY_MRCH_CLS_CD,
+        "sachlTypCd": "01",
+        "rvpayYn": "N",
+        "amountTotal": amounts["amountTotal"],
+        "totpayFee": 0,
+        "amountVat": 0, "amountTaxFree": 0, "amountTax": 0,
+        "saleDt": today or datetime.now(KST).strftime("%Y%m%d"),
+        "goodsName": pay_goods_name(ctx),
+        "goodsCnt": str(count),
+        "userId": identity.get("user_id") or "",
+        "userName": identity.get("user_nm") or "",
+    }
+
+
+def pay_auth_body(paym_no: str, verify_no: str, total: int, *,
+                  user_phone: str | None, host: str = BASE_ORIGIN,
+                  today: str | None = None) -> dict:
+    """`onlineAuthRequestReserve` 요청 — 이걸 보내면 결제창 주소가 돌아온다.
+
+    번들의 조립 코드를 그대로 옮겼다(`service/mpy/apiCpx.ts`). redirectUrl에
+    대조번호가 실리고, 결제가 끝나면 CGV가 그 주소로 돌아와 판매정보를 찾는다.
+    """
+    import urllib.parse as _up
+
+    amounts = pay_amounts(total)
+    return {
+        "coCd": CO_CD,
+        "mrchClsCd": PAY_MRCH_CLS_CD,
+        "paymNo": paym_no,
+        "paykndCd": PAY_KAKAO_PAYKND_CD,
+        "payMethod": PAY_KAKAO_METHOD,
+        "payMethodCode": "",
+        "dcNo": "",
+        "amountTotal": amounts["amountTotal"],
+        "amountDiscount": 0,
+        "amountVat": amounts["amountVat"],
+        "amountTaxFree": amounts["amountTaxFree"],
+        "amountTax": amounts["amountTax"],
+        "redirectUrl": (f"{host}/api/pg?paymNo={paym_no}"
+                        f"&paymVrifyNo={verify_no}"
+                        f"&host={_up.quote(host, safe='')}"),
+        "cupDepositAmount": 0,
+        "goodsType": "N",
+        "cultureType": "Y",
+        "userPhone": user_phone,
+        "expireDate": today or datetime.now(KST).strftime("%Y%m%d"),
+        "appId": "",
+        "salitmClsCd": "01",
+    }
+
+
+# 카카오페이 결제창을 여는 CGV PG 페이지. onlineAuthRequestReserve가 이 주소를 준다.
+PG_READY_MARK = "onepg.cjsystems.co.kr"
+# 그 페이지가 자동 제출하는 폼. action 끝이 브릿지 식별자다.
+PG_FORM_ACTION = re.compile(
+    r'action="(https://online-payment\.kakaopay\.com/bridge/pc/[^"]+)"')
+# 브릿지가 부르는 카카오 게이트웨이. **여기 응답에만 쓸 수 있는 해시가 있다.**
+KAKAO_GATEWAY_MARK = "pay-api-gw.kakaopay.com/online-payment-internal"
+
+
+def pg_bridge_id(html: str) -> str | None:
+    """PG 페이지에서 브릿지 식별자를 꺼낸다. 없으면 None.
+
+    **이 값으로 결제 링크를 만들면 안 된다.** 폼 action의 것은 64자인데 쓸 수 있는
+    해시는 65자다(실측). 한 글자 차이라 눈으로는 같아 보이고, 열면 "인증정보를 찾을
+    수 없습니다"가 떠서 만료로 착각하기 딱 좋다 — README가 경고하던 그 함정이고,
+    이 코드를 만들면서 실제로 한 번 빠졌다. 이 값은 게이트웨이를 찾는 데만 쓴다.
+    """
+    found = PG_FORM_ACTION.search(html or "")
+    return found.group(1).rsplit("/", 1)[-1] if found else None
+
+
+def kakao_link_from_gateway(body) -> tuple[str | None, object]:
+    """카카오 게이트웨이 응답에서 (휴대폰 결제 주소, 만료시각). 못 읽으면 (None, None).
+
+    `hash`가 **화면의 QR에 담긴 것과 같은 주소**를 만든다(실측: 트래킹 요청의
+    `qr` 필드와 글자까지 일치). `expired_timestamp`는 유닉스 초다.
+    """
+    if not isinstance(body, dict):
+        return None, None
+    digest = str(body.get("hash") or "").strip()
+    if not digest:
+        return None, None
+    # **유닉스 시각이 아니다.** 숫자를 UTC로 읽은 뒤 그 벽시계를 한국 시간으로
+    # 봐야 맞는다 — 카카오가 한국 시각으로 센 초를 유닉스인 양 주는 셈이다.
+    # 그냥 `fromtimestamp(tz=KST)`로 읽으면 9시간 뒤가 나온다. 실측으로 가렸다:
+    # 13:41에 만든 링크의 수명이 15분인데(README), 그렇게 읽으면 22:56이 된다.
+    #
+    # 만료를 늦게 잡는 쪽이 더 나쁘다 — 이미 죽은 링크를 아직 살아 있다고 알리게
+    # 되고, 사용자는 그걸 누르고 나서야 안다.
+    expires = None
+    try:
+        stamp = int(body.get("expired_timestamp") or 0)
+        if stamp:
+            expires = datetime.fromtimestamp(
+                stamp, tz=timezone.utc).replace(tzinfo=KST)
+    except (TypeError, ValueError, OSError, OverflowError):
+        expires = None
+    return KAKAO_PAY_LINK.format(hash=digest), expires
+
+
+def fetch_pay_link(session, paylink_url: str, *,
+                   timeout_ms: int = PAY_BRIDGE_WAIT_MS) -> dict:
+    """PG 결제창 주소를 열어 **휴대폰용 카카오페이 결제 링크**를 받아 온다.
+
+    반환: {ok, pay_url, pay_expires_at, error}
+
+    화면을 몰지 않는다 — 주소 하나를 열면 PG 페이지가 스스로 폼을 제출하고,
+    그때 카카오 게이트웨이가 내려주는 응답을 가로채면 끝이다. 우리가 누르는
+    버튼은 없다.
+
+    **승인은 여기서 하지 않는다.** 카카오톡 승인은 사용자 기기에서 이뤄지고,
+    그건 시스템이 대신할 수 없고 대신해서도 안 된다.
+
+    **그래도 이 탭은 닫지 않는다.** 카카오페이 브릿지가 이 탭에서 승인 상태를
+    폴링하고, 승인이 오면 거기서 CGV의 완료 주소(redirectUrl)로 넘어가면서 매출이
+    만들어진다. 링크만 챙기고 닫아 버렸더니 그 연쇄가 시작되지 않아 **예매가
+    하나 날아갔다**(2026-09-07 · 승인은 했는데 예매 내역 0건). `_keep_paying_page`
+    주석이 UI 경로에 대해 경고하던 것과 같은 일이다 — 읽고도 같은 실수를 했다.
+
+    그래서 결제 시한까지 세션에 맡긴다(CgvSession.keep_page). 시한이 지나면
+    세션이 알아서 닫는다.
+    """
+    import json as _json
+
+    captured: dict = {}
+
+    def on_resp(r):
+        if KAKAO_GATEWAY_MARK not in (r.url or ""):
+            return
+        try:
+            body = _json.loads(r.text())
+        except Exception:  # noqa: BLE001 - JSON이 아니면 우리가 찾는 응답이 아니다
+            return
+        if isinstance(body, dict) and body.get("hash"):
+            captured.setdefault("gateway", body)
+
+    page = session.page.context.new_page()
+    page.on("response", on_resp)
+    got = False
+    try:
+        page.goto(paylink_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        got = _wait_until(page, lambda: bool(captured.get("gateway")),
+                          timeout_ms)
+        if not got:
+            return {"ok": False, "pay_url": None, "pay_expires_at": None,
+                    "error": "카카오페이 결제 정보를 시간 안에 받지 못했습니다"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "pay_url": None, "pay_expires_at": None,
+                "error": f"결제창을 열지 못했습니다: {exc}"}
+    finally:
+        try:
+            page.remove_listener("response", on_resp)
+        except Exception:  # noqa: BLE001
+            pass
+        # 결제 정보를 못 받았으면 승인이 올 일도 없다 — 그때만 닫는다.
+        if not got:
+            _close_pay_page(page)
+
+    pay_url, expires = kakao_link_from_gateway(captured.get("gateway"))
+    if not pay_url:
+        _close_pay_page(page)
+        return {"ok": False, "pay_url": None, "pay_expires_at": None,
+                "error": "결제 정보는 받았지만 링크를 만들지 못했습니다"}
+    _hold_pay_page(session, page, expires)
+    return {"ok": True, "pay_url": pay_url, "pay_expires_at": expires,
+            "error": ""}
+
+
+def _hold_pay_page(session, page, expires) -> None:
+    """결제창 탭을 승인이 올 때까지 맡긴다. 실패해도 링크는 이미 나갔다.
+
+    지켜 주는 시간은 카카오가 준 만료 시각까지 + 여유다 — 사람이 시한 직전에
+    승인해도 CGV가 그 결과를 받아 예매를 확정할 틈이 있어야 한다. 시각을 못
+    읽었으면 고정값으로 간다(UI 경로와 같은 기준).
+    """
+    keep = PAY_PAGE_KEEP_SECONDS
+    if expires is not None:
+        try:
+            exp = expires if expires.tzinfo else expires.replace(tzinfo=KST)
+            left = (exp - datetime.now(KST)).total_seconds()
+            keep = max(PAY_PAGE_MIN_KEEP_SECONDS, left + PAY_PAGE_GRACE_SECONDS)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass
+    try:
+        session.keep_page(page, keep)
+        log.info("결제창 탭을 %d초간 지킵니다 — 승인이 오면 이 탭이 CGV에 "
+                 "넘겨 예매가 확정됩니다.", int(keep))
+    except Exception as exc:  # noqa: BLE001
+        log.error("결제창 탭을 맡기지 못했습니다 (%s) — 승인해도 예매가 "
+                  "확정되지 않을 수 있습니다. CGV 예매 내역을 확인하세요.", exc)
+
+
+def _close_pay_page(page) -> None:
+    """결제창 탭을 닫는다. **승인이 올 수 없다고 확정된 뒤에만** 부른다.
+
+    링크를 못 만든 경우가 그렇다. 링크가 나갔는데 닫으면 사용자가 승인해도
+    매출이 만들어지지 않는다 — 돈은 나가고 표는 안 나온다.
+    """
+    try:
+        page.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# 결제 화면 문서. **여기에만 있는 것이 있다** — 접속 IP와 고객·CJ ONE 정보를
+# CGV가 서버에서 그려 넣어 보낸다(Next.js RSC 페이로드). 결제 단계의 어떤 API도
+# 이 값을 주지 않아서, 한동안 출처를 못 찾았다(2026-09-07).
+PAY_MAIN_PAGE = "/mpy/main"
+# 그 문서에서 감싸서 실어야 하는 자리들 (apiCpx.ts의 tw). 나머지는 평문 그대로다.
+PAY_ENCRYPTED_FIELDS = {
+    "cust": ("userId", "userName", "userCellPhone", "userEmail"),
+    "cjOneUser": ("memberName", "mobileNo"),
+}
+
+
+# 결제 화면이 코드로 들고 있는 고정 목록들. **어떤 응답에도 없어서** 관측에서
+# 그대로 옮겼다(2026-09-07, 극장·영화·인원이 다른 8건에서 모두 동일).
+#
+# 손으로 베끼지 않았다 — 관측 파일에서 뽑아 넣었다. 현금영수증 발급 대상
+# 결제수단 목록 같은 것은 눈으로 옮기면 반드시 틀린다.
+PAY_CASH_RECEIPT_YLIST = [
+    {
+        "paykndCd": "1058",
+        "cashrtPblctAmtAplyCd": "01"
+    },
+    {
+        "paykndCd": "1197",
+        "cashrtPblctAmtAplyCd": "01"
+    },
+    {
+        "paykndCd": "1064",
+        "cashrtPblctAmtAplyCd": "02"
+    },
+    {
+        "paykndCd": "1227",
+        "cashrtPblctAmtAplyCd": "03"
+    },
+    {
+        "paykndCd": "1044",
+        "cashrtPblctAmtAplyCd": "02"
+    },
+    {
+        "paykndCd": "1101",
+        "cashrtPblctAmtAplyCd": "02"
+    },
+    {
+        "paykndCd": "1066",
+        "cashrtPblctAmtAplyCd": "02"
+    },
+    {
+        "paykndCd": "1065",
+        "cashrtPblctAmtAplyCd": "02"
+    },
+    {
+        "paykndCd": "1244",
+        "cashrtPblctAmtAplyCd": None
+    },
+    {
+        "paykndCd": "1245",
+        "cashrtPblctAmtAplyCd": "02"
+    },
+    {
+        "paykndCd": "1260",
+        "cashrtPblctAmtAplyCd": "02"
+    },
+    {
+        "paykndCd": "1089",
+        "cashrtPblctAmtAplyCd": None
+    },
+    {
+        "paykndCd": "1090",
+        "cashrtPblctAmtAplyCd": "03"
+    },
+    {
+        "paykndCd": "1219",
+        "cashrtPblctAmtAplyCd": None
+    },
+    {
+        "paykndCd": "1038",
+        "cashrtPblctAmtAplyCd": "03"
+    },
+    {
+        "paykndCd": "1040",
+        "cashrtPblctAmtAplyCd": None
+    }
+]
+PAY_METHOD_TAB_LIST = [
+    {
+        "label": "CGV 스마트결제",
+        "value": "01"
+    },
+    {
+        "label": "일반결제",
+        "value": "02"
+    }
+]
+PAY_METHOD_TAB = {
+    "label": "일반결제",
+    "value": "02"
+}
+PAY_EMPTY_DISCOUNTS = {
+    "sellDiscountList": [],
+    "ticketDiscountList": [],
+    "productDiscountList": [],
+    "giftcDiscountList": [],
+    "sbzSvcDiscountList": []
+}
+
+
+def _json_object_at(text: str, key: str):
+    """`"key":{…}` 를 찾아 그 객체만 떼어 파싱한다. 못 찾으면 None.
+
+    RSC 페이로드는 JSON이 아니라 **JSON 조각이 섞인 글**이라 통째로 파싱할 수
+    없다. 여는 중괄호부터 짝이 맞을 때까지 세어 잘라 낸다.
+    """
+    import json as _json
+
+    start = text.find(f'"{key}":{{')
+    if start < 0:
+        return None
+    start = text.index("{", start + len(key) + 3)
+    depth, quoted, escaped = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+        elif ch == '"':
+            quoted = not quoted
+        elif not quoted:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return _json.loads(text[start:i + 1])
+                    except ValueError:
+                        return None
+    return None
+
+
+def parse_pay_account(html: str) -> dict:
+    """결제 화면 문서에서 {ipAddress, cust, cjOneUser}를 읽는다. 평문 그대로다.
+
+    감싸는 것은 부르는 쪽이 한다(encrypt_pay_account) — 읽는 일과 감싸는 일을
+    나눠 두면, 어느 쪽이 틀렸는지 대조에서 가릴 수 있다.
+    """
+    import re as _re
+
+    text = (html or "").replace('\\"', '"')
+    found = _re.search(r'"ipAddress":"([^"]*)"', text)
+    return {
+        "ipAddress": found.group(1) if found else "",
+        "cust": _json_object_at(text, "cust") or {},
+        "cjOneUser": _json_object_at(text, "cjOneUser") or {},
+    }
+
+
+def encrypt_pay_account(account: dict) -> dict:
+    """읽어 온 계정 정보를 판매정보에 실을 모양으로 감싼다.
+
+    **고객번호는 감싸지 않는다.** CGV가 그렇게 보내기 때문이다(관측에서 userNo·
+    custNo·itgrCustNo·ipinCntcNo만 평문이었다) — 우리가 더 가리면 CGV가 못 읽는다.
+    """
+    from watch import encrypt_pay_field
+
+    out = {"ipAddress": encrypt_pay_field(account.get("ipAddress"))}
+    for block, fields in PAY_ENCRYPTED_FIELDS.items():
+        body = dict(account.get(block) or {})
+        for field in fields:
+            if body.get(field):
+                body[field] = encrypt_pay_field(body[field])
+        out[block] = body
+    return out
+
+
+def fetch_pay_account(session) -> dict:
+    """결제 화면 문서를 받아 계정 정보를 읽는다. 감싸지 않은 상태로 돌려준다."""
+    html = session.page.evaluate("""async (path) => {
+        const res = await fetch(path, {headers: {'accept': 'text/html'}});
+        return res.ok ? await res.text() : '';
+    }""", PAY_MAIN_PAGE)
+    account = parse_pay_account(html)
+    if not account.get("cust"):
+        raise RuntimeError("결제 화면에서 고객 정보를 읽지 못했습니다 — CGV가 "
+                           "화면 구성을 바꿨을 수 있습니다")
+    return account
+
+
+def pick_pay_method(grouped, paykndCd: str = PAY_KAKAO_PAYKND_CD):
+    """결제수단 목록에서 카카오페이 항목을 골라 온다. 없으면 None.
+
+    응답이 `data[*].paymdList[*]`로 두 겹이라 그 안까지 훑는다. 순서를 믿지
+    않는다 — 실측에서 `data[6].paymdList[9]`였는데 그건 우연한 자리다.
+    """
+    for group in (grouped or {}).get("data") or []:
+        for item in (group or {}).get("paymdList") or []:
+            if str((item or {}).get("paykndCd") or "") == paykndCd:
+                found = dict(item)
+                # **안내 문구는 비워서 보낸다.** 화면이 사용자에게 보여 주는
+                # 글이고, 판매정보에는 실리지 않는다 — 관측 9건 모두 null이었다.
+                found["custGuidWordCont"] = None
+                return found
+    return None
+
+
+def pick_credit_card(cards):
+    """카드사 목록의 첫 항목. 결제수단이 카카오페이면 쓰이지 않지만 자리는 채운다.
+
+    실측에서 늘 BC카드(첫 항목)가 실려 있었다 — 화면이 기본값으로 들고 있는
+    것이라, 카카오페이 결제에서는 이 값이 쓰이지 않는다.
+    """
+    data = (cards or {}).get("data") or []
+    return data[0] if data else None
+
+
+def pay_info_content(ctx: dict, identity: dict, mov: dict, account: dict,
+                     *, paym_no: str, verify_no: str, pay_method: dict | None,
+                     credit_card: dict | None) -> dict:
+    """`insertIssSalProcTempInfo`에 실을 판매정보 전체.
+
+    **PG 콜백이 이걸 읽어 매출을 만든다.** 여기가 틀리면 사용자가 카카오페이
+    승인을 누른 뒤 CGV가 판매정보를 못 읽는다 — 돈은 나가고 표는 안 나온다.
+    그래서 이 함수는 순수 함수로 두고, 만든 것을 실제 관측과 대조한다
+    (compare_payspec.py).
+
+    account는 **이미 감싼** 것이어야 한다(encrypt_pay_account) — 여기서 감싸면
+    읽는 일·감싸는 일·조립하는 일이 한 덩어리가 되어, 어느 쪽이 틀렸는지 대조에서
+    가릴 수 없다.
+
+    시나리오는 하나로 못박혀 있다: **일반결제 · 카카오페이 · 할인 없음 · 기프트
+    없음 · 일반 성인 권종.** 지금 이 시스템이 하는 것이 정확히 그것이고, 다른
+    조합(청소년 권종·포인트 사용·쿠폰)은 여기 있는 "N"들을 손대야 한다.
+    """
+    row = ctx.get("row") or {}
+    total = int(mov.get("sumSalAmt") or 0)
+    count = len(mov.get("sellProductsList") or [])
+    return {
+        "ipAddress": account.get("ipAddress"),
+        "coCd": CO_CD,
+        "cust": account.get("cust"),
+        "cjOneUser": account.get("cjOneUser"),
+        "saleDt": datetime.now(KST).strftime("%Y%m%d"),
+        "siteNo": str(row.get("siteNo") or ctx.get("site_no") or ""),
+        "siteNm": ctx.get("site_nm") or "",
+        "mrchClsCd": PAY_MRCH_CLS_CD,
+        "sachlCd": "10",
+        "sachlTypCd": "01",
+        "payMethodTabList": PAY_METHOD_TAB_LIST,
+        "payMethodTab": PAY_METHOD_TAB,
+        "payMethod": pay_method,
+        "creditCardList": None,
+        "creditCard": credit_card,
+        "creditCardOption": credit_card,
+        "cardPointYN": "N",
+        "creditCardDcCpnUseYn": "N",
+        "creditCardDcValidYn": "N",
+        "onlineAuthUseYn": "N",
+        "onlineAuthAplyYn": "N",
+        "isNaverPayEduYn": "N",
+        "isCultureNHYn": "N",
+        "isCultureNHValidYn": "N",
+        "paymNo": paym_no,
+        "paymVrifyNo": verify_no,
+        "traceNo": "",
+        # **결제 요청 쪽과 다르다.** 여기서는 금액을 가르지 않는다 — 총액만
+        # 싣고 나머지는 0이다(관측). 가르는 것은 onlineAuthRequestReserve다.
+        "amountTotal": total,
+        "amountPaymTotal": 0,
+        "amountDiscount": 0,
+        "amountVat": 0,
+        "amountTax": 0,
+        "amountTaxFree": 0,
+        "cupDepositAmount": 0,
+        "quota": "00",
+        "giftYn": "N",
+        "regirYn": "N",
+        "cjOnePntUseYn": "N", "cjOnePntUse": 0, "cjOneAuthFlag": "",
+        "cjOnePntDiscData": None,
+        "cjGiftUseYn": "N", "cjGiftAvlAmount": 0, "cjGiftUse": 0,
+        "cjGiftDiscData": None, "showCjGiftBalance": False,
+        "cgvGiftUseYn": "N", "cgvGiftAvlAmount": 0, "cgvGiftUse": 0,
+        "cgvGiftDiscData": None, "showCgvGiftBalance": False,
+        "giftCardList": [],
+        "isStaff": "N", "isStaffDcUseYn": "N",
+        # 판매정보의 redirectUrl은 **빈 값이다**(관측). 주소가 실리는 곳은
+        # 결제 요청 쪽이다 — 여기 채우면 CGV가 보내는 것과 달라진다.
+        "redirectUrl": "",
+        "payType": "mov",
+        "goodsName": pay_goods_name(ctx),
+        "goodsCnt": str(count),
+        "goodsType": "N",
+        "imdtlOrdYn": "N",
+        "traceType": "0",
+        "pickupPerson": "", "pickupPhoneNm": "",
+        "pickupStartYmd": "", "pickupEndYmd": "",
+        "cashReceiptYList": PAY_CASH_RECEIPT_YLIST,
+        "cashReceiptAcceptList": [], "cashReceiptNotAcceptList": [],
+        # 현금영수증 연락처는 그 계정의 휴대폰이다. **감싸지 않는다**(관측).
+        "cashReceiptInfo": (account.get("cust") or {}).get("userCellPhoneRaw")
+                           or (ctx.get("cash_receipt_no") or ""),
+        "cashReceiptTraceType": "01",
+        "cashrtUseYn": "Y", "cashrtList": [],
+        "channel": "ONLINE",
+        "cultureType": "Y",
+        "salSprExpYn": "N", "salSprYn": "N",
+        "salSprOrgSalNo": "", "salSprOrgPaymNo": "", "salSprOrgPaymVrifyNo": "",
+        "outOfStock": "N",
+        "imdtlDc": None, "imdtlDcYn": "N", "imdtlDcUseYn": "N",
+        "appId": "",
+        "giftcardSaveTelegram0104": None,
+        "isHotdl": "N",
+        "vipHalfPntUseYn": "N", "vipHalfPntDiscData": None,
+        "cdcDlveProdInclsYn": "N",
+        "scntsSalNo": None, "scntsSalNoSeatList": None,
+        "scntsSalNoSearchYn": "N",
+        "szoneExpChkStep": 0, "szoneExpChk": True, "szoneExpTm": "",
+        "purchaseInfoExpYn": "Y", "smartPayTooltipExpYn": "N",
+        "discounts": PAY_EMPTY_DISCOUNTS,
+        "pntParam": None,
+        "mov": mov,
+        "sto": None, "gft": None, "act": None, "ptp": None, "prk": None,
+        "ccl": None, "pmd": None, "pld": None,
+        "coopList": [], "onlnList": [], "coopCpnList": [],
+        "hotdlYn": "", "hotdlDtlNo": "",
+        "salSprPayDtos": None,
+    }
+
+
+# 결제 단계가 부르는 주소들. 전부 같은 오리진 BFF다 — 결제 모듈은 코드에
+# api.cgv.co.kr을 박아 두었지만, 매퍼를 타는 이 경로로도 같은 것이 나온다(실측).
+EP_PAY_ID = "/api/v1/payment/pay/commonGetPayId"
+EP_PAY_TEMP_INSERT = "/api/v1/payment/mpy/proc/insertIssSalProcTempInfo"
+EP_PAY_TEMP_UPDATE = "/api/v1/payment/mpy/proc/updateIssSalProcTempInfo"
+EP_PAY_AUTH = "/api/v1/payment/pay/onlineAuthRequestReserve"
+EP_PAY_METHODS = ("/api/v1/payment/pay/searchGroupedPaymdList"
+                  "?siteNo={site_no}&bzplcTypCds=01&prdtypCds=01&mbrYn=Y")
+EP_PAY_CARDS = "/api/v1/payment/pay/searchCrdCocdList"
+EP_SEAT_PRICE = "/api/v1/booking/searchMovAtktSeatPrcList"
+
+# CJ ONE 포인트 적립 파라미터의 고정값. 번들에 박혀 있는 값이다 — 어떤 응답도
+# 주지 않아서 관측만으로는 6자라는 것밖에 알 수 없었다.
+PAY_POINT_TERM_USER_ID = "317665"
+
+
+def pay_price_body(ctx: dict, seats: list[dict]) -> dict:
+    """좌석별 가격을 묻는 요청. 선점 요청과 같은 회차·좌석을 가리킨다."""
+    row = ctx.get("row") or {}
+    return {
+        "coCd": CO_CD,
+        "siteNo": str(row.get("siteNo") or ctx.get("site_no") or ""),
+        "scnsNo": str(row.get("scnsNo") or ""),
+        "scnYmd": str(ctx.get("scn_ymd") or ""),
+        "scnSseq": str(row.get("scnSseq") or ""),
+        "movNo": str(row.get("movNo") or ""),
+        "rtctlScopCd": PAY_RTCTL_SCOP_CD,
+        "prcrulDivCd": _row_get(row, "prcrulDivCd") or "01",
+        "sachlTypCd": "01",
+        "prodBnduList": [{"prodBnduCd": "01", "prodBnduQty": len(seats)}],
+        "seatList": [{"seatLocNo": s.get("seat_loc_no"),
+                      "szoneKindCd": s.get("szone_kind_cd"),
+                      "stkndCd": s.get("stknd_cd"),
+                      "seatSalfrmCd": s.get("seat_salfrm_cd"),
+                      "prodBnduCd": "01"} for s in seats],
+        "zoneGroupYn": "N",
+    }
+
+
+def pay_point_param(account: dict) -> dict | None:
+    """CJ ONE 포인트 적립 파라미터. CJ ONE 회원이 아니면 None.
+
+    **포인트를 쓰는 게 아니라 쌓는 쪽이다**(cjOnePntUseYn은 "N"이다). 틀리면
+    적립이 안 될 수 있지만 결제 자체를 막지는 않는다.
+    """
+    member = str((account.get("cjOneUser") or {}).get("memberNo") or "")
+    if not member:
+        return None
+    return {"memberNo": member, "cgvPointType": "01",
+            "termUserId": PAY_POINT_TERM_USER_ID, "txReasonCode": "1001",
+            "itgrCustNo": member, "divType": "2", "prodNo": "",
+            "sprodAcmrteCd": "02"}
+
+
+def pay_info_settled(info: dict, account: dict, *,
+                     host: str = BASE_ORIGIN) -> dict:
+    """`updateIssSalProcTempInfo`에 실을 판매정보 — 금액을 가르고 주소를 채운 판.
+
+    처음 등록(insert)은 금액 칸이 0이고 주소가 비어 있다. 그 상태로 두면 PG가
+    읽는 판매정보에 부가세·과세분이 0으로 남는다 — CGV의 화면도 결제 요청 전후로
+    두 번 갱신해 이 값을 채운다(관측). 그 순서를 그대로 따른다.
+    """
+    total = int(info.get("amountTotal") or 0)
+    amounts = pay_amounts(total)
+    return {**info,
+            "amountPaymTotal": total,
+            "amountVat": amounts["amountVat"],
+            "amountTax": amounts["amountTax"],
+            "redirectUrl": host,
+            "szoneExpTm": datetime.now(KST).strftime("%Y%m%d%H%M%S"),
+            "pntParam": pay_point_param(account)}
+
+
+def _pay_step(session, path: str, body: dict, what: str) -> dict:
+    """결제 요청 하나를 보내고 성공을 확인한다. 실패하면 사유를 담아 올린다."""
+    out = session.post_json(path, body)
+    payload = out.get("body")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{what}: 응답을 읽지 못했습니다 "
+                           f"(HTTP {out.get('status')})")
+    if payload.get("statusCode") not in (0, "0", None):
+        raise RuntimeError(f"{what}: {payload.get('statusMessage') or '실패'}")
+    return payload.get("data") or {}
+
+
+def _pay_info_json(value) -> str:
+    """판매정보를 문자열로. CGV가 보내는 것과 같은 모양이어야 한다."""
+    import json as _json
+
+    return _json.dumps(value, ensure_ascii=False)
+
+
+def pay_api(session, ctx: dict, *, method: str = DEFAULT_PAY_METHOD) -> dict:
+    """화면을 몰지 않고 **카카오페이 결제 링크**를 받아 온다.
+
+    반환: pay_block과 같다 — {ok, pay_url, pay_expires_at, amount, method, error}
+
+    hold_api가 잡아 둔 선점 위에서 돈다. 순서는 CGV 화면이 하는 것과 같다
+    (logs/payspec/ 관측 10건에서 확정):
+
+        결제번호 받기 → 판매정보 등록 → 판매정보 갱신
+        → 결제 요청 → 판매정보 갱신 → PG 주소 열어 링크 받기
+
+    **매출 생성(salCreateSal)에는 손대지 않는다.** 돈이 실제로 빠지는 건 사용자가
+    카카오톡에서 승인할 때이고, 그건 시스템이 대신할 수 없고 대신해서도 안 된다.
+    지금 UI 경로가 멈추는 곳과 같은 자리에서 멈춘다.
+
+    **카카오페이만 지원한다.** 다른 수단은 결제수단 목록에서 고르는 값이 달라
+    관측이 없다 — 없는 것을 지어내지 않는다.
+    """
+    if method != DEFAULT_PAY_METHOD:
+        return {"ok": False, "method": method, "pay_url": None,
+                "pay_expires_at": None, "amount": None,
+                "error": f"API 결제는 카카오페이만 지원합니다 (요청: {method})"}
+    seats = list(ctx.get("_held_seats") or [])
+    mov_atkt_no = str(ctx.get("mov_atkt_no") or "")
+    if not seats or not mov_atkt_no:
+        return {"ok": False, "method": method, "pay_url": None,
+                "pay_expires_at": None, "amount": None,
+                "error": "선점 결과가 없어 결제를 시작할 수 없습니다"}
+
+    row = ctx.get("row") or {}
+    site_no = str(row.get("siteNo") or ctx.get("site_no") or "")
+    steps = _Steps()
+    # **여기서도 관측을 남긴다.** 처음에는 pay_block에만 붙여 뒀는데, 그래서
+    # API 결제가 실패했을 때(2026-09-07) 흔적이 하나도 없었다 — 무슨 요청이 나가고
+    # 무엇이 돌아왔는지 볼 수가 없었다. 선점 단계에서 이미 모으고 있으면 이어 담는다.
+    spec: list = ctx.setdefault("_pay_spec", [])
+    spec_handlers = None
+    try:
+        spec_handlers = watch_pay_requests(session.page, spec)
+    except Exception as exc:  # noqa: BLE001 - 못 걸어도 결제는 그대로 간다
+        log.debug("API 결제 관찰을 걸지 못했습니다: %s", exc)
+    paym_no = ""
+    try:
+        identity = session.identity()
+        account = fetch_pay_account(session)
+        wrapped = encrypt_pay_account(account)
+        steps.mark("신원")
+
+        prices = _pay_step(session, EP_SEAT_PRICE,
+                           pay_price_body(ctx, seats), "좌석 가격 조회")
+        prices = prices if isinstance(prices, list) else []
+        # **금액은 우리가 정하지 않는다.** 좌석마다 CGV가 준 가격을 쓰고, 하나라도
+        # 못 받았으면 여기서 멈춘다 — 모르는 금액으로 결제를 걸지 않는다.
+        if len(prices) != len(seats):
+            raise RuntimeError(f"좌석 {len(seats)}석 중 {len(prices)}석의 "
+                               f"가격만 받았습니다")
+        grouped = session.get_json(EP_PAY_METHODS.format(site_no=site_no))
+        cards = session.get_json(EP_PAY_CARDS)
+        pay_method = pick_pay_method(grouped)
+        if pay_method is None:
+            raise RuntimeError("결제수단 목록에 카카오페이가 없습니다")
+        adnc = session.adnc_seat_info(site_no, str(row.get("scnsNo") or ""),
+                                      str(ctx.get("scn_ymd") or ""),
+                                      str(row.get("scnSseq") or ""),
+                                      str(row.get("movNo") or ""))
+        steps.mark("조회")
+
+        mov = pay_mov_block(ctx, identity, seats, prices, mov_atkt_no, adnc)
+        total = int(mov.get("sumSalAmt") or 0)
+        if total <= 0:
+            raise RuntimeError("결제 금액을 계산하지 못했습니다")
+
+        paym_no = str(_pay_step(
+            session, EP_PAY_ID,
+            pay_id_body(ctx, identity, total, len(seats)),
+            "결제번호 받기").get("payId") or "")
+        if not paym_no:
+            raise RuntimeError("결제번호를 받지 못했습니다")
+        verify_no = pay_verify_no()
+        steps.mark("결제번호")
+
+        info = pay_info_content(
+            ctx, identity, mov, wrapped, paym_no=paym_no, verify_no=verify_no,
+            pay_method=pay_method, credit_card=pick_credit_card(cards))
+        # 현금영수증 연락처는 감싸지 않은 휴대폰이다(관측).
+        info["cashReceiptInfo"] = (account.get("cust") or {}).get(
+            "userCellPhone") or ""
+
+        def temp(path: str, body: dict, what: str) -> None:
+            _pay_step(session, path, {
+                "coCd": CO_CD, "paymNo": paym_no, "paymVrifyNo": verify_no,
+                "paymInfoCont": _pay_info_json(body)}, what)
+
+        temp(EP_PAY_TEMP_INSERT, info, "판매정보 등록")
+        settled = pay_info_settled(info, account)
+        temp(EP_PAY_TEMP_UPDATE, settled, "판매정보 갱신")
+        steps.mark("판매정보")
+
+        auth = _pay_step(session, EP_PAY_AUTH,
+                         pay_auth_body(paym_no, verify_no, total,
+                                       user_phone=(account.get("cust") or {})
+                                       .get("userCellPhone")),
+                         "결제 요청")
+        if str(auth.get("returnCode") or "") not in ("0000", "0"):
+            raise RuntimeError(
+                f"결제 요청이 거절됐습니다 — "
+                f"{auth.get('returnMessage') or auth.get('returnCode')}")
+        paylink = str(auth.get("paylinkUrl") or "")
+        if not paylink:
+            raise RuntimeError("결제창 주소를 받지 못했습니다")
+        temp(EP_PAY_TEMP_UPDATE, settled, "판매정보 갱신(재)")
+        steps.mark("결제요청")
+    except Exception as exc:  # noqa: BLE001 - 결제 실패가 선점을 무르지 않는다
+        log.warning("API 결제 실패: %s", exc)
+        _finish_pay_spec(spec, spec_handlers, session, ctx, method=method,
+                         error=str(exc), got_link=False)
+        return {"ok": False, "method": method, "pay_url": None,
+                "pay_expires_at": None, "amount": None,
+                "paym_no": paym_no or None, "error": str(exc)}
+
+    link = fetch_pay_link(session, paylink)
+    steps.mark("링크")
+    log.info("자동 결제 소요(API) — %s", steps.summary())
+    _finish_pay_spec(spec, spec_handlers, session, ctx, method=method,
+                     error=None if link.get("ok") else link.get("error"),
+                     got_link=bool(link.get("ok")))
+    if not link.get("ok"):
+        # **선점과 결제 요청은 이미 끝났다.** 링크만 못 만든 것이라 사람이 CGV
+        # 앱에서 이어 결제할 수 있다 — 금액과 결제번호는 알려 준다.
+        return {"ok": False, "method": method, "pay_url": None,
+                "pay_expires_at": None, "amount": total,
+                "paym_no": paym_no, "error": link.get("error")}
+    return {"ok": True, "method": method, "pay_url": link["pay_url"],
+            "pay_expires_at": link["pay_expires_at"], "amount": total,
+            "paym_no": paym_no, "error": ""}
+
+
+def _finish_pay_spec(spec: list, handlers, session, ctx: dict, *, method: str,
+                     error: str | None, got_link: bool) -> None:
+    """관찰을 떼고 기록한다. 실패해도 결제에는 영향이 없다."""
+    if handlers:
+        for event, handler in zip(("request", "response"), handlers):
+            try:
+                session.page.remove_listener(event, handler)
+            except Exception:  # noqa: BLE001
+                pass
+    record_pay_spec(spec, ctx, method=method, error=error, got_bridge=got_link)
+
+
+# 대조에서 **값까지는 비교하지 않는** 자리. 매번 달라지는 게 정상이라
+# 다르다고 알려 봐야 소음이다.
+PAY_COMPARE_SKIP = frozenset({
+    "paymNo",        # commonGetPayId가 준다
+    "paymVrifyNo",   # 클라이언트가 만드는 난수
+    "traceNo", "redirectUrl", "ipAddress",
+    "szoneExpTm",    # 화면이 찍는 시각 — 매번 다른 게 정상이다
+    "cust", "cjOneUser", "cashReceiptInfo",   # 신원 — 토큰에서 따로 온다
+})
+
+
+def compare_pay_body(ours: dict, theirs: dict, *, path: str = "") -> list[str]:
+    """우리가 만든 것과 CGV가 실제로 보낸 것의 차이. 같으면 빈 리스트.
+
+    **값이 아니라 경로를 돌려준다.** 어긋난 자리를 알면 어느 조회를 고쳐야 할지
+    알 수 있고, 값은 로그에 남기면 안 되는 것이 섞여 있다.
+    """
+    diffs: list[str] = []
+    if isinstance(theirs, dict) and isinstance(ours, dict):
+        for key in sorted(set(ours) | set(theirs)):
+            here = f"{path}.{key}" if path else key
+            if key in PAY_COMPARE_SKIP:
+                continue
+            if key not in ours:
+                diffs.append(f"{here} (우리 쪽에 없음)")
+            elif key not in theirs:
+                diffs.append(f"{here} (CGV 쪽에 없음)")
+            else:
+                diffs.extend(compare_pay_body(ours[key], theirs[key], path=here))
+        return diffs
+    if isinstance(theirs, list) and isinstance(ours, list):
+        if len(ours) != len(theirs):
+            return [f"{path} (개수 {len(ours)} ≠ {len(theirs)})"]
+        for i, (a, b) in enumerate(zip(ours, theirs)):
+            diffs.extend(compare_pay_body(a, b, path=f"{path}[{i}]"))
+        return diffs
+    # 가려 둔 값은 비교할 수 없다. 기록 파일(logs/payspec/)로 대조할 때 만난다 —
+    # "다르다"고 세면 가린 자리마다 차이가 나서 정작 볼 것이 묻힌다.
+    if isinstance(theirs, str) and theirs.startswith("(가림:"):
+        return []
+    # 숫자와 그 숫자의 문자열은 같은 것으로 본다 — CGV가 자리마다 다르게 쓴다.
+    if str(ours) != str(theirs):
+        diffs.append(path or "(최상위)")
+    return diffs
 
 
 # ── 자동 결제: 카카오페이 결제 요청 ─────────────────────────────────────────
@@ -2704,7 +4356,18 @@ def pay_block(session, ctx: dict, *, method: str = DEFAULT_PAY_METHOD) -> dict:
         if isinstance(body, dict) and body.get("tid"):
             captured.setdefault("bridge", body)
     page.on("response", on_resp)
+    # 결제 흐름의 형태를 모은다 — **관찰 전용**이고, 나중에 결제를 API로 하려면
+    # 이 기록이 있어야 한다(record_pay_spec). 실패해도 결제에는 영향이 없다.
+    # 선점 단계에서 이미 모은 것이 있으면 **이어서** 담는다 — 한 파일에 선점부터
+    # 결제까지가 시간 순으로 들어가야 흐름을 읽을 수 있다.
+    spec: list = ctx.setdefault("_pay_spec", [])
+    spec_handlers = None
+    try:
+        spec_handlers = watch_pay_requests(page, spec)
+    except Exception as exc:  # noqa: BLE001 - 못 걸어도 결제는 그대로 간다
+        log.debug("결제 흐름 관찰을 걸지 못했습니다: %s", exc)
 
+    failure: str | None = None
     try:
         if not _open_payment_page(page):
             raise RuntimeError("결제 화면으로 넘어가지 못했습니다")
@@ -2721,16 +4384,29 @@ def pay_block(session, ctx: dict, *, method: str = DEFAULT_PAY_METHOD) -> dict:
         _wait_until(page, lambda: bool(captured.get("bridge")),
                     PAY_BRIDGE_BODY_MS)
     except Exception as exc:  # noqa: BLE001 - 결제 요청 실패는 선점을 무르지 않는다
+        failure = str(exc)
         shot = _save_screenshot(page, ctx)
         detail = f" (화면: {shot})" if shot else ""
         return {"ok": False, "method": method, "pay_url": None,
                 "pay_expires_at": None, "amount": None,
                 "error": f"{exc}{detail}"}
     finally:
+        # 하나씩 따로 뗀다 — 한 묶음으로 두면 앞엣것이 터졌을 때 뒤엣것이 남는데,
+        # 이 페이지는 상주 탭이라 결제할 때마다 리스너가 쌓인다.
         try:
             page.remove_listener("response", on_resp)
         except Exception:  # noqa: BLE001
             pass
+        if spec_handlers:
+            for event, handler in zip(("request", "response"), spec_handlers):
+                try:
+                    page.remove_listener(event, handler)
+                except Exception:  # noqa: BLE001
+                    pass
+        # 리스너를 뗀 뒤에 남긴다. 결제 링크는 이미 나왔거나 이미 실패한 뒤라
+        # 여기서 파일을 쓰는 것이 결제를 늦추지 않는다.
+        record_pay_spec(spec, ctx, method=method, error=failure,
+                        got_bridge=bool(captured.get("bridge")))
 
     body = captured.get("bridge")
     pay_url = kakao_link_from_bridge(body)

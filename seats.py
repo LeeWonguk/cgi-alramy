@@ -53,6 +53,9 @@ def parse_seats(seat_data: dict) -> list[dict]:
             "szone_no": s.get("szoneNo") or "",
             "stknd_cd": s.get("stkndCd") or "",
             "szone_kind_cd": s.get("szoneKindCd") or "",
+            # 결제 판매정보(ticketProducts)가 코드가 아니라 **이름**을 싣는다.
+            "szone_kind_nm": s.get("szoneKindNm") or "",
+            "hrzone_cd": s.get("hrzoneCd") or "",
             # 판매형태 — 선점 바디에도 실리지만, 휠체어 전용석을 가려내는
             # 유일한 단서이기도 하다(is_restricted).
             "seat_salfrm_cd": s.get("seatSalfrmCd") or "",
@@ -479,6 +482,9 @@ SEAT_FIELDS = [
     "xcoordStartVal", "xcoordEndVal", "leftPwayYn", "rghtPwayYn",
     "seatLocNo", "sbordNo", "seatAreaNo", "szoneNo", "stkndCd",
     "szoneKindCd", "seatSalfrmCd",
+    # 결제 판매정보가 쓰는 이름들. 좌석 감시에는 안 쓰지만 여기서 안 받아 두면
+    # 결제할 때 좌석맵을 한 번 더 열어야 한다.
+    "szoneKindNm", "hrzoneCd",
 ]
 
 
@@ -995,8 +1001,13 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
     #
     # 좌석 확인은 이 탭이 아니라 기본 페이지에서 fetch로 하니(session.get_json),
     # 띄워 둬도 감시 자체에는 영향이 없다.
-    if w.get("auto_book") and not dry_run:
-        import booking
+    #
+    # **API로 바로 선점하는 감시는 화면을 쓰지 않는다.** 미리 띄우고 미리 진행해
+    # 두는 일은 전부 '좌석이 난 순간의 화면 전환 6.2초'를 없애려는 것인데, 그
+    # 경로엔 화면 전환 자체가 없다 — 해 두면 탭과 요청 예산만 축낸다.
+    import booking
+
+    if w.get("auto_book") and not dry_run and booking.hold_mode(w) == "ui":
         warm_ctx = {"mov_no": mov_no, "site_no": site_no,
                     "site_nm": site_nm, "scn_ymd": w["scn_ymd"]}
         # 탭은 (영화·극장·날짜)로 갈리므로 같은 날짜를 보는 감시들은 한 탭을

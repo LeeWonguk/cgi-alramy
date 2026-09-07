@@ -387,3 +387,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS seat_watches_uniq_seatnum_idx
                      seat_num_from, seat_num_to);
 
 DROP INDEX IF EXISTS seat_watches_uniq_range_idx;
+
+
+-- ── 선점 방식: 화면 구동 vs API 직접 호출 ────────────────────────────────────
+-- 지금까지 선점은 CGV 예매 화면을 사람처럼 몰아 '결제하기'까지 가는 길 하나뿐이었다
+-- (booking.hold_block). 그 길은 사이트의 자체 JS가 요청을 만들어 주므로 안전하지만,
+-- 화면 진입·회차 클릭·대기열·팝업 닫기·좌석 클릭이 전부 시간이다(실측 2.6초).
+--
+-- hold_mode = 'api'면 그 전부를 건너뛰고 seatTempPrmp를 **직접** 부른다
+-- (booking.hold_api) — 좌석맵 조회 한 번 + POST 한 번이다. 요청 바디의 형태는
+-- logs/holdspec/에 쌓아 둔 실제 관측에서 확정했고, 그 계정의 고객번호는
+-- accessToken을 풀어 읽는다(watch.booking_identity).
+--
+-- 기본은 'ui'다. API 경로는 CGV가 요청 형태를 바꾸면 그날로 멎지만 화면은 사람이
+-- 쓰는 길이라 훨씬 천천히 바뀐다 — 빠른 쪽은 켜는 사람이 고른다.
+--
+-- **'api'에서는 자동 결제를 켤 수 없다.** 선점은 세션(쿠키)에 걸리지만 결제 화면은
+-- 그 탭의 SPA 상태를 타고 이어지므로, 화면 없이 잡은 좌석은 결제 UI로 이어지지
+-- 않는다. 그때는 알림을 받아 사람이 CGV 앱의 '진행 중인 예매'에서 마친다.
+ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
+    hold_mode text NOT NULL DEFAULT 'ui';
+
+
+-- ── 결제번호(paymNo) ─────────────────────────────────────────────────────────
+-- API 결제가 CGV에서 받아 오는 번호다(commonGetPayId). 이걸 안 남겨 둬서
+-- **결제가 어디까지 갔는지 사후에 조회할 수가 없었다** — 승인은 했는데 예매가
+-- 안 된 건이 생겼을 때(2026-09-07), 승인 상태를 물어볼 열쇠가 우리에게 없었다.
+--
+-- 화면 구동 경로는 CGV의 JS가 이 번호를 만들어 쓰므로 우리 손에 안 들어온다.
+-- 그때는 비어 있다.
+ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS paym_no text;
+

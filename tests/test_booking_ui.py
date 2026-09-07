@@ -2727,9 +2727,89 @@ class TestAdvancePassStaysInsideItsBudget(unittest.TestCase):
         self.assertEqual(out["advanced"], 0)
         self.assertGreaterEqual(out["skipped"], 1)
 
+    def test_it_leaves_the_seat_cycle_its_share(self):
+        """예산을 남김없이 가져가면 정작 좌석을 보는 쪽이 굶는다.
+
+        실측(2026-09-07 기동): 탭 7장을 세우는 동안 사전진행이 분당 160건을 써서
+        상영표·좌석맵 조회가 60초간 "예산을 다 썼습니다"로 실패했다. 사전진행은
+        다음 창에 이어서 하면 그만이지만 놓친 좌석은 돌아오지 않는다.
+        """
+        self.register(2)
+        out = booking.advance_pending(
+            self.Session(allowance=booking.ADVANCE_BUDGET_RESERVE),
+            budget_ms=5000)
+        self.assertEqual(out["advanced"], 0, "남겨 둘 몫까지 가져갔다")
+        self.assertGreaterEqual(out["skipped"], 1)
+
+    def test_plenty_of_budget_still_does_the_work(self):
+        # 물러나는 건 빠듯할 때뿐이다 — 넉넉하면 평소처럼 진행해야 한다.
+        self.register(2)
+        session = self.Session(allowance=booking.ADVANCE_BUDGET_RESERVE + 100)
+        try:
+            booking.advance_pending(session, budget_ms=5000)
+        except AssertionError:
+            pass          # 가짜 세션이 탭을 열려 할 때 내는 것 — 여기까지 왔으면 됐다
+        self.assertEqual(session.pages[:1], ["M|S|20260908|012|0|2"],
+                         "예산이 넉넉한데 물러났다")
+
     def test_nothing_registered_is_not_an_error(self):
         self.assertEqual(booking.advance_pending(self.Session(),
                                                  budget_ms=5000)["advanced"], 0)
+
+
+class TestAdvanceOverflowIsAnnounced(unittest.TestCase):
+    """등록된 회차가 탭 상한을 넘으면 **등록하는 자리에서** 알린다.
+
+    축출이 일어난 뒤에 아는 건 늦다. 2026-09-07 배포에서 키 7개에 상한이 4라
+    준비 상태가 0→4→0을 끝없이 반복했는데(분당 5~9회 축출), 축출 로그가 info라
+    몇 시간 동안 눈에 띄지 않았다. 사전진행은 "이미 진행돼 있으면 0초"라서 하는
+    것이라, 이 상태에서는 요청 예산만 쓰고 아무것도 돌려주지 않는다.
+    """
+
+    def setUp(self):
+        booking.forget_advance()
+        self.logs: list[str] = []
+        self.real = booking.log.warning
+        booking.log.warning = lambda msg, *a: self.logs.append(msg % a if a else msg)
+
+    def tearDown(self):
+        booking.log.warning = self.real
+        booking.forget_advance()
+
+    def register(self, showtimes: int):
+        rows = [{"scnsNo": f"{i:03d}", "scnSseq": "1", "scnsrtTm": "0900",
+                 "frSeatCnt": 1} for i in range(showtimes)]
+        return booking.register_advance(
+            None, {"owner_id": 7, "auto_book": True, "party_size": 2,
+                   "scn_ymd": "20260908"},
+            rows, mov_no="30001323", site_no="0013", site_nm="용산아이파크몰")
+
+    def test_staying_under_the_limit_says_nothing(self):
+        self.register(booking_limit := watch_limit())
+        self.assertEqual(self.logs, [], f"{booking_limit}개는 조용해야 한다")
+
+    def test_going_over_the_limit_is_announced(self):
+        self.register(watch_limit() + 3)
+        self.assertTrue(self.logs, "상한을 넘겼는데 아무 말이 없다")
+        self.assertIn("ADVANCED_PAGE_LIMIT", self.logs[0])
+
+    def test_the_same_state_is_not_repeated_every_cycle(self):
+        over = watch_limit() + 3
+        self.register(over)
+        self.register(over)
+        self.register(over)
+        self.assertEqual(len(self.logs), 1, "사이클마다 같은 말을 반복한다")
+
+    def test_dropping_back_under_clears_the_warning(self):
+        self.register(watch_limit() + 3)
+        booking.forget_advance()
+        self.register(2)
+        self.assertEqual(len(self.logs), 1, "내려온 뒤에도 경고가 남아 있다")
+
+
+def watch_limit() -> int:
+    import watch as _watch
+    return _watch.ADVANCED_PAGE_LIMIT
 
 
 if __name__ == "__main__":

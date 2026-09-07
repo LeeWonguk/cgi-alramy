@@ -36,6 +36,10 @@
   let minConsecutive = $state(0) // 0·1 = 개별 좌석, 2+ = 나란히 붙은 N석
   let autoBook = $state(false) // 좌석 확보 시 자동 선점
   let autoPay = $state(false) // 선점에 이어 카카오페이 결제까지 요청
+  // 좌석을 잡는 방식. 'ui'는 예매 화면을 몰고, 'api'는 CGV API를 직접 부른다.
+  // API 쪽은 화면 전환·대기열·팝업이 통째로 빠져서 훨씬 빠르지만, 몰 결제 화면이
+  // 없어 자동 결제를 함께 켤 수 없다.
+  let holdMode = $state('ui')
   let partySize = $state(1) // 잡을 좌석 수(인원)
   let types = $state(new Set())
   let savingWatch = $state(false)
@@ -228,12 +232,15 @@
         scn_time_to: timeMode === 'range' ? timeTo : '',
         min_consecutive: Number(minConsecutive) || 0,
         auto_book: autoBook,
+        hold_mode: autoBook ? holdMode : 'ui',
         auto_pay: autoBook && autoPay,
         party_size: Number(partySize) || 1,
         ticket_spec: autoBook ? { adult: Number(partySize) || 1 } : {},
       })
       watchMsg = autoBook
-        ? `좌석 감시를 추가했습니다 (자동 예매 켜짐${autoPay ? ' · 카카오페이 결제까지' : ''})`
+        ? `좌석 감시를 추가했습니다 (자동 예매 켜짐${
+            holdMode === 'api' ? ' · API 직접 선점' : ''
+          }${autoPay ? ' · 카카오페이 결제까지' : ''})`
         : '좌석 감시를 추가했습니다'
       rowsText = ''
       numFrom = ''
@@ -518,6 +525,13 @@
             {/each}
           </select>
         </div>
+        <div class="row" style="align-items: center; gap: 6px">
+          <span class="small muted">선점 방식</span>
+          <select bind:value={holdMode}>
+            <option value="ui">화면 구동 (안정)</option>
+            <option value="api">API 직접 호출 (빠름)</option>
+          </select>
+        </div>
         <label class="check small">
           <input id="s-autopay" type="checkbox" bind:checked={autoPay} />
           선점에 이어 <strong>카카오페이 결제까지 요청</strong>하고 결제 링크를 보냅니다
@@ -526,6 +540,12 @@
       <div class="small muted">
         {#if !account.linked}
           먼저 위에서 CGV 계정을 연동하세요.
+        {:else if autoBook && holdMode === 'api'}
+          ⚡ 예매 화면을 열지 않고 <strong>CGV API를 바로 호출</strong>해 좌석을 잡고,
+          자동 결제까지 켜면 결제 요청도 API로 보냅니다 — 화면 전환·대기열·팝업이
+          없어 선점이 훨씬 빠릅니다(실측 2.6초 → 0.2초). <strong>마지막 승인은
+          직접</strong> 하셔야 합니다. CGV가 API 형태를 바꾸면 이 방식만 멎으니,
+          그때는 '화면 구동'으로 되돌리세요.
         {:else if autoBook && autoPay}
           ⚠️ 실제로 좌석을 잡고 카카오페이 결제창까지 띄웁니다. <strong>마지막 승인은
           직접</strong> 하셔야 합니다 — 알림으로 온 링크를 휴대폰에서 열어 카카오페이
@@ -582,6 +602,7 @@
             <td>
               {#if w.auto_book}
                 <span class="badge accent">성인 {w.party_size}</span>
+                {#if w.hold_mode === 'api'}<span class="badge">API</span>{/if}
                 {#if w.auto_pay}<span class="badge">카카오페이</span>{/if}
               {:else}
                 <span class="small muted">끔</span>

@@ -713,7 +713,7 @@ SEAT_WATCH_COLUMNS = """
     id, owner_id, movie_query, site_query, scn_ymd, scn_time,
     scn_time_from, scn_time_to, screen_types, rows,
     seat_num_from, seat_num_to,
-    min_consecutive, auto_book, auto_pay, pay_method,
+    min_consecutive, auto_book, auto_pay, pay_method, hold_mode,
     party_size, ticket_spec, enabled, created_at
 """
 
@@ -728,6 +728,21 @@ def normalize_pay_method(value) -> str:
     if text not in PAY_METHODS:
         raise ValueError(f"지원하지 않는 결제수단입니다: {value}")
     return text
+
+# 좌석을 잡는 방식. 화면과 API가 같은 값을 쓴다(booking.HOLD_MODES).
+#   ui   예매 화면을 몰아 '결제하기'까지 간다 (기본 · 지금까지의 유일한 길)
+#   api  seatTempPrmp를 직접 부른다 — 화면을 아예 열지 않는다
+HOLD_MODES = ("ui", "api")
+DEFAULT_HOLD_MODE = "ui"
+
+
+def normalize_hold_mode(value) -> str:
+    """선점 방식을 정규화. 비어 있으면 기본값(화면 구동)."""
+    text = (str(value or "").strip() or DEFAULT_HOLD_MODE).lower()
+    if text not in HOLD_MODES:
+        raise ValueError(f"지원하지 않는 선점 방식입니다: {value}")
+    return text
+
 
 # 자정을 넘긴 회차를 24시 이상으로 적는 CGV 표기의 상한. '2530' = 25:30 = 새벽 1:30.
 # 하루치 상영표라 28시(= 새벽 4시)를 넘는 회차는 없다.
@@ -825,7 +840,8 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
                    min_consecutive: int = 0, auto_book: bool = False,
                    party_size: int = 1, ticket_spec=None, scn_time="",
                    scn_time_from="", scn_time_to="", auto_pay: bool = False,
-                   pay_method=None, seat_num_from=0, seat_num_to=0) -> dict:
+                   pay_method=None, seat_num_from=0, seat_num_to=0,
+                   hold_mode=None) -> dict:
     """좌석 감시를 추가한다. 같은 조합이 있으면 옵션을 갱신해 돌려준다.
 
     회차 지정은 셋 중 하나다:
@@ -856,9 +872,14 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
     except (TypeError, ValueError):
         raise ValueError("인원수는 숫자여야 합니다")
     spec = normalize_ticket_spec(ticket_spec)
+    mode = normalize_hold_mode(hold_mode)
     # 자동 결제는 자동 예매 위에서만 뜻이 있다 — 선점하지 않는 감시에 결제할
     # 대상이 있을 리 없다. 화면에서도 그렇게 묶여 있지만, API로 바로 들어오는
     # 값도 있으니 여기서 한 번 더 맞춘다.
+    #
+    # API 선점에서도 켤 수 있게 됐다 — 결제도 API로 하기 때문이다
+    # (booking.pay_api). 예전에는 화면 없이 잡은 좌석에 몰 결제 화면이 없어서
+    # 막아 두었다.
     pay_on = bool(auto_pay) and bool(auto_book)
     method = normalize_pay_method(pay_method)
     with pool().connection() as conn:
@@ -868,9 +889,9 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
             f"    scn_time_from, scn_time_to, screen_types, rows,"
             f"    seat_num_from, seat_num_to,"
             f"    min_consecutive, auto_book, party_size, ticket_spec,"
-            f"    auto_pay, pay_method)"
+            f"    auto_pay, pay_method, hold_mode)"
             f" values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-            f"         %s, %s, %s)"
+            f"         %s, %s, %s, %s)"
             f" on conflict (owner_id, movie_query, site_query, scn_ymd, scn_time,"
             f"              scn_time_from, scn_time_to, screen_types, rows,"
             f"              seat_num_from, seat_num_to)"
@@ -880,11 +901,12 @@ def add_seat_watch(owner_id: int | None, movie_query: str, site_query: str,
             f"              party_size = excluded.party_size,"
             f"              ticket_spec = excluded.ticket_spec,"
             f"              auto_pay = excluded.auto_pay,"
-            f"              pay_method = excluded.pay_method"
+            f"              pay_method = excluded.pay_method,"
+            f"              hold_mode = excluded.hold_mode"
             f" returning {SEAT_WATCH_COLUMNS}",
             (owner_id, movie_query, site_query, scn_ymd, stime, tfrom, tto,
              types, row_filter, num_from, num_to, need, bool(auto_book),
-             party, Json(spec), pay_on, method),
+             party, Json(spec), pay_on, method, mode),
         ).fetchone()
     return dict(row)
 
@@ -900,6 +922,7 @@ def set_seat_watch(seat_watch_id: int, owner_id: int | None = None,
         "auto_book": lambda v: bool(v),
         "auto_pay": lambda v: bool(v),
         "pay_method": normalize_pay_method,
+        "hold_mode": normalize_hold_mode,
         "min_consecutive": lambda v: max(0, int(v or 0)),
         "party_size": lambda v: max(1, int(v or 1)),
         "ticket_spec": lambda v: Json(normalize_ticket_spec(v)),
@@ -916,10 +939,16 @@ def set_seat_watch(seat_watch_id: int, owner_id: int | None = None,
     # 자동 예매를 끄면 자동 결제도 함께 꺼진다 — 선점하지 않는 감시가 결제만
     # 켜져 있는 상태는 뜻이 없고, 나중에 자동 예매를 다시 켤 때 사용자가
     # 기억하지 못하는 결제 설정이 되살아나는 게 더 위험하다.
-    if fields.get("auto_book") is not None and not fields["auto_book"] \
-            and "auto_pay" not in fields:
-        sets.append("auto_pay = %s")
-        params.append(False)
+    #
+    # **API 선점으로 바꿀 때도 같이 끈다.** 그 방식에는 몰 결제 화면이 없어서,
+    # 켜진 채로 두면 선점은 되고 결제만 매번 실패한다.
+    book_off = fields.get("auto_book") is not None and not fields["auto_book"]
+    if book_off and "auto_pay" not in fields:
+        if "auto_pay = %s" in sets:
+            params[sets.index("auto_pay = %s")] = False
+        else:
+            sets.append("auto_pay = %s")
+            params.append(False)
     if not sets:
         return seat_watch(seat_watch_id)
     where = "id = %s"
@@ -1052,7 +1081,7 @@ BOOKING_COLUMNS = """
     id, seat_watch_id, owner_id, showtime_key, mov_nm, site_nm, scn_ymd,
     start_hhmm, seat_labels, seat_loc_nos, mov_atkt_no, amount, status,
     hold_expires_at, last_error, created_at, updated_at,
-    pay_method, pay_url, pay_expires_at, pay_error
+    pay_method, pay_url, pay_expires_at, pay_error, paym_no
 """
 
 
@@ -1095,7 +1124,8 @@ def finish_booking_attempt(attempt_id: int, status: str, *,
                            pay_method: str | None = None,
                            pay_url: str | None = None,
                            pay_expires_at: datetime | None = None,
-                           pay_error: str | None = None) -> None:
+                           pay_error: str | None = None,
+                           paym_no: str | None = None) -> None:
     """선점 시도 결과를 확정한다. status: held|failed|expired|cancelled.
 
     seat_labels를 주면 좌석도 덮어쓴다 — 시도를 열 때 적은 건 감지 시점의
@@ -1105,6 +1135,10 @@ def finish_booking_attempt(attempt_id: int, status: str, *,
 
     pay_* 는 자동 결제(auto_pay)를 켠 감시에서만 채워진다. 결제 요청이 실패해도
     선점은 유효하므로 status는 held 그대로 두고 pay_error에만 사유를 남긴다.
+
+    paym_no는 API 결제에서만 채워진다. **이걸 안 남겨 두면 결제가 어디까지 갔는지
+    사후에 조회할 수 없다** — 승인은 됐는데 예매가 안 된 건이 생겼을 때 물어볼
+    열쇠가 우리에게 없었다(2026-09-07).
     """
     if status not in ("held", "failed", "expired", "cancelled", "pending"):
         raise ValueError(f"알 수 없는 상태: {status}")
@@ -1113,6 +1147,11 @@ def finish_booking_attempt(attempt_id: int, status: str, *,
             "pay_method=%s", "pay_url=%s", "pay_expires_at=%s", "pay_error=%s"]
     params: list[Any] = [status, mov_atkt_no, amount, hold_expires_at, error,
                          _now(), pay_method, pay_url, pay_expires_at, pay_error]
+    # **준 경우에만 덮어쓴다.** 화면 구동 경로는 CGV의 JS가 결제번호를 만들어 써서
+    # 우리 손에 안 들어오는데, 무조건 쓰면 이미 적힌 값을 None으로 지운다.
+    if paym_no is not None:
+        sets.append("paym_no=%s")
+        params.append(paym_no)
     if seat_labels is not None:
         sets.append("seat_labels=%s")
         params.append(list(seat_labels))

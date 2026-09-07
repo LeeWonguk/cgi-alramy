@@ -988,9 +988,18 @@ class TestRateBudget(unittest.TestCase):
         self.assertEqual(b.take(1), 0)
 
     def test_being_refused_halves_the_limit(self):
-        b = watch.RateBudget(limit=200)
+        # 바닥(RATE_FLOOR)에 걸리지 않는 높이에서 재야 '반으로'가 드러난다 —
+        # 숫자를 못박으면 바닥을 올릴 때마다 이 테스트가 같이 깨진다.
+        start = watch.RATE_FLOOR * 4
+        b = watch.RateBudget(limit=start)
         b.penalize()
-        self.assertEqual(b.limit, 100)
+        self.assertEqual(b.limit, start // 2)
+
+    def test_the_floor_stops_the_halving(self):
+        """반으로 줄이다 감시가 멎으면 안 된다 — 바닥 밑으로는 안 내려간다."""
+        b = watch.RateBudget(limit=watch.RATE_FLOOR + 10)
+        b.penalize()
+        self.assertEqual(b.limit, watch.RATE_FLOOR)
 
     def test_the_floor_never_raises_the_limit(self):
         """거절당했는데 오히려 더 보내면 안 된다."""
