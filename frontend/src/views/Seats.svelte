@@ -46,7 +46,7 @@
   let watchMsg = $state(null)
   let watchErr = $state(null)
 
-  // '선호좌석' 프리셋. 스크린에서 적당히 떨어진 H~O열의, 좌우 끝을 뺀 가운데
+  // '선호좌석' 프리셋. 스크린에서 적당히 떨어진 G~O열의, 좌우 끝을 뺀 가운데
   // 구역이다 — IMAX처럼 한 열이 45석까지 가는 관에서는 열만 걸어서는 화면
   // 끝자리가 그대로 후보에 남는다.
   //
@@ -58,9 +58,9 @@
   const PREFERRED = {
     site: '용산아이파크몰',
     type: 'IMAX',
-    rows: 'H, I, J, K, L, M, N, O',
-    from: 13,
-    to: 32,
+    rows: 'G, H, I, J, K, L, M, N, O',
+    from: 9,
+    to: 38,
   }
 
   const preferredOk = $derived(

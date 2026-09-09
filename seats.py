@@ -1088,7 +1088,7 @@ def _check_one_seat_watch(session, catalog, w, webhook, webhook_kind,
         scn_time_to=w.get("scn_time_to") or "")
     rows = w["rows"]
     # 좌석 번호 범위(가로). 열 필터와 함께 '어디를 볼지'를 정한다 — 화면의
-    # '선호좌석' 버튼이 H~O열 · 13~32번을 한 번에 채운다.
+    # '선호좌석' 버튼이 G~O열 · 9~38번을 한 번에 채운다.
     num_from, num_to = normalize_seat_nums(w.get("seat_num_from"),
                                            w.get("seat_num_to"))
     need = int(w.get("min_consecutive") or 0)   # 0·1 = 개별 좌석, 2+ = 연속 좌석

@@ -373,7 +373,7 @@ ALTER TABLE booking_attempts ADD COLUMN IF NOT EXISTS pay_error      text;
 -- 45석까지 가는 관에서는 열만으로는 "좋은 자리"가 가려지지 않는다.
 --
 -- 0은 '제한 없음'이다. 둘 다 0이면 예전처럼 그 열의 모든 번호를 본다.
--- 화면의 '선호좌석' 버튼이 H~O열 · 13~32번을 한 번에 채운다.
+-- 화면의 '선호좌석' 버튼이 G~O열 · 9~38번을 한 번에 채운다.
 ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
     seat_num_from integer NOT NULL DEFAULT 0;
 ALTER TABLE seat_watches ADD COLUMN IF NOT EXISTS
